@@ -19,8 +19,8 @@ use winit::window::{Fullscreen, Window, WindowId};
 const WARMUP_S: f64 = 1.5;
 /// Refresh interval used to count missed vblanks: the panel runs 1920x1080 @ 60.000 Hz (dxdiag, 2026-11-25).
 const VBLANK_MS: f64 = 1000.0 / 60.0;
-/// More consecutive skipped frames than this ends the run as a failure (occluded/stalled surface).
-const MAX_CONSECUTIVE_SKIPS: u32 = 120;
+/// A continuous stretch without a presented frame longer than this fails the run (occluded/stalled surface).
+const MAX_SKIP_TIME: Duration = Duration::from_secs(2);
 
 #[derive(Debug, PartialEq)]
 struct Opts {
@@ -50,7 +50,7 @@ struct App {
     gpu_ms: Vec<f64>,
     presented: u64,
     skipped: u64,
-    consecutive_skips: u32,
+    skip_since: Option<Instant>,
     errors: u64,
     compile_ms: f64,
     timed_out: bool,
@@ -94,7 +94,12 @@ impl ApplicationHandler for App {
             Ok(mut gpu) => {
                 if let Some(p) = self.opts.present {
                     if !gpu.set_present_mode(p) {
-                        eprintln!("requested present mode {p:?} is not supported here");
+                        self.result = Err(format!(
+                            "requested present mode {p:?} is not supported here"
+                        ));
+                        el.exit();
+                        self.window = Some(window);
+                        return;
                     }
                 }
                 println!(
@@ -181,16 +186,17 @@ impl ApplicationHandler for App {
                         }
                         self.last_frame = Some(now);
                         self.presented += 1;
-                        self.consecutive_skips = 0;
+                        self.skip_since = None;
                     }
                     Ok(FrameStatus::Skipped) => {
                         self.skipped += 1;
-                        self.consecutive_skips += 1;
                         self.last_frame = None; // a skipped frame must not pollute the next interval
-                        if self.consecutive_skips > MAX_CONSECUTIVE_SKIPS {
+                        let skipped_for =
+                            self.skip_since.get_or_insert_with(Instant::now).elapsed();
+                        if skipped_for > MAX_SKIP_TIME {
                             self.result = Err(format!(
-                                "{} consecutive skipped frames (surface occluded or stalled)",
-                                self.consecutive_skips
+                                "no frame presented for {:.1} s (surface occluded or stalled)",
+                                skipped_for.as_secs_f64()
                             ));
                             el.exit();
                         }
@@ -294,7 +300,20 @@ fn missed_vblanks(intervals_ms: &[f64], vblank_ms: f64) -> f64 {
         .sum()
 }
 
+/// Independent hard deadline: even if the render loop or a GPU call stalls, the process exits
+/// (destroying any fullscreen window) shortly after the requested duration.
+fn spawn_watchdog(limit: Duration) {
+    std::thread::spawn(move || {
+        std::thread::sleep(limit);
+        eprintln!("RESULT: FAILED: watchdog expired after {limit:?}; terminating");
+        std::process::exit(2);
+    });
+}
+
 fn run(opts: Opts) -> i32 {
+    spawn_watchdog(Duration::from_secs_f64(
+        opts.seconds as f64 + if opts.bench { WARMUP_S } else { 0.0 } + 10.0,
+    ));
     let event_loop = match EventLoop::new() {
         Ok(l) => l,
         Err(e) => {
@@ -303,7 +322,7 @@ fn run(opts: Opts) -> i32 {
         }
     };
     event_loop.set_control_flow(ControlFlow::Poll);
-    let (bench, vsync, scale) = (opts.bench, opts.vsync, opts.scale);
+    let (bench, scale) = (opts.bench, opts.scale);
     let mut app = App {
         opts,
         stress: None,
@@ -315,7 +334,7 @@ fn run(opts: Opts) -> i32 {
         gpu_ms: Vec::new(),
         presented: 0,
         skipped: 0,
-        consecutive_skips: 0,
+        skip_since: None,
         errors: 0,
         compile_ms: 0.0,
         timed_out: false,
@@ -341,7 +360,12 @@ fn run(opts: Opts) -> i32 {
         s.sort_by(|a, b| a.total_cmp(b));
         let missed = missed_vblanks(&app.intervals_ms, VBLANK_MS);
         // Missed vblanks are only meaningful when presentation is synchronised (vsync on).
-        let missed_txt = if vsync {
+        let mode = app.gpu.as_ref().map(|g| g.config.present_mode);
+        let synced = matches!(
+            mode,
+            Some(mg_gfx::context::PresentMode::Fifo | mg_gfx::context::PresentMode::FifoRelaxed)
+        );
+        let missed_txt = if synced {
             format!(
                 "missed_vblanks={missed} missed_pct={:.2}",
                 100.0 * missed / (n + missed)
@@ -356,11 +380,14 @@ fn run(opts: Opts) -> i32 {
             .unwrap_or((0, 0));
         let render = app.stress.as_ref().map_or(res, |s| s.render_size(res));
         println!(
-            "BENCH scale={scale} output_res={}x{} render_res={}x{} vsync={vsync} compile_ms={:.1} measured_frames={} fps={:.1} avg_ms={:.3} median_ms={:.3} p95_ms={:.3} p99_ms={:.3} max_ms={:.3} {missed_txt} method=frame_interval_cpu_side",
+            "BENCH scale={scale} output_res={}x{} render_res={}x{} present_mode={mode:?} presented={} skipped={} completed={} compile_ms={:.1} measured_frames={} fps={:.1} avg_ms={:.3} median_ms={:.3} p95_ms={:.3} p99_ms={:.3} max_ms={:.3} {missed_txt} method=frame_interval_cpu_side",
             res.0,
             res.1,
             render.0,
             render.1,
+            app.presented,
+            app.skipped,
+            app.timed_out,
             app.compile_ms,
             app.intervals_ms.len(),
             1000.0 * n / sum,
@@ -388,6 +415,12 @@ fn run(opts: Opts) -> i32 {
         );
     }
     match app.result {
+        Ok(()) if bench && !app.timed_out => {
+            eprintln!(
+                "RESULT: FAILED: bench run ended early (Esc/close) and is not a valid measurement"
+            );
+            1
+        }
         Ok(()) if app.presented > 0 => {
             println!(
                 "RESULT: ok ({} frames presented on the selected adapter; software adapters are rejected)",

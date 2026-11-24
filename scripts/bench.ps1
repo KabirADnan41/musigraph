@@ -10,10 +10,13 @@ param(
   [switch]$Windowed,
   [switch]$Shot,
   [switch]$Vram,
-  [string]$Tag = '',
+  [ValidatePattern('^[\w-]*$')][string]$Tag = '',
   [string]$OutDir = ''
 )
 $ErrorActionPreference = 'Stop'
+[Threading.Thread]::CurrentThread.CurrentCulture = [Globalization.CultureInfo]::InvariantCulture  # '.' decimals in args and CSV
+# CopyFromScreen captures the whole primary screen, so screenshots are only allowed for the fullscreen run (nothing else visible).
+if ($Shot -and $Windowed) { throw '-Shot is only allowed for fullscreen runs (a windowed capture would include other windows)' }
 $root = Split-Path $PSScriptRoot -Parent
 if (-not $OutDir) { $OutDir = Join-Path (Split-Path $root -Parent) 'benchmarks' }
 New-Item -ItemType Directory -Force $OutDir | Out-Null
@@ -34,6 +37,8 @@ $sw = [Diagnostics.Stopwatch]::StartNew()
 $p = Start-Process -FilePath $exe -ArgumentList $argv -PassThru -RedirectStandardOutput $out -RedirectStandardError $err
 $null = $p.Handle  # cache the handle so ExitCode and PeakWorkingSet64 stay readable after exit
 $vd = -1; $png = ''
+$peak = 0; $killed = $false; $deadline = (Get-Date).AddSeconds($Seconds + 30)
+try {
 if ($Shot) {
   Start-Sleep -Milliseconds 4500
   $vd = Vram
@@ -41,7 +46,7 @@ if ($Shot) {
   Add-Type -Namespace Mg -Name Win -MemberDefinition '[System.Runtime.InteropServices.DllImport("user32.dll")] public static extern System.IntPtr GetForegroundWindow();'
   $p.Refresh()
   # Capture only when the Musigraph window is the foreground window, so no other desktop content is recorded.
-  if ($p.MainWindowHandle -eq [IntPtr]::Zero -or [Mg.Win]::GetForegroundWindow() -ne $p.MainWindowHandle) {
+  if ($p.HasExited -or $p.MainWindowHandle -eq [IntPtr]::Zero -or [Mg.Win]::GetForegroundWindow() -ne $p.MainWindowHandle) {
     Write-Warning 'screenshot skipped: Musigraph window is not the foreground window'
     $Shot = $false
   }
@@ -53,12 +58,12 @@ if ($Shot) {
   $png = Join-Path $OutDir "$name.png"; $bmp.Save($png, [Drawing.Imaging.ImageFormat]::Png); $bmp.Dispose()
 } elseif ($Vram) { Start-Sleep -Milliseconds 4500; $vd = Vram }
 # Screenshots and VRAM sampling (nvidia-smi spawn) disturb timing: use separate -Shot / -Vram runs, never measurement runs.
-$peak = 0; $killed = $false; $deadline = (Get-Date).AddSeconds($Seconds + 30)
 while (-not $p.HasExited) {
   try { $p.Refresh(); $peak = [Math]::Max($peak, [int]($p.PeakWorkingSet64 / 1MB)) } catch { }
   if ((Get-Date) -gt $deadline) { $p.Kill(); $killed = $true; break }  # emergency cleanup: hard timeout
   Start-Sleep -Milliseconds 500
 }
+} finally { try { if (-not $p.HasExited) { $p.Kill() } } catch { } }  # never leave a fullscreen child behind on script error / Ctrl-C
 $sw.Stop()
 $p.WaitForExit()
 $cpu = $p.TotalProcessorTime.TotalSeconds

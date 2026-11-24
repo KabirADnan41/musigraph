@@ -238,8 +238,18 @@ impl Gpu {
         if self.measure_gpu {
             // Diagnostic only: waits for the GPU to finish this frame (serialises CPU and GPU) to time the
             // GPU work independent of the present path. Never enabled in normal runs.
-            let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
-            self.last_gpu_ms = Some(t0.elapsed().as_secs_f64() * 1000.0);
+            // Bounded: a stalled GPU must never hang the (fullscreen) process; a timeout is reported as an error.
+            let wait = wgpu::PollType::Wait {
+                submission_index: None,
+                timeout: Some(std::time::Duration::from_secs(2)),
+            };
+            match self.device.poll(wait) {
+                Ok(_) => self.last_gpu_ms = Some(t0.elapsed().as_secs_f64() * 1000.0),
+                Err(e) => {
+                    self.last_gpu_ms = None;
+                    return Err(format!("GPU wait failed or timed out: {e}"));
+                }
+            }
         }
         self.queue.present(frame);
         if suboptimal {
