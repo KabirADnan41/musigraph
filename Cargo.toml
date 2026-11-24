@@ -1,0 +1,20 @@
+[workspace]
+resolver = "2"
+members = ["crates/mg-dsp", "crates/mg-audio", "crates/mg-gfx", "crates/mg-engine"]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.87"
+license = "Apache-2.0"
+repository = "https://github.com/KabirADnan41/musigraph"
+publish = false
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+
+[profile.release]
+lto = "thin"
