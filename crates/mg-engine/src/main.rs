@@ -53,13 +53,6 @@ struct App {
 }
 
 impl App {
-    fn scaled(&self, w: u32, h: u32) -> (u32, u32) {
-        (
-            ((w as f32 * self.opts.scale).round() as u32).max(1),
-            ((h as f32 * self.opts.scale).round() as u32).max(1),
-        )
-    }
-
     fn total_s(&self) -> f64 {
         self.opts.seconds as f64 + if self.opts.bench { WARMUP_S } else { 0.0 }
     }
@@ -86,8 +79,13 @@ impl ApplicationHandler for App {
             window.set_cursor_visible(false);
         }
         let size = window.inner_size();
-        let (w, h) = self.scaled(size.width, size.height);
-        match mg_gfx::context::init(self.opts.backend, window.clone(), w, h, self.opts.vsync) {
+        match mg_gfx::context::init(
+            self.opts.backend,
+            window.clone(),
+            size.width,
+            size.height,
+            self.opts.vsync,
+        ) {
             Ok(gpu) => {
                 println!(
                     "adapter={:?} type={:?} backend={:?} driver={:?} {:?} surface_format={:?} present_mode={:?}",
@@ -100,7 +98,7 @@ impl ApplicationHandler for App {
                     gpu.config.present_mode
                 );
                 if self.opts.bench {
-                    let s = StressRenderer::new(&gpu);
+                    let s = StressRenderer::new(&gpu, self.opts.scale);
                     self.compile_ms = s.compile_ms;
                     self.stress = Some(s);
                 }
@@ -128,9 +126,8 @@ impl ApplicationHandler for App {
                 ..
             } => el.exit(),
             WindowEvent::Resized(s) => {
-                let (w, h) = self.scaled(s.width, s.height);
                 if let Some(g) = self.gpu.as_mut() {
-                    g.resize(w, h);
+                    g.resize(s.width, s.height);
                 }
             }
             WindowEvent::RedrawRequested => {
@@ -148,7 +145,7 @@ impl ApplicationHandler for App {
                     self.result = Err(format!("wgpu error: {e}"));
                     return el.exit();
                 }
-                let r = if let Some(s) = &self.stress {
+                let r = if let Some(s) = self.stress.as_mut() {
                     s.render(g, t as f32)
                 } else {
                     g.render_clear([
@@ -328,10 +325,13 @@ fn run(opts: Opts) -> i32 {
             .as_ref()
             .map(|g| (g.config.width, g.config.height))
             .unwrap_or((0, 0));
+        let render = app.stress.as_ref().map_or(res, |s| s.render_size(res));
         println!(
-            "BENCH scale={scale} render_res={}x{} vsync={vsync} compile_ms={:.1} measured_frames={} fps={:.1} avg_ms={:.3} median_ms={:.3} p95_ms={:.3} p99_ms={:.3} max_ms={:.3} {missed_txt} method=frame_interval_cpu_side",
+            "BENCH scale={scale} output_res={}x{} render_res={}x{} vsync={vsync} compile_ms={:.1} measured_frames={} fps={:.1} avg_ms={:.3} median_ms={:.3} p95_ms={:.3} p99_ms={:.3} max_ms={:.3} {missed_txt} method=frame_interval_cpu_side",
             res.0,
             res.1,
+            render.0,
+            render.1,
             app.compile_ms,
             app.intervals_ms.len(),
             1000.0 * n / sum,
