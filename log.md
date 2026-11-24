@@ -48,3 +48,26 @@
 - Changes: `Gpu.present_modes`/`set_present_mode`, `--present immediate|mailbox|fifo` and `--gpu-time` (serialised GPU frame time) in the bench harness, `PresentMode` re-export, scripts\bench.ps1 (hard 30 s-over-duration kill, peak working set polling, ExitCode via cached handle, separate -Shot/-Vram runs, foreground-window check before any screenshot, refuses to run elevated).
 - Results and PASS/FAIL tables: docs\testing\GPU-BENCHMARK-REPORT.md (outside this repository). Summary: Vulkan 92.9 fps uncapped at 1080p (p99 12.4 ms), all backends 60 fps synchronised with 0 missed vblanks; DX12 uncapped stalls ~33 ms (3 repeats, immediate and mailbox too), GL 93-96 % of a core. Esc exit 0.20 s.
 - Not done: 10-minute soaks, forced device loss, resize/minimise tests, Vulkan repeats.
+
+## 2026-11-25 - P2 pure DSP analyzer + GPU review round 4 fixes (branch feature/poc-audio-fullscreen)
+
+**Changes**
+- mg-dsp: new `lib.rs` (Analyzer, AnalysisParams, AudioFrame), `smooth.rs`, `bands.rs`, `synth.rs` (SYNTHETIC, tests/benchmarks only). Dependency `rustfft =6.4.1` (batch-1 approved; Cargo.lock +6 pkgs: rustfft, num-complex, num-integer, primal-check, strength_reduce, transpose).
+- Analyzer: 2048-pt Hann FFT, hop 512, 64 log bands (30-16k Hz), 6 groups (sub-bass..treble) at fast/medium/slow attack-release smoothing, rolling-reference adaptive normalisation (rises instantly, falls 2 dB/s, floor -30 dBFS, 45 dB range), silence gate (rms < -70 dBFS held 0.3 s zeroes bands, no onsets), spectral-flux onset detector (mean + 1.8 std adaptive threshold, 90 ms refractory), adaptive energy (loudness + onset density + bass), per-frame capture timestamp. NaN/inf sanitised, input clamped.
+- Review fixes (Sonnet High review of 4708fa7..e82ea64): bench run ended by Esc/close now exits 1; BENCH line reports present_mode, presented, skipped, completed; missed-vblank logic derives from actual present mode; unsupported `--present` override is a hard error; skip failure is time-based (2 s) not frame-count; bench.ps1 refuses `-Shot` with `-Windowed`, validates `-Tag`, uses InvariantCulture, kills child in `finally`, guards exited process.
+
+**Impact / risk**: mg-dsp has no OS access and `forbid(unsafe_code)`. All timing constants are independent design defaults, to be tuned on native hardware. Onset/energy are heuristics; no beat/tempo/mood claims.
+
+**Deferred LOW (review)**: `--gpu-time` wait_indefinitely can pass deadline (diagnostic only); Suboptimal reconfigure each frame; WGSL struct test is substring-only; peak_ws_mb=0 on very short runs.
+
+**Verification**: `cargo test --workspace --locked` all pass (mg-dsp 20 tests: tones/groups, sweep monotonic, silence no onsets, tone->silence->resume, kick onset recall >=85% / <=2 false, steady tone no onsets, loud>quiet energy, fast before slow, buildup, equal-loudness spectra, determinism, hostile input, timestamps, sample rates); clippy -D warnings clean; fmt applied; release windowed vulkan bench smoke: exit 0, BENCH line shows present_mode=Fifo. Not yet run: scripts\verify.ps1 full gate; independent review of P2 (pending).
+
+### 2026-11-25 addendum - P2 review (Sonnet High, PASS WITH SUGGESTIONS) resolution + GPU stall safety
+- MEDIUM-1 (false onsets on stationary noise, measured 4-9 per ~9 s): `onset_k` 1.8 -> 4.0; new test `stationary_noise_makes_almost_no_onsets` (<=3 in ~19 s at amp 0.05 and 0.3). Kick-train recall test still passes.
+- MEDIUM-2 (tests passing falsely): removed tautological assertion; added quiet-after-loud, level-ordering and sustained-vs-rhythmic tests. Band/group levels are shape-normalised (a steady tone is full at 0.8 and 0.1 amplitude); loudness is carried by `rms_db` and `energy`. Documented as a design note in tests; scenes must combine both.
+- LOW-1: `rms_db` floored at -120 (doc matches). LOW-2: first-frame flux excluded from onset statistics. LOW-4: `AnalysisParams` sanitised in `Analyzer::new` (+ hostile-parameter test). bench.ps1 `finally` kill wrapped in try/catch.
+- Not changed (documented): LOW-3 extreme sample rates (8 kHz / 384 kHz band collapse; no panic/NaN) - revisit if non-48/44.1 kHz devices matter; LOW-5 onset-density estimator is a peak-biased follower, treat as provisional and tune on live audio; `bands` use only the fast response, three speeds exist on groups (per ADR-0008).
+- Extra tests added: buffer-size independence (chunks 1..100000), discontinuities (splice/dropout/click), 10-minute numerical stability. mg-dsp: 28 tests pass.
+- GPU stall safety (owner request): `--gpu-time` wait is now bounded (2 s, reported as error); independent watchdog thread in mg-engine force-exits the process (code 2) at duration + 10 s even if the render loop or GPU call stalls, so a fullscreen run cannot be trapped. bench.ps1 also hard-kills at Seconds + 30 s.
+- Still deferred (GPU LOW): Suboptimal reconfigure every frame; WGSL struct test substring-only; peak_ws_mb=0 on very short runs.
+- All DSP timing constants remain PROVISIONAL engineering defaults (not derived from any reference application); to be tuned on live audio.
