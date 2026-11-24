@@ -13,7 +13,7 @@
 *.mp4
 *.pml
 *.iso
-weyv/
+research/
 evidence/
 # OS/editor
 Thumbs.db
@@ -21,3 +21,30 @@ Thumbs.db
 *.log
 node_modules/
 .playwright-mcp/
+
+# binaries, archives, installers
+*.exe
+*.msi
+*.dll
+*.pdb
+*.zip
+*.7z
+dist/
+out/
+downloads/
+.cache/
+*.tmp
+# virtual machines and media
+*.vmdk
+*.vhdx
+*.ova
+*.wav
+*.mp3
+# credentials and local agent/tool state
+.claude/
+CLAUDE.md
+.playwright/
+.dev.vars
+*.p12
+*.pfx
+id_rsa*
