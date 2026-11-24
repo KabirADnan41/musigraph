@@ -1,6 +1,8 @@
 //! wgpu rendering, frame pacing and scenes.
 
+pub mod context;
 pub mod report;
+pub mod stress;
 
 /// Crate identity, used by the workspace smoke test.
 pub const NAME: &str = "mg-gfx";
