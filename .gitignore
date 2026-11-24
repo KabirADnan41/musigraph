@@ -1,0 +1,23 @@
+# build output and caches
+/target/
+**/target/
+# secrets
+.env
+.env.*
+*.pem
+*.key
+# research material, VMs, recordings, disks (never belong here)
+*.vhd
+*.vdi
+*.webm
+*.mp4
+*.pml
+*.iso
+weyv/
+evidence/
+# OS/editor
+Thumbs.db
+.vscode/
+*.log
+node_modules/
+.playwright-mcp/
