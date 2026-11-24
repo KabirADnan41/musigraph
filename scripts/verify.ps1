@@ -22,7 +22,7 @@ if ($mbad) { $mbad | ForEach-Object { $_.ToString() }; throw 'FAILED: git/patch/
 $pbad = $manifests | Select-String -Pattern 'path\s*=\s*"' | Where-Object { $_.Line -notmatch 'path\s*=\s*"\.\./mg-[a-z]+"' }
 if ($pbad) { $pbad | ForEach-Object { $_.ToString() }; throw 'FAILED: path dependency outside the workspace crates' }
 Write-Host '== privacy gate: no capture (microphone) endpoint API'
-$hit = Get-ChildItem crates -Recurse -Filter *.rs | Select-String -Pattern 'eCapture|eAll|AUDIO_CAPTURE|DataFlow\s*\(\s*1' 
+$hit = Get-ChildItem crates -Recurse -Filter *.rs | Select-String -CaseSensitive -Pattern 'eCapture|\beAll\b|AUDIO_CAPTURE|DataFlow\s*\(\s*1'
 if ($hit) { $hit | ForEach-Object { $_.ToString() }; throw 'FAILED: capture endpoint referenced (render-endpoint loopback only)' }
 Write-Host '== tracked-file allow-list'
 $ok = '^(\.gitignore|LICENSE|NOTICE|README\.md|THIRD-PARTY-NOTICES\.md|log\.md|rust-toolchain\.toml|Cargo\.toml|Cargo\.lock)$|^(crates|scripts|docs|assets)/.+\.(rs|toml|md|ps1|wgsl|txt|json|csv)$'

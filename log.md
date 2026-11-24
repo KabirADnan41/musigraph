@@ -14,3 +14,10 @@
 - Deferred (documented): workspace-wide `unsafe_code = "deny"` with per-crate override lands with the first unsafe code (P1); tautological NAME smoke tests are scaffolding, replaced by real tests in P1/P2; `cargo tree -d` + build.rs/proc-macro allow-list diff are generated at dependency adoption.
 - Reviewer claim not accepted: "gitleaks path does not exist on this machine" was wrong (it was installed to F:\musigraph\tools\gitleaks); the committed-absolute-path concern was valid and fixed.
 - Verification: scripts\verify.ps1 passes end to end (fmt, clippy, 3 tests, build, run, source checks, privacy gate, allow-list, gitleaks x2, osv-scanner 2.7.0: 4 packages, no issues).
+
+## 2026-11-25 P3.1 adapter report (first dependency: wgpu =30.0.2, features std,parking_lot,dx12,vulkan,gles,wgsl)
+- Changes: crates/mg-gfx/src/report.rs (`adapter_report()` enumerates adapters separately for DX12/Vulkan/GL via wgpu and prints name/vendor/device/type/backend/driver/limits/features; small std `block_on` replaces a pollster dependency; 1 unit test), lib.rs exposes `report`, mg-engine main.rs accepts `--gpu-report` (unknown option exits 2), Cargo.toml/Cargo.lock (114 packages locked MSRV-aware by cargo for rust-version 1.87).
+- Measured on the host (debug build, no device created yet): DX12 lists "NVIDIA GeForce GT 730" (DiscreteGpu, vendor 0x10de, device 0x1287, driver 30.0.14.7514) AND "Microsoft Basic Render Driver" (WARP, type Cpu); Vulkan lists the GT 730 (driver 475.14); GL lists "NVIDIA GeForce GT 730/PCIe/SSE2" (OpenGL 4.6.0 NVIDIA 475.14). Limits: max_texture_2d 16384, max_bind_groups 8, max_uniform_buffer 65536.
+- Meaning: enumeration only. Device creation, surface, shader compilation and rendering are NOT yet verified (P3.2/P3.3). The CPU adapter (WARP) is listed by DX12: selection logic must reject DeviceType::Cpu so software rendering is never reported as hardware compatibility.
+- Not run: release build, osv on the app lockfile with wgpu (scratch tree scanned clean), build.rs allow-list.
+- verify.ps1: privacy grep made case-sensitive with word boundary on eAll (it falsely matched the word "really" in a comment; the gate itself worked).
