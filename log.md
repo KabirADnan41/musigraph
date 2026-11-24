@@ -21,3 +21,10 @@
 - Meaning: enumeration only. Device creation, surface, shader compilation and rendering are NOT yet verified (P3.2/P3.3). The CPU adapter (WARP) is listed by DX12: selection logic must reject DeviceType::Cpu so software rendering is never reported as hardware compatibility.
 - Not run: release build, osv on the app lockfile with wgpu (scratch tree scanned clean), build.rs allow-list.
 - verify.ps1: privacy grep made case-sensitive with word boundary on eAll (it falsely matched the word "really" in a comment; the gate itself worked).
+
+## 2026-11-25 review round 2 (Sonnet High on deb31e6 + 6ac1a59: CHANGES REQUIRED -> fixed)
+- HIGH confirmed: in verify.ps1 the manifest filter `-notmatch '\target\'` was an illegal regex (error swallowed, manifest/path-dep checks silently skipped). Fixed with `'[\/]target[\/]'`, a throw when no manifests are found, and the whole source/privacy/allow-list section now runs under `$ErrorActionPreference='Stop'`. My own earlier filtered output had hidden the error: lesson recorded, verify output is no longer grepped when checking gates.
+- MEDIUM fixed: report.rs prints an "ENUMERATION ONLY" header, build profile, tags CPU adapters "SOFTWARE (not hardware)" and prints a hardware/software summary; tests added (self-wake, cross-thread wake, report sections); `block_on` is now `pub(crate)`.
+- LOW fixed: privacy grep also matches build_input_stream|default_input_device|Direction::Capture; `--gpu-report` rejects extra arguments, ignores a closed pipe. `tokio` is not in the Windows dependency tree (`cargo tree -i tokio` finds nothing for the target). Instance debug flags: report states the build profile (explicit flags deferred to P3.2).
+- Owner request: the reference-project name is already absent from the CURRENT .gitignore (replaced by `research/` in a6da0d5); history is not rewritten.
+- Verification: scripts\verify.ps1 passes in full (5 mg-gfx tests, manifests found, gitleaks x2 clean, osv 118 packages no issues).
