@@ -114,6 +114,55 @@ where
     ))
 }
 
+/// A device without a window, for headless rendering measurements and tests.
+pub struct Headless {
+    pub device: wgpu::Device,
+    pub queue: wgpu::Queue,
+    pub info: wgpu::AdapterInfo,
+}
+
+/// Creates a headless hardware device using the first backend of `AUTO_ORDER` that works.
+/// Software adapters are rejected, so tests can never silently measure a CPU renderer.
+pub fn init_headless() -> Result<Headless, String> {
+    let mut failures = Vec::new();
+    for b in AUTO_ORDER {
+        let mut desc = wgpu::InstanceDescriptor::new_without_display_handle();
+        desc.backends = b.backends();
+        let instance = wgpu::Instance::new(desc);
+        let adapter = match block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            force_fallback_adapter: false,
+            apply_limit_buckets: false,
+            compatible_surface: None,
+        })) {
+            Ok(a) => a,
+            Err(e) => {
+                failures.push(format!("{b:?}: {e}"));
+                continue;
+            }
+        };
+        let info = adapter.get_info();
+        if is_software_adapter(&info) {
+            failures.push(format!("{b:?}: software adapter {:?}", info.name));
+            continue;
+        }
+        match block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("musigraph-headless"),
+            ..Default::default()
+        })) {
+            Ok((device, queue)) => {
+                return Ok(Headless {
+                    device,
+                    queue,
+                    info,
+                });
+            }
+            Err(e) => failures.push(format!("{b:?}: {e}")),
+        }
+    }
+    Err(format!("no hardware device: {}", failures.join(" | ")))
+}
+
 /// Creates device, queue and a configured surface for `target` (for example an `Arc<winit::window::Window>`).
 /// Fails (never falls back to software) if only a software adapter is available.
 pub fn init(

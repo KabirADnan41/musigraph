@@ -3,6 +3,10 @@
 //! Options: `--backend dx12|vulkan|gl` `--seconds N` `--fullscreen` `--vsync on|off` `--scale F` (bench).
 
 mod levels;
+mod scene_map;
+mod scene_run;
+mod selftest;
+mod sim;
 
 use std::io::Write as _;
 use std::sync::Arc;
@@ -324,7 +328,7 @@ fn missed_vblanks(intervals_ms: &[f64], vblank_ms: f64) -> f64 {
 
 /// Independent hard deadline: even if the render loop or a GPU call stalls, the process exits
 /// (destroying any fullscreen window) shortly after the requested duration.
-fn spawn_watchdog(limit: Duration) {
+pub(crate) fn spawn_watchdog(limit: Duration) {
     std::thread::spawn(move || {
         std::thread::sleep(limit);
         eprintln!("RESULT: FAILED: watchdog expired after {limit:?}; terminating");
@@ -479,6 +483,32 @@ fn main() {
                 }
             }
         }
+        Some(flag @ ("--scene" | "--scene-synth")) => {
+            let (source, rest) = if flag == "--scene" {
+                (scene_run::Source::Live, &args[1..])
+            } else {
+                match args.get(1) {
+                    Some(name) if !name.starts_with("--") => {
+                        (scene_run::Source::Synth(name.clone()), &args[2..])
+                    }
+                    _ => {
+                        eprintln!(
+                            "usage: --scene-synth NAME [options]; fixtures: {}",
+                            sim::FIXTURES.join(", ")
+                        );
+                        std::process::exit(2);
+                    }
+                }
+            };
+            match scene_run::parse(rest, source) {
+                Ok(o) => std::process::exit(scene_run::run(o)),
+                Err(e) => {
+                    eprintln!("{e}");
+                    std::process::exit(2);
+                }
+            }
+        }
+        Some("--scene-selftest") if args.len() == 1 => std::process::exit(selftest::run()),
         Some("--print-levels") => {
             let secs = match args.get(1).map(String::as_str) {
                 None => 10,
@@ -498,7 +528,7 @@ fn main() {
         }
         None => {
             println!(
-                "musigraph engine (P3.3 skeleton): --gpu-report | --gpu-test | --gpu-bench | --print-levels"
+                "musigraph engine (P3.3 skeleton): --gpu-report | --gpu-test | --gpu-bench | --print-levels | --scene | --scene-synth NAME"
             )
         }
         _ => {
