@@ -2,7 +2,7 @@
 # Example: powershell -NoProfile -ExecutionPolicy Bypass -File scripts\bench.ps1 -Backend dx12 -Scale 1.0 -Vsync off -Seconds 10 -Shot
 # Never run as administrator. Output: <OutDir>\results.csv (+ PNG screenshots). OutDir defaults to ..\benchmarks next to the repository.
 param(
-  [ValidateSet('dx12', 'vulkan', 'gl')][string]$Backend = 'dx12',
+  [ValidateSet('auto', 'dx12', 'vulkan', 'gl')][string]$Backend = 'auto',
   [ValidateSet('bench', 'test')][string]$Mode = 'bench',
   [double]$Scale = 1.0,
   [ValidateSet('on', 'off')][string]$Vsync = 'on',

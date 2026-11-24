@@ -657,6 +657,9 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 [[package]]
 name = "mg-audio"
 version = "0.0.1"
+dependencies = [
+ "windows",
+]
 
 [[package]]
 name = "mg-dsp"
@@ -669,6 +672,8 @@ dependencies = [
 name = "mg-engine"
 version = "0.0.1"
 dependencies = [
+ "mg-audio",
+ "mg-dsp",
  "mg-gfx",
  "winit",
 ]

@@ -2,6 +2,8 @@
 //! `--gpu-report` (P3.1); `--gpu-test` (P3.2 clear colour); `--gpu-bench` (P3.3 stress shader).
 //! Options: `--backend dx12|vulkan|gl` `--seconds N` `--fullscreen` `--vsync on|off` `--scale F` (bench).
 
+mod levels;
+
 use std::io::Write as _;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -17,14 +19,15 @@ use winit::window::{Fullscreen, Window, WindowId};
 
 /// Seconds rendered before measurement starts (fullscreen settle, shader/driver warm-up).
 const WARMUP_S: f64 = 1.5;
-/// Refresh interval used to count missed vblanks: the panel runs 1920x1080 @ 60.000 Hz (dxdiag, 2026-11-25).
-const VBLANK_MS: f64 = 1000.0 / 60.0;
+/// Fallback refresh interval when the monitor does not report its rate (60 Hz).
+const DEFAULT_VBLANK_MS: f64 = 1000.0 / 60.0;
 /// A continuous stretch without a presented frame longer than this fails the run (occluded/stalled surface).
 const MAX_SKIP_TIME: Duration = Duration::from_secs(2);
 
 #[derive(Debug, PartialEq)]
 struct Opts {
-    backend: BackendChoice,
+    /// `None` = automatic (`mg_gfx::context::AUTO_ORDER`); `Some` = manual override.
+    backend: Option<BackendChoice>,
     seconds: u64,
     fullscreen: bool,
     vsync: bool,
@@ -44,6 +47,8 @@ struct App {
     stress: Option<StressRenderer>,
     gpu: Option<Gpu>,
     window: Option<Arc<Window>>,
+    /// Monitor refresh interval (ms), detected at start-up.
+    vblank_ms: f64,
     start: Instant,
     last_frame: Option<Instant>,
     intervals_ms: Vec<f64>,
@@ -84,13 +89,27 @@ impl ApplicationHandler for App {
             window.set_cursor_visible(false);
         }
         let size = window.inner_size();
-        match mg_gfx::context::init(
-            self.opts.backend,
-            window.clone(),
-            size.width,
-            size.height,
-            self.opts.vsync,
-        ) {
+        // Refresh interval comes from the monitor the window is on (never assumed to be 60 Hz).
+        self.vblank_ms = window
+            .current_monitor()
+            .and_then(|m| m.refresh_rate_millihertz())
+            .filter(|&mhz| mhz > 0)
+            .map_or(DEFAULT_VBLANK_MS, |mhz| 1_000_000.0 / f64::from(mhz));
+        let init_result = match self.opts.backend {
+            Some(b) => {
+                mg_gfx::context::init(b, window.clone(), size.width, size.height, self.opts.vsync)
+            }
+            None => {
+                mg_gfx::context::init_auto(window.clone(), size.width, size.height, self.opts.vsync)
+                    .map(|(g, failed)| {
+                        for f in &failed {
+                            eprintln!("backend skipped: {f}");
+                        }
+                        g
+                    })
+            }
+        };
+        match init_result {
             Ok(mut gpu) => {
                 if let Some(p) = self.opts.present {
                     if !gpu.set_present_mode(p) {
@@ -227,7 +246,7 @@ impl ApplicationHandler for App {
 
 fn parse_opts(args: &[String], bench: bool) -> Result<Opts, String> {
     let mut o = Opts {
-        backend: BackendChoice::Dx12,
+        backend: None,
         seconds: if bench { 10 } else { 5 },
         fullscreen: bench,
         vsync: true,
@@ -242,10 +261,13 @@ fn parse_opts(args: &[String], bench: bool) -> Result<Opts, String> {
             "--fullscreen" => o.fullscreen = true,
             "--windowed" if bench => o.fullscreen = false,
             "--backend" => {
-                o.backend = it
-                    .next()
-                    .and_then(|v| BackendChoice::parse(v))
-                    .ok_or("--backend needs dx12|vulkan|gl")?;
+                o.backend = match it.next().map(String::as_str) {
+                    Some("auto") => None,
+                    Some(v) => {
+                        Some(BackendChoice::parse(v).ok_or("--backend needs auto|dx12|vulkan|gl")?)
+                    }
+                    None => return Err("--backend needs auto|dx12|vulkan|gl".into()),
+                };
             }
             "--seconds" => {
                 o.seconds = it
@@ -328,6 +350,7 @@ fn run(opts: Opts) -> i32 {
         stress: None,
         gpu: None,
         window: None,
+        vblank_ms: DEFAULT_VBLANK_MS,
         start: Instant::now(),
         last_frame: None,
         intervals_ms: Vec::new(),
@@ -358,7 +381,7 @@ fn run(opts: Opts) -> i32 {
         let sum: f64 = app.intervals_ms.iter().sum();
         let mut s = app.intervals_ms.clone();
         s.sort_by(|a, b| a.total_cmp(b));
-        let missed = missed_vblanks(&app.intervals_ms, VBLANK_MS);
+        let missed = missed_vblanks(&app.intervals_ms, app.vblank_ms);
         // Missed vblanks are only meaningful when presentation is synchronised (vsync on).
         let mode = app.gpu.as_ref().map(|g| g.config.present_mode);
         let synced = matches!(
@@ -380,11 +403,12 @@ fn run(opts: Opts) -> i32 {
             .unwrap_or((0, 0));
         let render = app.stress.as_ref().map_or(res, |s| s.render_size(res));
         println!(
-            "BENCH scale={scale} output_res={}x{} render_res={}x{} present_mode={mode:?} presented={} skipped={} completed={} compile_ms={:.1} measured_frames={} fps={:.1} avg_ms={:.3} median_ms={:.3} p95_ms={:.3} p99_ms={:.3} max_ms={:.3} {missed_txt} method=frame_interval_cpu_side",
+            "BENCH scale={scale} output_res={}x{} render_res={}x{} refresh_hz={:.2} present_mode={mode:?} presented={} skipped={} completed={} compile_ms={:.1} measured_frames={} fps={:.1} avg_ms={:.3} median_ms={:.3} p95_ms={:.3} p99_ms={:.3} max_ms={:.3} {missed_txt} method=frame_interval_cpu_side",
             res.0,
             res.1,
             render.0,
             render.1,
+            1000.0 / app.vblank_ms,
             app.presented,
             app.skipped,
             app.timed_out,
@@ -455,12 +479,31 @@ fn main() {
                 }
             }
         }
+        Some("--print-levels") => {
+            let secs = match args.get(1).map(String::as_str) {
+                None => 10,
+                Some("--seconds") => match args.get(2).and_then(|v| v.parse::<u32>().ok()) {
+                    Some(n) if (1..=3600).contains(&n) && args.len() == 3 => n,
+                    _ => {
+                        eprintln!("--seconds needs 1..3600");
+                        std::process::exit(2);
+                    }
+                },
+                _ => {
+                    eprintln!("usage: --print-levels [--seconds N]");
+                    std::process::exit(2);
+                }
+            };
+            std::process::exit(levels::run(secs));
+        }
         None => {
-            println!("musigraph engine (P3.3 skeleton): --gpu-report | --gpu-test | --gpu-bench")
+            println!(
+                "musigraph engine (P3.3 skeleton): --gpu-report | --gpu-test | --gpu-bench | --print-levels"
+            )
         }
         _ => {
             eprintln!(
-                "unsupported arguments; supported: --gpu-report | --gpu-test | --gpu-bench (see source header)"
+                "unsupported arguments; supported: --gpu-report | --gpu-test | --gpu-bench | --print-levels (see source header)"
             );
             std::process::exit(2);
         }
@@ -492,7 +535,7 @@ mod tests {
             parse_opts(&a(&["--backend", "vulkan", "--vsync", "off"]), true)
                 .unwrap()
                 .backend,
-            BackendChoice::Vulkan
+            Some(BackendChoice::Vulkan)
         );
     }
 
@@ -529,7 +572,7 @@ mod tests {
 
     #[test]
     fn missed_vblank_counting() {
-        let v = VBLANK_MS;
+        let v = DEFAULT_VBLANK_MS;
         assert_eq!(missed_vblanks(&[], v), 0.0);
         assert_eq!(missed_vblanks(&[v, v, v], v), 0.0);
         assert_eq!(missed_vblanks(&[2.0 * v], v), 1.0);

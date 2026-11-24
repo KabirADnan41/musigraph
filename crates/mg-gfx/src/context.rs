@@ -81,6 +81,39 @@ pub struct Gpu {
     max_dim: u32,
 }
 
+/// Default automatic preference order. It is a starting point only (measured on one reference
+/// machine, ADR-0009), not a claim about other hardware: the first backend that creates a real
+/// hardware device is used, and `--backend` always overrides it.
+pub const AUTO_ORDER: [BackendChoice; 3] = [
+    BackendChoice::Vulkan,
+    BackendChoice::Dx12,
+    BackendChoice::Gl,
+];
+
+/// Tries each backend in `AUTO_ORDER` and returns the first that initialises on real hardware, plus a
+/// diagnostic line for every backend that failed. Never falls back to a software adapter.
+pub fn init_auto<T>(
+    target: T,
+    width: u32,
+    height: u32,
+    vsync: bool,
+) -> Result<(Gpu, Vec<String>), String>
+where
+    T: Into<wgpu::SurfaceTarget<'static>> + Clone,
+{
+    let mut failures = Vec::new();
+    for b in AUTO_ORDER {
+        match init(b, target.clone(), width, height, vsync) {
+            Ok(g) => return Ok((g, failures)),
+            Err(e) => failures.push(format!("{b:?}: {e}")),
+        }
+    }
+    Err(format!(
+        "no supported hardware graphics backend: {}",
+        failures.join(" | ")
+    ))
+}
+
 /// Creates device, queue and a configured surface for `target` (for example an `Arc<winit::window::Window>`).
 /// Fails (never falls back to software) if only a software adapter is available.
 pub fn init(
