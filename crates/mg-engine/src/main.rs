@@ -6,7 +6,7 @@ use std::io::Write as _;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use mg_gfx::context::{BackendChoice, Gpu};
+use mg_gfx::context::{BackendChoice, FrameStatus, Gpu};
 use mg_gfx::stress::StressRenderer;
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
@@ -17,9 +17,12 @@ use winit::window::{Fullscreen, Window, WindowId};
 
 /// Seconds rendered before measurement starts (fullscreen settle, shader/driver warm-up).
 const WARMUP_S: f64 = 1.5;
-/// Nominal refresh interval used to count missed vblanks (60 Hz panel; verified by dxdiag).
+/// Refresh interval used to count missed vblanks: the panel runs 1920x1080 @ 60.000 Hz (dxdiag, 2026-11-25).
 const VBLANK_MS: f64 = 1000.0 / 60.0;
+/// More consecutive skipped frames than this ends the run as a failure (occluded/stalled surface).
+const MAX_CONSECUTIVE_SKIPS: u32 = 120;
 
+#[derive(Debug, PartialEq)]
 struct Opts {
     backend: BackendChoice,
     seconds: u64,
@@ -29,7 +32,9 @@ struct Opts {
     bench: bool,
 }
 
-/// Field order matters: `gpu` (surface) must drop before `window`.
+/// Field order matters: `stress` and `gpu` (surface) must drop before `window`.
+/// The window is destroyed on every exit path (Esc, close, init failure, unwind); winit then restores the
+/// cursor. A hard process kill is covered by the OS only.
 struct App {
     opts: Opts,
     stress: Option<StressRenderer>,
@@ -38,9 +43,12 @@ struct App {
     start: Instant,
     last_frame: Option<Instant>,
     intervals_ms: Vec<f64>,
-    frames: u64,
+    presented: u64,
+    skipped: u64,
+    consecutive_skips: u32,
     errors: u64,
     compile_ms: f64,
+    timed_out: bool,
     result: Result<(), String>,
 }
 
@@ -50,6 +58,10 @@ impl App {
             ((w as f32 * self.opts.scale).round() as u32).max(1),
             ((h as f32 * self.opts.scale).round() as u32).max(1),
         )
+    }
+
+    fn total_s(&self) -> f64 {
+        self.opts.seconds as f64 + if self.opts.bench { WARMUP_S } else { 0.0 }
     }
 }
 
@@ -123,13 +135,17 @@ impl ApplicationHandler for App {
             }
             WindowEvent::RedrawRequested => {
                 let t = self.start.elapsed().as_secs_f64();
-                let total = self.opts.seconds as f64 + if self.opts.bench { WARMUP_S } else { 0.0 };
-                if t >= total {
+                if t >= self.total_s() {
+                    self.timed_out = true;
                     return el.exit(); // bounded duration: automatic exit
                 }
                 let Some(g) = self.gpu.as_mut() else { return };
                 if g.device_lost.load(std::sync::atomic::Ordering::SeqCst) {
                     self.result = Err("GPU device lost".into());
+                    return el.exit();
+                }
+                if let Some(e) = g.take_error() {
+                    self.result = Err(format!("wgpu error: {e}"));
                     return el.exit();
                 }
                 let r = if let Some(s) = &self.stress {
@@ -142,7 +158,7 @@ impl ApplicationHandler for App {
                     ])
                 };
                 match r {
-                    Ok(()) => {
+                    Ok(FrameStatus::Presented) => {
                         let now = Instant::now();
                         if self.opts.bench && t >= WARMUP_S {
                             if let Some(prev) = self.last_frame {
@@ -150,7 +166,20 @@ impl ApplicationHandler for App {
                             }
                         }
                         self.last_frame = Some(now);
-                        self.frames += 1;
+                        self.presented += 1;
+                        self.consecutive_skips = 0;
+                    }
+                    Ok(FrameStatus::Skipped) => {
+                        self.skipped += 1;
+                        self.consecutive_skips += 1;
+                        self.last_frame = None; // a skipped frame must not pollute the next interval
+                        if self.consecutive_skips > MAX_CONSECUTIVE_SKIPS {
+                            self.result = Err(format!(
+                                "{} consecutive skipped frames (surface occluded or stalled)",
+                                self.consecutive_skips
+                            ));
+                            el.exit();
+                        }
                     }
                     Err(e) => {
                         self.errors += 1;
@@ -163,7 +192,13 @@ impl ApplicationHandler for App {
         }
     }
 
-    fn about_to_wait(&mut self, _el: &ActiveEventLoop) {
+    fn about_to_wait(&mut self, el: &ActiveEventLoop) {
+        // The deadline must not depend on redraw events (minimised or stalled window).
+        if self.window.is_some() && self.start.elapsed().as_secs_f64() >= self.total_s() + 2.0 {
+            self.timed_out = true;
+            el.exit();
+            return;
+        }
         if let Some(w) = &self.window {
             w.request_redraw();
         }
@@ -217,12 +252,21 @@ fn parse_opts(args: &[String], bench: bool) -> Result<Opts, String> {
     Ok(o)
 }
 
+/// Percentile of an ascending-sorted slice (nearest rank); 0.0 for an empty slice.
 fn pct(sorted: &[f64], p: f64) -> f64 {
     if sorted.is_empty() {
         return 0.0;
     }
     let idx = ((sorted.len() as f64 - 1.0) * p).round() as usize;
     sorted[idx.min(sorted.len() - 1)]
+}
+
+/// Number of refresh intervals lost: each interval of `d` ms counts `round(d / vblank) - 1` missed vblanks.
+fn missed_vblanks(intervals_ms: &[f64], vblank_ms: f64) -> f64 {
+    intervals_ms
+        .iter()
+        .map(|d| ((d / vblank_ms).round() - 1.0).max(0.0))
+        .sum()
 }
 
 fn run(opts: Opts) -> i32 {
@@ -234,9 +278,7 @@ fn run(opts: Opts) -> i32 {
         }
     };
     event_loop.set_control_flow(ControlFlow::Poll);
-    let bench = opts.bench;
-    let vsync = opts.vsync;
-    let scale = opts.scale;
+    let (bench, vsync, scale) = (opts.bench, opts.vsync, opts.scale);
     let mut app = App {
         opts,
         stress: None,
@@ -245,9 +287,12 @@ fn run(opts: Opts) -> i32 {
         start: Instant::now(),
         last_frame: None,
         intervals_ms: Vec::new(),
-        frames: 0,
+        presented: 0,
+        skipped: 0,
+        consecutive_skips: 0,
         errors: 0,
         compile_ms: 0.0,
+        timed_out: false,
         result: Ok(()),
     };
     if let Err(e) = event_loop.run_app(&mut app) {
@@ -260,26 +305,31 @@ fn run(opts: Opts) -> i32 {
         .max(Duration::from_millis(1))
         .as_secs_f64();
     println!(
-        "frames={} errors={} seconds={:.2}",
-        app.frames, app.errors, secs
+        "presented={} skipped={} errors={} seconds={:.2} completed={} (aborted_early={})",
+        app.presented, app.skipped, app.errors, secs, app.timed_out, !app.timed_out
     );
     if bench && !app.intervals_ms.is_empty() {
         let n = app.intervals_ms.len() as f64;
         let sum: f64 = app.intervals_ms.iter().sum();
         let mut s = app.intervals_ms.clone();
         s.sort_by(|a, b| a.total_cmp(b));
-        let missed: f64 = app
-            .intervals_ms
-            .iter()
-            .map(|d| ((d / VBLANK_MS).round() - 1.0).max(0.0))
-            .sum();
+        let missed = missed_vblanks(&app.intervals_ms, VBLANK_MS);
+        // Missed vblanks are only meaningful when presentation is synchronised (vsync on).
+        let missed_txt = if vsync {
+            format!(
+                "missed_vblanks={missed} missed_pct={:.2}",
+                100.0 * missed / (n + missed)
+            )
+        } else {
+            "missed_vblanks=n/a missed_pct=n/a".to_string()
+        };
         let res = app
             .gpu
             .as_ref()
             .map(|g| (g.config.width, g.config.height))
             .unwrap_or((0, 0));
         println!(
-            "BENCH scale={scale} render_res={}x{} vsync={vsync} compile_ms={:.1} measured_frames={} fps={:.1} avg_ms={:.3} median_ms={:.3} p95_ms={:.3} p99_ms={:.3} max_ms={:.3} missed_vblanks={} missed_pct={:.2}",
+            "BENCH scale={scale} render_res={}x{} vsync={vsync} compile_ms={:.1} measured_frames={} fps={:.1} avg_ms={:.3} median_ms={:.3} p95_ms={:.3} p99_ms={:.3} max_ms={:.3} {missed_txt} method=frame_interval_cpu_side",
             res.0,
             res.1,
             app.compile_ms,
@@ -289,18 +339,19 @@ fn run(opts: Opts) -> i32 {
             pct(&s, 0.5),
             pct(&s, 0.95),
             pct(&s, 0.99),
-            s[s.len() - 1],
-            missed,
-            100.0 * missed / (n + missed)
+            s[s.len() - 1]
         );
     }
     match app.result {
-        Ok(()) if app.frames > 0 => {
-            println!("RESULT: ok (hardware adapter rendered frames)");
+        Ok(()) if app.presented > 0 => {
+            println!(
+                "RESULT: ok ({} frames presented on the selected adapter; software adapters are rejected)",
+                app.presented
+            );
             0
         }
         Ok(()) => {
-            eprintln!("RESULT: FAILED: no frame was rendered");
+            eprintln!("RESULT: FAILED: no frame was presented");
             1
         }
         Err(e) => {
@@ -335,5 +386,76 @@ fn main() {
             );
             std::process::exit(2);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn a(s: &[&str]) -> Vec<String> {
+        s.iter().map(|x| x.to_string()).collect()
+    }
+
+    #[test]
+    fn parse_defaults_and_ranges() {
+        let o = parse_opts(&a(&[]), true).unwrap();
+        assert_eq!(
+            (o.seconds, o.fullscreen, o.vsync, o.scale),
+            (10, true, true, 1.0)
+        );
+        let t = parse_opts(&a(&[]), false).unwrap();
+        assert_eq!((t.seconds, t.fullscreen), (5, false));
+        assert_eq!(
+            parse_opts(&a(&["--scale", "0.5"]), true).unwrap().scale,
+            0.5
+        );
+        assert_eq!(
+            parse_opts(&a(&["--backend", "vulkan", "--vsync", "off"]), true)
+                .unwrap()
+                .backend,
+            BackendChoice::Vulkan
+        );
+    }
+
+    #[test]
+    fn parse_rejects_bad_input() {
+        for bad in [
+            &["--scale", "0.1"][..],
+            &["--scale", "1.5"],
+            &["--scale", "NaN"],
+            &["--scale", "inf"],
+            &["--scale"],
+            &["--seconds", "0"],
+            &["--seconds", "121"],
+            &["--seconds", "x"],
+            &["--vsync", "maybe"],
+            &["--backend", "metal"],
+            &["--bogus"],
+        ] {
+            assert!(parse_opts(&a(bad), true).is_err(), "{bad:?}");
+        }
+        assert!(parse_opts(&a(&["--windowed"]), false).is_err());
+        assert!(parse_opts(&a(&["--scale", "0.5"]), false).is_err());
+    }
+
+    #[test]
+    fn percentiles() {
+        assert_eq!(pct(&[], 0.5), 0.0);
+        assert_eq!(pct(&[7.0], 0.99), 7.0);
+        let v: Vec<f64> = (1..=100).map(f64::from).collect();
+        assert_eq!(pct(&v, 0.5), 51.0);
+        assert_eq!(pct(&v, 0.99), 99.0);
+        assert_eq!(pct(&v, 1.0), 100.0);
+    }
+
+    #[test]
+    fn missed_vblank_counting() {
+        let v = VBLANK_MS;
+        assert_eq!(missed_vblanks(&[], v), 0.0);
+        assert_eq!(missed_vblanks(&[v, v, v], v), 0.0);
+        assert_eq!(missed_vblanks(&[2.0 * v], v), 1.0);
+        assert_eq!(missed_vblanks(&[3.0 * v, v], v), 2.0);
+        assert_eq!(missed_vblanks(&[0.4 * v], v), 0.0); // faster than refresh never counts
     }
 }

@@ -1,7 +1,7 @@
 //! Stress-shader renderer (P3.3): a fullscreen fragment shader whose cost approximates the planned
 //! P4 scene (haze noise, 64 bars, reflection, glow). It is not simplified to pass benchmarks.
 
-use crate::context::Gpu;
+use crate::context::{FrameStatus, Gpu};
 use std::time::Instant;
 
 const UNIFORM_BYTES: usize = 16 + 16 * 16;
@@ -91,20 +91,8 @@ impl StressRenderer {
     }
 
     /// Draws one frame with synthetic, deterministic "bands" derived from `time`.
-    pub fn render(&self, gpu: &mut Gpu, time: f32) -> Result<(), String> {
-        let (w, h) = (gpu.config.width as f32, gpu.config.height as f32);
-        let mut bytes = [0u8; UNIFORM_BYTES];
-        let level = 0.5 + 0.5 * (time * 2.1).sin();
-        for (i, v) in [w, h, time, level].iter().enumerate() {
-            bytes[i * 4..i * 4 + 4].copy_from_slice(&v.to_ne_bytes());
-        }
-        for b in 0..64usize {
-            let x = b as f32 / 64.0;
-            let v = (0.55 + 0.45 * (time * (1.5 + x * 4.0) + b as f32 * 0.7).sin())
-                * (1.0 - 0.6 * x)
-                * (0.6 + 0.4 * level);
-            bytes[16 + b * 4..16 + b * 4 + 4].copy_from_slice(&v.clamp(0.02, 1.0).to_ne_bytes());
-        }
+    pub fn render(&self, gpu: &mut Gpu, time: f32) -> Result<FrameStatus, String> {
+        let bytes = uniform_bytes(gpu.config.width as f32, gpu.config.height as f32, time);
         gpu.queue.write_buffer(&self.uniform, 0, &bytes);
         gpu.render(|enc, view| {
             let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -127,5 +115,51 @@ impl StressRenderer {
             pass.set_bind_group(0, &self.bind_group, &[]);
             pass.draw(0..3, 0..1);
         })
+    }
+}
+
+/// Packs the shader uniform (res, time, level, 64 synthetic bands) in the WGSL `U` layout (272 bytes).
+pub fn uniform_bytes(w: f32, h: f32, time: f32) -> [u8; UNIFORM_BYTES] {
+    let mut bytes = [0u8; UNIFORM_BYTES];
+    let level = 0.5 + 0.5 * (time * 2.1).sin();
+    for (i, v) in [w, h, time, level].iter().enumerate() {
+        bytes[i * 4..i * 4 + 4].copy_from_slice(&v.to_ne_bytes());
+    }
+    for b in 0..64usize {
+        let x = b as f32 / 64.0;
+        let v = (0.55 + 0.45 * (time * (1.5 + x * 4.0) + b as f32 * 0.7).sin())
+            * (1.0 - 0.6 * x)
+            * (0.6 + 0.4 * level);
+        bytes[16 + b * 4..16 + b * 4 + 4].copy_from_slice(&v.clamp(0.02, 1.0).to_ne_bytes());
+    }
+    bytes
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn f32_at(b: &[u8], off: usize) -> f32 {
+        f32::from_ne_bytes([b[off], b[off + 1], b[off + 2], b[off + 3]])
+    }
+
+    #[test]
+    fn uniform_layout_matches_wgsl() {
+        let b = uniform_bytes(1920.0, 1080.0, 1.25);
+        assert_eq!(b.len(), 272);
+        assert_eq!(f32_at(&b, 0), 1920.0);
+        assert_eq!(f32_at(&b, 4), 1080.0);
+        assert_eq!(f32_at(&b, 8), 1.25);
+        for i in 0..64 {
+            let v = f32_at(&b, 16 + i * 4);
+            assert!(v.is_finite() && (0.02..=1.0).contains(&v), "band {i} = {v}");
+        }
+    }
+
+    #[test]
+    fn shader_source_declares_matching_struct() {
+        let s = include_str!("stress.wgsl");
+        assert!(s.contains("bands: array<vec4<f32>, 16>"));
+        assert!(s.contains("res: vec2<f32>"));
     }
 }
