@@ -5,6 +5,8 @@ use crate::report::block_on;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+pub use wgpu::PresentMode;
+
 /// Backend requested by the caller. Explicit on purpose: no silent fallback between backends.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BackendChoice {
@@ -68,8 +70,14 @@ pub struct Gpu {
     pub config: wgpu::SurfaceConfiguration,
     pub info: wgpu::AdapterInfo,
     pub device_lost: Arc<AtomicBool>,
+    /// Diagnostic: time each frame's GPU work by waiting for completion (see `render`).
+    pub measure_gpu: bool,
+    /// Submit-to-completion time of the last frame when `measure_gpu` is set.
+    pub last_gpu_ms: Option<f64>,
     /// First uncaptured wgpu error (validation, out of memory, ...), if any. Callers must exit on it.
     pub error: Arc<Mutex<Option<String>>>,
+    /// Present modes the surface supports on this adapter.
+    pub present_modes: Vec<wgpu::PresentMode>,
     max_dim: u32,
 }
 
@@ -165,7 +173,10 @@ pub fn init(
         config,
         info,
         device_lost,
+        measure_gpu: false,
+        last_gpu_ms: None,
         error,
+        present_modes: caps.present_modes.clone(),
         max_dim,
     })
 }
@@ -178,6 +189,16 @@ impl Gpu {
         self.config.width = width.min(self.max_dim);
         self.config.height = height.min(self.max_dim);
         self.surface.configure(&self.device, &self.config);
+    }
+
+    /// Switches the present mode if the surface supports it; returns whether it was applied.
+    pub fn set_present_mode(&mut self, mode: wgpu::PresentMode) -> bool {
+        if !self.present_modes.contains(&mode) {
+            return false;
+        }
+        self.config.present_mode = mode;
+        self.surface.configure(&self.device, &self.config);
+        true
     }
 
     /// First recorded wgpu error, if any.
@@ -212,7 +233,14 @@ impl Gpu {
                 label: Some("frame"),
             });
         f(&mut enc, &view);
+        let t0 = std::time::Instant::now();
         self.queue.submit(Some(enc.finish()));
+        if self.measure_gpu {
+            // Diagnostic only: waits for the GPU to finish this frame (serialises CPU and GPU) to time the
+            // GPU work independent of the present path. Never enabled in normal runs.
+            let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+            self.last_gpu_ms = Some(t0.elapsed().as_secs_f64() * 1000.0);
+        }
         self.queue.present(frame);
         if suboptimal {
             self.surface.configure(&self.device, &self.config);

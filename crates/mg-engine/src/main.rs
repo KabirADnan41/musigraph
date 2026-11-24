@@ -6,7 +6,7 @@ use std::io::Write as _;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use mg_gfx::context::{BackendChoice, FrameStatus, Gpu};
+use mg_gfx::context::{BackendChoice, FrameStatus, Gpu, PresentMode};
 use mg_gfx::stress::StressRenderer;
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
@@ -28,6 +28,10 @@ struct Opts {
     seconds: u64,
     fullscreen: bool,
     vsync: bool,
+    /// Explicit present-mode override (bench diagnostics): immediate | mailbox | fifo.
+    present: Option<PresentMode>,
+    /// Diagnostic: also time GPU work per frame (serialises CPU/GPU); use in separate runs.
+    gpu_time: bool,
     scale: f32,
     bench: bool,
 }
@@ -43,6 +47,7 @@ struct App {
     start: Instant,
     last_frame: Option<Instant>,
     intervals_ms: Vec<f64>,
+    gpu_ms: Vec<f64>,
     presented: u64,
     skipped: u64,
     consecutive_skips: u32,
@@ -86,17 +91,24 @@ impl ApplicationHandler for App {
             size.height,
             self.opts.vsync,
         ) {
-            Ok(gpu) => {
+            Ok(mut gpu) => {
+                if let Some(p) = self.opts.present {
+                    if !gpu.set_present_mode(p) {
+                        eprintln!("requested present mode {p:?} is not supported here");
+                    }
+                }
                 println!(
-                    "adapter={:?} type={:?} backend={:?} driver={:?} {:?} surface_format={:?} present_mode={:?}",
+                    "adapter={:?} type={:?} backend={:?} driver={:?} {:?} surface_format={:?} present_mode={:?} supported_present_modes={:?}",
                     gpu.info.name,
                     gpu.info.device_type,
                     gpu.info.backend,
                     gpu.info.driver,
                     gpu.info.driver_info,
                     gpu.config.format,
-                    gpu.config.present_mode
+                    gpu.config.present_mode,
+                    gpu.present_modes
                 );
+                gpu.measure_gpu = self.opts.gpu_time;
                 if self.opts.bench {
                     let s = StressRenderer::new(&gpu, self.opts.scale);
                     self.compile_ms = s.compile_ms;
@@ -162,6 +174,11 @@ impl ApplicationHandler for App {
                                 self.intervals_ms.push((now - prev).as_secs_f64() * 1000.0);
                             }
                         }
+                        if self.opts.gpu_time && t >= WARMUP_S {
+                            if let Some(ms) = g.last_gpu_ms {
+                                self.gpu_ms.push(ms);
+                            }
+                        }
                         self.last_frame = Some(now);
                         self.presented += 1;
                         self.consecutive_skips = 0;
@@ -208,6 +225,8 @@ fn parse_opts(args: &[String], bench: bool) -> Result<Opts, String> {
         seconds: if bench { 10 } else { 5 },
         fullscreen: bench,
         vsync: true,
+        present: None,
+        gpu_time: false,
         scale: 1.0,
         bench,
     };
@@ -236,6 +255,15 @@ fn parse_opts(args: &[String], bench: bool) -> Result<Opts, String> {
                     .filter(|s| s.is_finite() && (0.25..=1.0).contains(s))
                     .ok_or("--scale needs 0.25..=1.0")?;
             }
+            "--present" if bench => {
+                o.present = Some(match it.next().map(String::as_str) {
+                    Some("immediate") => PresentMode::Immediate,
+                    Some("mailbox") => PresentMode::Mailbox,
+                    Some("fifo") => PresentMode::Fifo,
+                    _ => return Err("--present needs immediate|mailbox|fifo".into()),
+                })
+            }
+            "--gpu-time" if bench => o.gpu_time = true,
             "--vsync" => {
                 o.vsync = match it.next().map(String::as_str) {
                     Some("on") => true,
@@ -284,6 +312,7 @@ fn run(opts: Opts) -> i32 {
         start: Instant::now(),
         last_frame: None,
         intervals_ms: Vec::new(),
+        gpu_ms: Vec::new(),
         presented: 0,
         skipped: 0,
         consecutive_skips: 0,
@@ -340,6 +369,22 @@ fn run(opts: Opts) -> i32 {
             pct(&s, 0.95),
             pct(&s, 0.99),
             s[s.len() - 1]
+        );
+    }
+    if bench && !app.gpu_ms.is_empty() {
+        let n = app.gpu_ms.len() as f64;
+        let sum: f64 = app.gpu_ms.iter().sum();
+        let mut s = app.gpu_ms.clone();
+        s.sort_by(|a, b| a.total_cmp(b));
+        println!(
+            "GPUTIME scale={scale} frames={} avg_ms={:.3} median_ms={:.3} p95_ms={:.3} p99_ms={:.3} max_ms={:.3} implied_uncapped_fps={:.1} method=submit_to_gpu_idle_serialised",
+            s.len(),
+            sum / n,
+            pct(&s, 0.5),
+            pct(&s, 0.95),
+            pct(&s, 0.99),
+            s[s.len() - 1],
+            1000.0 * n / sum
         );
     }
     match app.result {

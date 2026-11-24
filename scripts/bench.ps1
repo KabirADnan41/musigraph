@@ -32,6 +32,7 @@ $out = Join-Path $OutDir "$name.out.txt"; $err = Join-Path $OutDir "$name.err.tx
 $vb = Vram
 $sw = [Diagnostics.Stopwatch]::StartNew()
 $p = Start-Process -FilePath $exe -ArgumentList $argv -PassThru -RedirectStandardOutput $out -RedirectStandardError $err
+$null = $p.Handle  # cache the handle so ExitCode and PeakWorkingSet64 stay readable after exit
 $vd = -1; $png = ''
 if ($Shot) {
   Start-Sleep -Milliseconds 4500
@@ -52,14 +53,18 @@ if ($Shot) {
   $png = Join-Path $OutDir "$name.png"; $bmp.Save($png, [Drawing.Imaging.ImageFormat]::Png); $bmp.Dispose()
 } elseif ($Vram) { Start-Sleep -Milliseconds 4500; $vd = Vram }
 # Screenshots and VRAM sampling (nvidia-smi spawn) disturb timing: use separate -Shot / -Vram runs, never measurement runs.
-if (-not $p.WaitForExit(($Seconds + 30) * 1000)) { $p.Kill(); $killed = $true } else { $killed = $false }
+$peak = 0; $killed = $false; $deadline = (Get-Date).AddSeconds($Seconds + 30)
+while (-not $p.HasExited) {
+  try { $p.Refresh(); $peak = [Math]::Max($peak, [int]($p.PeakWorkingSet64 / 1MB)) } catch { }
+  if ((Get-Date) -gt $deadline) { $p.Kill(); $killed = $true; break }  # emergency cleanup: hard timeout
+  Start-Sleep -Milliseconds 500
+}
 $sw.Stop()
 $p.WaitForExit()
 $cpu = $p.TotalProcessorTime.TotalSeconds
-$peak = [int]($p.PeakWorkingSet64 / 1MB)
 $txt = (Get-Content $out -Raw -ErrorAction SilentlyContinue) + (Get-Content $err -Raw -ErrorAction SilentlyContinue)
 $bench = ($txt -split "`n" | Where-Object { $_ -like 'BENCH*' } | Select-Object -First 1)
-$line = "{0},{1},{2},{3},{4},exit={5},killed={6},wall_s={7:N1},cpu_s={8:N2},cpu_pct_of_1core={9:N1},peak_ws_mb={10},vram_before_mb={11},vram_during_mb={12},{13}" -f (Get-Date -Format s), $Mode, $Backend, $Scale, $Vsync, $p.ExitCode, $killed, $sw.Elapsed.TotalSeconds, $cpu, (100 * $cpu / $sw.Elapsed.TotalSeconds), $peak, $vb, $vd, ($bench -replace ',', ';')
+$line = "{0},{1},{2},{3},{4},exit={5},killed={6},wall_s={7:N1},cpu_s={8:N2},cpu_pct_of_1core={9:N1},peak_ws_mb={10},vram_before_mb={11},vram_during_mb={12},{13}" -f (Get-Date -Format s), $Mode, $Backend, $Scale, $Vsync, $p.ExitCode, $killed, $sw.Elapsed.TotalSeconds, $cpu, (100 * $cpu / $sw.Elapsed.TotalSeconds), $peak, $vb, $vd, ([string]$bench -replace ',', ';')
 Add-Content (Join-Path $OutDir 'results.csv') $line -Encoding ascii
 $line
 if ($png) { "screenshot: $png" }
