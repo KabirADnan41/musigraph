@@ -87,6 +87,14 @@ pub struct SceneMapper {
     since_onset: f32,
     /// Aurora ribbon phases in cycles, wrapped at `PHASE_WRAP` (an integer, so the sines stay seamless).
     aurora_ph: [f32; 4],
+    /// Orb: smoothed bands, flow and rotation phases (cycles, unwrapped: an hour is a few hundred), ripple impacts.
+    orb_bass: Smoother,
+    orb_mid: Smoother,
+    orb_treble: Smoother,
+    orb_breath: Smoother,
+    orb_flow: f32,
+    orb_rot: f32,
+    orb_az: [f32; 2],
     /// Album Focus rotation phase (slow, grows without wrapping: one hour is only a few hundred units).
     focus_rot: f32,
     onset_count: u32,
@@ -140,6 +148,13 @@ impl SceneMapper {
             rings: [[100.0, 0.0]; 2],
             since_onset: 10.0,
             aurora_ph: [0.0; 4],
+            orb_bass: Smoother::new(60.0, 700.0),
+            orb_mid: Smoother::new(150.0, 900.0),
+            orb_treble: Smoother::new(100.0, 500.0),
+            orb_breath: Smoother::new(400.0, 1500.0),
+            orb_flow: 0.0,
+            orb_rot: 0.0,
+            orb_az: [0.5; 2],
             focus_rot: 0.0,
             onset_count: 0,
             slot_map,
@@ -269,6 +284,24 @@ impl SceneMapper {
             *b = (*b / n.max(1) as f32).clamp(0.0, 1.0);
         }
 
+        // Orb: bass/mid/treble smoothed here (bass attack 60 ms, release 700 ms); mid sets flow and rotation
+        // speed, and calm music (low slow energy) caps both. Flow/rotation phases are integrated, never reset.
+        let mix = |a: usize, b: usize| 0.5 * (gm(a) + gm(b));
+        let quiet = |v: f32| if silent { 0.0 } else { v };
+        let o_bass = self
+            .orb_bass
+            .step(quiet(0.6 * gm(0) + 0.4 * gm(1)), dt)
+            .clamp(0.0, 1.0);
+        let o_mid = self.orb_mid.step(quiet(mix(2, 3)), dt).clamp(0.0, 1.0);
+        let o_treble = self.orb_treble.step(quiet(mix(4, 5)), dt).clamp(0.0, 1.0);
+        let o_breath = self
+            .orb_breath
+            .step(quiet(0.6 * gm(0) + 0.4 * gm(1)), dt)
+            .clamp(0.0, 1.0);
+        self.orb_flow += dt * (0.012 + 0.10 * o_mid).min(0.03 + 0.14 * s);
+        self.orb_rot += dt * (0.006 + 0.03 * o_mid).min(0.01 + 0.04 * s);
+        let orb_band = [o_bass, o_mid, o_treble, o_breath];
+
         // Colour: two fixed palette endpoints, blended by the slow per-song spectral tilt (tau 20 s).
         // Bass-heavy songs sit near teal+amber, bright songs near periwinkle+rose. Music only moves lightness
         // (slow energy) and this slow blend; there is no hue from energy and nothing per beat.
@@ -299,6 +332,8 @@ impl SceneMapper {
             self.since_onset = 0.0;
             self.onset_count = self.onset_count.wrapping_add(1);
             self.rings[1] = self.rings[0];
+            self.orb_az[1] = self.orb_az[0];
+            self.orb_az[0] = (self.onset_count as f32 * 0.618_034).fract();
             let amp = self.tune.ring_amp * fin(input.onset_strength).clamp(0.0, 1.0);
             self.rings[0] = [0.0, amp.min(0.25)];
         }
@@ -315,6 +350,8 @@ impl SceneMapper {
             dust: self.dust,
             aurora_phase: self.aurora_ph,
             aurora_band,
+            orb_flow: [self.orb_flow, self.orb_rot, self.orb_az[0], self.orb_az[1]],
+            orb_band,
             focus_rot: self.focus_rot,
             front_x0: (self.onset_count as f32 * 0.618_034).fract(),
             // the runner overwrites `focus` and `focus_active` from the artwork layout
@@ -485,5 +522,198 @@ mod tests {
         }
         origins.dedup_by(|a, b| (*a - *b).abs() < 1e-6);
         assert_eq!(origins.len(), 4, "every onset moves the front origin");
+    }
+
+    fn loud_frame(bands_lo: f32, bands_hi: f32) -> AudioFrame {
+        let mut f = AudioFrame {
+            silent: false,
+            band_count: mg_dsp::MAX_BANDS,
+            rms_db: -10.0,
+            energy: 0.8,
+            ..AudioFrame::default()
+        };
+        f.group_medium = [bands_lo, bands_lo, 0.1, 0.1, bands_hi, bands_hi];
+        f.group_slow = f.group_medium;
+        f
+    }
+
+    fn run_orb(f: &AudioFrame, dt: f32, secs: f32) -> SceneParams {
+        let mut m = SceneMapper::new(MapTuning::default());
+        let mut p = m.update(&live(f), dt);
+        for _ in 0..(secs / dt) as usize {
+            p = m.update(&live(f), dt);
+        }
+        p
+    }
+
+    #[test]
+    fn orb_bands_follow_frequency_are_bounded_and_monotonic() {
+        let bass = run_orb(&loud_frame(0.9, 0.0), 1.0 / 60.0, 3.0);
+        let treble = run_orb(&loud_frame(0.0, 0.9), 1.0 / 60.0, 3.0);
+        assert!(
+            bass.orb_band[0] > treble.orb_band[0] + 0.3,
+            "{:?}",
+            bass.orb_band
+        );
+        assert!(
+            treble.orb_band[2] > bass.orb_band[2] + 0.3,
+            "{:?}",
+            treble.orb_band
+        );
+        let mut prev = 0.0;
+        for level in [0.0, 0.2, 0.4, 0.6, 0.8, 1.0, 5.0] {
+            let p = run_orb(&loud_frame(level, 0.0), 1.0 / 60.0, 3.0);
+            assert!(
+                p.orb_band.iter().all(|b| (0.0..=1.0).contains(b)),
+                "{:?}",
+                p.orb_band
+            );
+            assert!(
+                p.orb_band[0] >= prev - 1e-6,
+                "bass not monotonic at {level}"
+            );
+            prev = p.orb_band[0];
+        }
+    }
+
+    #[test]
+    fn orb_values_are_finite_for_nan_and_inf_input() {
+        let mut f = loud_frame(f32::NAN, f32::INFINITY);
+        f.energy = f32::NAN;
+        f.rms_db = f32::NAN;
+        f.group_slow = [f32::INFINITY; mg_dsp::GROUPS];
+        let mut m = SceneMapper::new(MapTuning::default());
+        for dt in [f32::NAN, f32::INFINITY, 0.0, 1.0 / 60.0] {
+            let p = m.update(
+                &Input {
+                    onsets: 1,
+                    onset_strength: f32::NAN,
+                    ..live(&f)
+                },
+                dt,
+            );
+            for v in p
+                .orb_band
+                .iter()
+                .chain(&p.orb_flow)
+                .chain(p.rings.iter().flatten())
+            {
+                assert!(v.is_finite(), "{v}");
+            }
+            assert!(p.orb_band.iter().all(|b| (0.0..=1.0).contains(b)));
+        }
+    }
+
+    #[test]
+    fn orb_bands_are_frame_rate_independent() {
+        let f = loud_frame(0.8, 0.5);
+        let (a, b) = (run_orb(&f, 1.0 / 30.0, 2.0), run_orb(&f, 1.0 / 144.0, 2.0));
+        for i in 0..4 {
+            assert!(
+                (a.orb_band[i] - b.orb_band[i]).abs() < 0.03,
+                "{i}: {:?} {:?}",
+                a.orb_band,
+                b.orb_band
+            );
+        }
+        for i in 0..2 {
+            assert!(
+                (a.orb_flow[i] - b.orb_flow[i]).abs() < 0.03,
+                "{:?} {:?}",
+                a.orb_flow,
+                b.orb_flow
+            );
+        }
+    }
+
+    #[test]
+    fn orb_bass_attacks_fast_and_releases_slowly() {
+        let mut m = SceneMapper::new(MapTuning::default());
+        let loud = loud_frame(1.0, 0.0);
+        for _ in 0..6 {
+            m.update(&live(&loud), 0.01); // 60 ms = one attack time constant
+        }
+        let up = m.update(&live(&loud), 0.0).orb_band[0];
+        assert!(up > 0.4, "attack: {up}");
+        for _ in 0..100 {
+            m.update(&live(&loud), 0.01);
+        }
+        let quiet = loud_frame(0.0, 0.0);
+        for _ in 0..70 {
+            m.update(&live(&quiet), 0.01); // 700 ms = one release time constant
+        }
+        let down = m.update(&live(&quiet), 0.0).orb_band[0];
+        assert!(down > 0.25 && down < 0.5, "release after 700 ms: {down}");
+    }
+
+    #[test]
+    fn silence_has_no_ripples_and_a_slow_dim_orb() {
+        let mut m = SceneMapper::new(MapTuning::default());
+        let silent = AudioFrame::default();
+        let mut p = m.update(&live(&silent), 1.0 / 60.0);
+        let mut prev = p.orb_flow;
+        for _ in 0..600 {
+            p = m.update(
+                &Input {
+                    onsets: 1,
+                    onset_strength: 1.0,
+                    ..live(&silent)
+                },
+                1.0 / 60.0,
+            );
+            assert!(p.rings.iter().all(|r| r[1] == 0.0), "ripple in silence");
+            assert!(p.orb_band.iter().all(|&b| b < 1e-3), "{:?}", p.orb_band);
+            assert!(
+                (p.orb_flow[0] - prev[0]) * 60.0 <= 0.0125,
+                "flow speed in silence"
+            );
+            prev = p.orb_flow;
+        }
+    }
+
+    #[test]
+    fn calm_music_caps_motion_and_flow_never_goes_backwards() {
+        let mut m = SceneMapper::new(MapTuning::default());
+        let mut f = loud_frame(0.1, 0.1);
+        f.group_medium = [0.1, 0.1, 1.0, 1.0, 0.1, 0.1]; // strong mids but low energy
+        f.energy = 0.05;
+        let mut prev = [0.0f32; 4];
+        for i in 0..1200 {
+            let p = m.update(&live(&f), 1.0 / 60.0);
+            if i > 300 {
+                assert!(
+                    (p.orb_flow[0] - prev[0]) * 60.0 < 0.08,
+                    "calm flow {}",
+                    (p.orb_flow[0] - prev[0]) * 60.0
+                );
+                assert!(p.orb_flow[0] >= prev[0] && p.orb_flow[1] >= prev[1]);
+            }
+            prev = p.orb_flow;
+        }
+    }
+
+    #[test]
+    fn every_onset_starts_a_ripple_from_a_new_impact_point_and_at_most_two_live() {
+        let mut m = SceneMapper::new(MapTuning::default());
+        let f = loud_frame(0.8, 0.5);
+        let mut origins = Vec::new();
+        for k in 0..4 {
+            for _ in 0..30 {
+                m.update(&live(&f), 1.0 / 60.0);
+            }
+            let p = m.update(
+                &Input {
+                    onsets: 1,
+                    onset_strength: 0.8,
+                    ..live(&f)
+                },
+                1.0 / 60.0,
+            );
+            assert!(p.rings[0][1] > 0.0 && p.rings[0][0] < 0.05, "onset {k}");
+            assert!((0.0..1.0).contains(&p.orb_flow[2]), "onset {k}");
+            origins.push(p.orb_flow[2]);
+        }
+        origins.dedup_by(|a, b| (*a - *b).abs() < 1e-6);
+        assert_eq!(origins.len(), 4, "every onset moves the impact point");
     }
 }

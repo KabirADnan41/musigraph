@@ -70,6 +70,28 @@ fn render_all(ticks: &[Tick]) -> Option<Measured> {
     })
 }
 
+/// Orb: largest mean-luminance change within any 100 ms over the same tick series (flash/flicker guard; `None` without a GPU).
+fn orb_flicker(ticks: &[Tick]) -> Option<f32> {
+    let h = headless().ok()?;
+    let scene = SceneSet::new_headless(&h.device);
+    let mut lum = Vec::with_capacity(ticks.len());
+    for t in ticks {
+        let img = scene
+            .render_offscreen_scenes(
+                &h.device,
+                &h.queue,
+                RES,
+                &t.params,
+                SceneKind::Orb,
+                None,
+                &|_, _| {},
+            )
+            .ok()?;
+        lum.push(region_lum(&img, 0, RES.0, 0, RES.1));
+    }
+    Some(max_delta_100ms(&lum))
+}
+
 /// Largest absolute change of mean frame luminance within any 100 ms window.
 fn max_delta_100ms(lum: &[f32]) -> f32 {
     let w = (FPS * 0.1).round() as usize;
@@ -112,6 +134,7 @@ fn presentation_previews(failures: &mut Vec<String>) -> bool {
             pres.set_lyric_anchor(match kind {
                 SceneKind::Spectrum => 0.70,
                 SceneKind::Aurora => 0.72,
+                SceneKind::Orb => 0.72,
                 SceneKind::Focus if layout == Layout::Center => 0.80,
                 SceneKind::Focus => 0.72,
             });
@@ -236,6 +259,114 @@ fn presentation_previews(failures: &mut Vec<String>) -> bool {
     true
 }
 
+/// Orb: real analyzer + mapper on the synthetic fixtures, rendered headless (Orb scene only). Returns whether a
+/// GPU was available. Thresholds are on mean absolute byte difference (0..255) at 160x90 and sit well below the
+/// measured differences but far above render noise (identical params give 0).
+fn orb_checks(failures: &mut Vec<String>) -> bool {
+    let Ok(h) = headless() else { return false };
+    let scene = SceneSet::new_headless(&h.device);
+    let render = |p: &mg_gfx::scene::SceneParams| {
+        scene.render_offscreen_scenes(
+            &h.device,
+            &h.queue,
+            RES,
+            p,
+            SceneKind::Orb,
+            None,
+            &|_, _| {},
+        )
+    };
+    let mad = |a: &[u8], b: &[u8]| {
+        a.iter()
+            .zip(b)
+            .map(|(x, y)| u64::from(x.abs_diff(*y)))
+            .sum::<u64>() as f64
+            / a.len() as f64
+    };
+    let mut frames = Vec::new();
+    for name in ["silence", "bass", "treble", "kick"] {
+        let x = fixture(name, SR).expect("fixture");
+        let ticks = Sim::new(SR, FPS, MapTuning::default()).run(&x[..x.len().min(SR as usize * 8)]);
+        // kick: a frame 0.25 s into a ripple, so the travelling wave is on screen
+        let pick = ticks
+            .iter()
+            .rev()
+            .find(|t| t.params.rings[0][1] > 0.0 && (0.2..0.3).contains(&t.params.rings[0][0]))
+            .unwrap_or_else(|| ticks.last().expect("ticks"));
+        let p = pick.params.clone();
+        let Ok(img) = render(&p) else {
+            failures.push(format!("orb/{name}: render failed"));
+            continue;
+        };
+        let orb = region_lum(&img, 80, 100, 30, 50);
+        let corners = (region_lum(&img, 0, 20, 0, 15) + region_lum(&img, 140, 160, 75, 90)) / 2.0;
+        println!(
+            "ORB {name:8} bands={:.2?} ripple_age={:.2} orb_lum={orb:.3} corner_lum={corners:.3}",
+            p.orb_band, p.rings[0][0]
+        );
+        if !(orb.is_finite() && orb > 0.02 && orb > corners + 0.02) {
+            failures.push(format!(
+                "orb/{name}: orb {orb:.3} must be brighter than corners {corners:.3}"
+            ));
+        }
+        if let Ok(dir) = std::env::var("MG_SCENE_DUMP") {
+            let big = scene.render_offscreen_scenes(
+                &h.device,
+                &h.queue,
+                (960, 540),
+                &p,
+                SceneKind::Orb,
+                None,
+                &|_, _| {},
+            );
+            if let Ok(big) = big {
+                let _ = std::fs::write(
+                    format!("{dir}/orb-{name}.png"),
+                    mg_media::synth::png_rgba(960, 540, &big),
+                );
+            }
+        }
+        if name == "kick" {
+            let mut calm = p.clone();
+            calm.rings = [[100.0, 0.0]; 2];
+            if let Ok(b) = render(&calm) {
+                let d = mad(&img, &b);
+                println!("ORB kick ripple vs same frame without ripple: mad={d:.3}");
+                if !(0.05..8.0).contains(&d) {
+                    failures.push(format!(
+                        "orb/kick: ripple difference {d:.3} outside 0.05..8 (no flash, but visible)"
+                    ));
+                }
+            }
+        }
+        frames.push((name, img));
+    }
+    if let [(_, s), (_, b), (_, t), _] = &frames[..] {
+        for (what, d, min) in [
+            ("silence vs bass", mad(s, b), 1.0),
+            ("silence vs treble", mad(s, t), 0.4),
+            ("bass vs treble", mad(b, t), 0.5),
+        ] {
+            println!("ORB {what}: mad={d:.3} (min {min})");
+            if d < min {
+                failures.push(format!(
+                    "orb: {what} frames too similar (mad {d:.3} < {min})"
+                ));
+            }
+        }
+        let (ls, lb) = (
+            region_lum(s, 60, 100, 20, 60),
+            region_lum(b, 60, 100, 20, 60),
+        );
+        if lb < ls * 1.1 {
+            failures.push(format!(
+                "orb: silence {ls:.3} must be dimmer than bass {lb:.3}"
+            ));
+        }
+    }
+    true
+}
+
 pub fn run(allow_no_gpu: bool) -> i32 {
     let mut failures = Vec::new();
     let mut gpu_seen = false;
@@ -277,6 +408,7 @@ pub fn run(allow_no_gpu: bool) -> i32 {
             }
         }
         let measured = render_all(&ticks);
+        let orb_ld = orb_flicker(&ticks);
         gpu_seen |= measured.is_some();
         let (ld, cl, el, ml) = match &measured {
             Some(m) => (
@@ -307,6 +439,10 @@ pub fn run(allow_no_gpu: bool) -> i32 {
         expect(
             ld.is_nan() || ld < 0.10,
             "luminance changed by >= 0.10 within 100 ms",
+        );
+        expect(
+            orb_ld.is_none_or(|d| d.is_finite() && d < 0.10),
+            "orb: luminance changed by >= 0.10 within 100 ms",
         );
         match name {
             "silence" => {
@@ -352,6 +488,7 @@ pub fn run(allow_no_gpu: bool) -> i32 {
         let _ = SLOTS;
     }
     gpu_seen |= presentation_previews(&mut failures);
+    gpu_seen |= orb_checks(&mut failures);
     if !gpu_seen {
         println!(
             "NOTE: no hardware GPU device available; rendered-pixel checks were NOT run (parameter checks ran)."

@@ -11,7 +11,7 @@ use crate::fullscreen::FullscreenRenderer;
 pub const SLOTS: usize = 96;
 const VEC4S: usize = SLOTS / 4;
 /// Bytes of the packed uniform block (must equal the WGSL `U` struct size).
-pub const UNIFORM_BYTES: usize = 16 + 16 + 16 + 16 + 64 + 3 * VEC4S * 16 + 64;
+pub const UNIFORM_BYTES: usize = 16 + 16 + 16 + 16 + 64 + 3 * VEC4S * 16 + 64 + 32;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum SceneMode {
@@ -49,6 +49,10 @@ pub struct SceneParams {
     pub focus_active: f32,
     /// Aurora onset front origin (0..1 across the screen), changes with every onset.
     pub front_x0: f32,
+    /// Orb: (flow phase, rotation phase) in cycles, integrated on the CPU, then the impact azimuths (0..1) of the two onset ripples whose (age, amplitude) live in `rings`.
+    pub orb_flow: [f32; 4],
+    /// Orb: smoothed bass, mid, treble (0..1) and the slow glow breath (0..1).
+    pub orb_band: [f32; 4],
     pub mode: SceneMode,
     pub bars: [f32; SLOTS],
     pub peaks: [f32; SLOTS],
@@ -80,6 +84,8 @@ impl Default for SceneParams {
             focus_rot: 0.0,
             focus_active: 0.0,
             front_x0: 0.5,
+            orb_flow: [0.0; 4],
+            orb_band: [0.0; 4],
             mode: SceneMode::NoAudio,
             bars: [0.0; SLOTS],
             peaks: [0.0; SLOTS],
@@ -136,9 +142,21 @@ impl SceneParams {
             &mut o,
             &[self.focus_rot, self.front_x0, self.focus_active, 0.0],
         );
+        put(&mut o, &self.orb_flow);
+        put(&mut o, &self.orb_band);
         debug_assert_eq!(o.len(), UNIFORM_BYTES);
         o
     }
+}
+
+/// How far a scene has come. Technical verification (builds, tests, measured pixels and frame time) is not
+/// artistic acceptance: `Accepted` is only ever set by the owner.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Lifecycle {
+    Experimental,
+    TechnicallyVerified,
+    EvaluationPending,
+    Accepted,
 }
 
 /// The visual styles. Each has its own composition and animation algorithm; all read the same `SceneParams`.
@@ -150,21 +168,56 @@ pub enum SceneKind {
     Aurora,
     /// Atmosphere radiating from the album artwork.
     Focus,
+    /// One softly lit, audio-displaced sphere.
+    Orb,
 }
 
 impl SceneKind {
-    pub const ALL: [SceneKind; 3] = [SceneKind::Spectrum, SceneKind::Aurora, SceneKind::Focus];
+    /// Every scene, in pipeline order (`index()` is the pipeline index: never reorder).
+    pub const ALL: [SceneKind; 4] = [
+        SceneKind::Spectrum,
+        SceneKind::Aurora,
+        SceneKind::Focus,
+        SceneKind::Orb,
+    ];
+
+    /// Lifecycle stage: the single source of truth for what the scene selector offers.
+    pub fn lifecycle(self) -> Lifecycle {
+        match self {
+            SceneKind::Spectrum | SceneKind::Focus => Lifecycle::TechnicallyVerified,
+            SceneKind::Aurora => Lifecycle::Experimental,
+            SceneKind::Orb => Lifecycle::TechnicallyVerified,
+        }
+    }
+
+    /// Offered by the scene selector (keys, cycling, `--auto-scenes`): everything past `Experimental`.
+    pub fn in_selector(self) -> bool {
+        self.lifecycle() != Lifecycle::Experimental
+    }
+
+    /// Selector scenes in stable declared order.
+    pub fn selector() -> impl Iterator<Item = SceneKind> {
+        Self::ALL.into_iter().filter(|k| k.in_selector())
+    }
 
     pub fn index(self) -> usize {
         self as usize
     }
 
+    /// Next selector scene (an experimental scene continues at the first selector scene).
     pub fn next(self) -> Self {
-        Self::ALL[(self.index() + 1) % Self::ALL.len()]
+        let v: Vec<_> = Self::selector().collect();
+        v[v.iter()
+            .position(|k| *k == self)
+            .map_or(0, |i| (i + 1) % v.len())]
     }
 
     pub fn prev(self) -> Self {
-        Self::ALL[(self.index() + Self::ALL.len() - 1) % Self::ALL.len()]
+        let v: Vec<_> = Self::selector().collect();
+        let n = v.len();
+        v[v.iter()
+            .position(|k| *k == self)
+            .map_or(n - 1, |i| (i + n - 1) % n)]
     }
 
     pub fn name(self) -> &'static str {
@@ -172,6 +225,7 @@ impl SceneKind {
             SceneKind::Spectrum => "spectrum",
             SceneKind::Aurora => "aurora",
             SceneKind::Focus => "focus",
+            SceneKind::Orb => "orb",
         }
     }
 
@@ -183,6 +237,7 @@ impl SceneKind {
 const SPECTRUM_WGSL: &str = concat!(include_str!("common.wgsl"), include_str!("spectrum.wgsl"));
 const AURORA_WGSL: &str = concat!(include_str!("common.wgsl"), include_str!("aurora.wgsl"));
 const FOCUS_WGSL: &str = concat!(include_str!("common.wgsl"), include_str!("focus.wgsl"));
+const ORB_WGSL: &str = concat!(include_str!("common.wgsl"), include_str!("orb.wgsl"));
 
 /// All scene pipelines, created up front (a scene switch never compiles), sharing one uniform block.
 pub struct SceneSet {
@@ -197,7 +252,7 @@ impl SceneSet {
                 format,
                 scale,
                 "scenes",
-                &[SPECTRUM_WGSL, AURORA_WGSL, FOCUS_WGSL],
+                &[SPECTRUM_WGSL, AURORA_WGSL, FOCUS_WGSL, ORB_WGSL],
                 UNIFORM_BYTES,
             ),
         }
@@ -321,7 +376,7 @@ mod tests {
         p.dust = 0.25;
         let b = p.pack((1280, 720));
         assert_eq!(b.len(), UNIFORM_BYTES);
-        assert_eq!(UNIFORM_BYTES, 1344);
+        assert_eq!(UNIFORM_BYTES, 1376);
         assert_eq!(f32_at(&b, 0), 1280.0);
         assert_eq!(f32_at(&b, 16), 0.7); // glow
         assert_eq!(f32_at(&b, 44), 0.0); // mode live
@@ -335,9 +390,53 @@ mod tests {
             src.contains("array<vec4<f32>, 24>")
                 && src.contains("pal3: vec4<f32>")
                 && src.contains("ex3: vec4<f32>")
+                && src.contains("ex5: vec4<f32>")
         );
         // extras sit after the three slot arrays: 128 (bars) + 3 * 96 * 4 = 1280
         assert_eq!(f32_at(&b, 1280), 0.0);
+        let q = SceneParams {
+            orb_flow: [1.0, 2.0, 3.0, 4.0],
+            orb_band: [5.0, 6.0, 7.0, 8.0],
+            ..Default::default()
+        };
+        let b = q.pack((1, 1));
+        assert_eq!((f32_at(&b, 1344), f32_at(&b, 1356)), (1.0, 4.0)); // ex4
+        assert_eq!((f32_at(&b, 1360), f32_at(&b, 1372)), (5.0, 8.0)); // ex5, last float
+        assert_eq!(b.len(), 1376);
+    }
+
+    #[test]
+    fn selector_order_skips_experimental_scenes_and_cycles_stably() {
+        use SceneKind::*;
+        assert_eq!(
+            SceneKind::selector().collect::<Vec<_>>(),
+            [Spectrum, Focus, Orb]
+        );
+        assert_eq!(Aurora.lifecycle(), Lifecycle::Experimental);
+        assert!(!Aurora.in_selector());
+        assert!(
+            SceneKind::ALL
+                .iter()
+                .all(|k| k.lifecycle() != Lifecycle::Accepted),
+            "only the owner accepts"
+        );
+        for k in SceneKind::ALL {
+            assert!(k.next() != Aurora && k.prev() != Aurora, "{k:?}");
+        }
+        assert_eq!(
+            (Spectrum.next(), Focus.next(), Orb.next()),
+            (Focus, Orb, Spectrum)
+        );
+        assert_eq!(
+            (Spectrum.prev(), Focus.prev(), Orb.prev()),
+            (Orb, Spectrum, Focus)
+        );
+        assert_eq!((Aurora.next(), Aurora.prev()), (Spectrum, Orb));
+        assert_eq!(SceneKind::parse("orb"), Some(Orb));
+        assert_eq!(SceneKind::parse("aurora"), Some(Aurora));
+        for (i, k) in SceneKind::ALL.iter().enumerate() {
+            assert_eq!(k.index(), i, "pipeline order");
+        }
     }
 
     #[test]
@@ -508,6 +607,7 @@ mod tests {
             mode: SceneMode::Live,
             energy: 0.6,
             glow: 0.6,
+            orb_band: [0.6, 0.3, 0.5, 0.4],
             ..Default::default()
         };
         for i in 0..SLOTS {
@@ -562,6 +662,15 @@ mod tests {
         );
         // same scene on both sides is just that scene
         assert_eq!(render(SceneKind::Aurora, Some((SceneKind::Aurora, 0.5))), b);
+        // a fourth scene crosses over like the others
+        let o = render(SceneKind::Orb, None);
+        assert!(
+            diff(&o, &a) > 3.0 && diff(&o, &b) > 3.0 && diff(&o, &c) > 3.0,
+            "orb differs"
+        );
+        let ox = render(SceneKind::Orb, Some((SceneKind::Aurora, 1.0)));
+        assert!(maxd(&ox, &b) <= 2, "orb -> aurora t=1 shows aurora");
+        orb_is_a_lit_sphere_that_answers_to_bass_treble_and_onsets(&h, &scene);
     }
 
     #[test]
@@ -594,5 +703,100 @@ mod tests {
         let max = a.iter().zip(&b).map(|(x, y)| x.abs_diff(*y)).max().unwrap();
         assert!(max <= 3, "phase 0 and 64 cycles differ by {max} levels");
         assert!(a != render(&mk(0.3)), "the phase must move the ribbons");
+    }
+    /// Mean absolute per-byte difference between two frames (0..255).
+    fn mad(x: &[u8], y: &[u8]) -> f64 {
+        x.iter()
+            .zip(y)
+            .map(|(p, q)| p.abs_diff(*q) as u64)
+            .sum::<u64>() as f64
+            / x.len() as f64
+    }
+
+    /// Orb checks share the crossfade test's device: parallel headless devices can run out of GPU memory.
+    fn orb_is_a_lit_sphere_that_answers_to_bass_treble_and_onsets(
+        h: &crate::context::Headless,
+        scene: &SceneSet,
+    ) {
+        let res = (320u32, 180u32);
+        let base = SceneParams {
+            mode: SceneMode::Live,
+            energy: 0.1,
+            glow: 0.25,
+            haze: 0.3,
+            ..Default::default()
+        };
+        let loud = |band: [f32; 4]| SceneParams {
+            energy: 0.7,
+            glow: 0.7,
+            orb_band: band,
+            orb_flow: [3.3, 1.7, 0.0, 0.0],
+            ..base.clone()
+        };
+        let render = |p: &SceneParams| {
+            let img = scene
+                .render_offscreen_scenes(
+                    &h.device,
+                    &h.queue,
+                    res,
+                    p,
+                    SceneKind::Orb,
+                    None,
+                    &|_, _| {},
+                )
+                .unwrap();
+            assert_eq!(img.len(), (res.0 * res.1 * 4) as usize);
+            img
+        };
+        let silence = render(&base);
+        let bass = render(&loud([0.9, 0.2, 0.1, 0.8]));
+        let treble = render(&loud([0.1, 0.2, 0.9, 0.1]));
+        let mut kick = loud([0.5, 0.2, 0.1, 0.4]);
+        kick.rings = [[0.25, 0.15], [100.0, 0.0]];
+        kick.orb_flow[2] = 0.3;
+        let kick = render(&kick);
+        // the orb region (centre 0.57,0.44, radius 0.22 h = 40 px) is brighter than the corners
+        let (cx, cy) = (182u32, 79u32);
+        for img in [&silence, &bass, &treble, &kick] {
+            let orb = mean_lum(img, res.0, cx - 20, cx + 20, cy - 20, cy + 20);
+            let corners = (mean_lum(img, res.0, 0, 30, 0, 30)
+                + mean_lum(img, res.0, 290, 320, 150, 180))
+                / 2.0;
+            assert!(
+                orb > 0.04 && orb > corners + 0.03,
+                "orb {orb} corners {corners}"
+            );
+        }
+        // silence is dim; bass lifts and reshapes the sphere; treble and a ripple each change the frame clearly
+        let lum = |img: &[u8]| mean_lum(img, res.0, cx - 40, cx + 40, cy - 40, cy + 40);
+        assert!(
+            lum(&bass) > lum(&silence) * 1.15,
+            "silence {} bass {}",
+            lum(&silence),
+            lum(&bass)
+        );
+        assert!(
+            mad(&silence, &bass) > 1.0,
+            "silence vs bass {}",
+            mad(&silence, &bass)
+        );
+        assert!(
+            mad(&silence, &treble) > 1.0,
+            "silence vs treble {}",
+            mad(&silence, &treble)
+        );
+        assert!(
+            mad(&bass, &treble) > 0.5,
+            "bass vs treble {}",
+            mad(&bass, &treble)
+        );
+        let mut no_kick = loud([0.5, 0.2, 0.1, 0.4]);
+        no_kick.orb_flow[2] = 0.3;
+        assert!(
+            mad(&render(&no_kick), &kick) > 0.1,
+            "a ripple must be visible"
+        );
+        // no full-screen flash: the ripple frame stays close to the same frame without it
+        assert!(mad(&render(&no_kick), &kick) < 6.0);
     }
 }

@@ -94,7 +94,7 @@ pub fn parse(args: &[String], source: Source) -> Result<SceneOpts, String> {
                 o.style = it
                     .next()
                     .and_then(|v| SceneKind::parse(v))
-                    .ok_or("--style needs spectrum|aurora|focus")?;
+                    .ok_or("--style needs spectrum|focus|orb|aurora")?;
             }
             "--auto-scenes" => {
                 o.auto_scenes = Some(
@@ -384,9 +384,9 @@ impl ApplicationHandler for App {
                 let to = match code {
                     KeyCode::ArrowLeft => from.prev(),
                     KeyCode::ArrowRight => from.next(),
-                    KeyCode::Digit1 => SceneKind::Spectrum,
-                    KeyCode::Digit2 => SceneKind::Aurora,
-                    _ => SceneKind::Focus,
+                    KeyCode::Digit1 => SceneKind::selector().nth(0).unwrap_or(SceneKind::Spectrum),
+                    KeyCode::Digit2 => SceneKind::selector().nth(1).unwrap_or(SceneKind::Spectrum),
+                    _ => SceneKind::selector().nth(2).unwrap_or(SceneKind::Spectrum),
                 };
                 self.switch.request(to);
                 self.last_auto_switch = Instant::now(); // a manual choice restarts the tour timer
@@ -550,6 +550,7 @@ impl App {
         self.pres.set_lyric_anchor(match self.switch.target() {
             SceneKind::Spectrum => 0.70,
             SceneKind::Aurora => 0.72,
+            SceneKind::Orb => 0.72,
             SceneKind::Focus if self.pres.layout() == Layout::Center => 0.80,
             SceneKind::Focus => 0.72,
         });
@@ -749,6 +750,9 @@ pub fn run(opts: SceneOpts) -> i32 {
         _ => LyricSource::None,
     };
     let style = opts.style;
+    if style.lifecycle() == mg_gfx::scene::Lifecycle::Experimental {
+        eprintln!("experimental scene: {}", style.name());
+    }
     let tune = MapTuning::default();
     let stale_after = Duration::from_secs_f32(tune.stale_after_s);
     let mut app = App {
@@ -934,6 +938,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(o.style, SceneKind::Aurora);
+        assert_eq!(parse(&a(&[]), Source::Live).unwrap().auto_scenes, None);
         assert_eq!(o.layout, Layout::Center);
         assert_eq!(o.media, MediaChoice::Demo);
         assert_eq!(o.auto_scenes, Some(30));
@@ -948,8 +953,13 @@ mod tests {
         ] {
             assert!(parse(&a(bad), Source::Live).is_err(), "{bad:?}");
         }
-        assert_eq!(SceneKind::Focus.next(), SceneKind::Spectrum);
-        assert_eq!(SceneKind::Spectrum.prev(), SceneKind::Focus);
+        assert_eq!(SceneKind::Focus.next(), SceneKind::Orb);
+        assert_eq!(SceneKind::Orb.next(), SceneKind::Spectrum);
+        assert_eq!(SceneKind::Spectrum.prev(), SceneKind::Orb);
+        assert_eq!(
+            parse(&a(&["--style", "orb"]), Source::Live).unwrap().style,
+            SceneKind::Orb
+        );
         assert_eq!(SceneKind::parse("focus"), Some(SceneKind::Focus));
     }
 }

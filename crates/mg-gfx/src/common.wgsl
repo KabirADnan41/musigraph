@@ -23,6 +23,8 @@ struct U {
     ex1: vec4<f32>,  // aurora: band levels, bass to treble
     ex2: vec4<f32>,  // focus: artwork centre (uv x, uv y), half size (screen heights)
     ex3: vec4<f32>,  // focus: rotation phase, onset-front origin x, artwork present (0/1), unused
+    ex4: vec4<f32>,  // orb: flow phase, rotation phase (cycles), ripple 0 and 1 impact azimuths
+    ex5: vec4<f32>,  // orb: bass, mid, treble, breath
 };
 @group(0) @binding(0) var<uniform> u: U;
 

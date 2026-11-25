@@ -119,7 +119,14 @@ pub struct Headless {
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
     pub info: wgpu::AdapterInfo,
+    /// Held for the life of the device: see `HEADLESS_LOCK`. Declared last so it is released after the device.
+    _exclusive: std::sync::MutexGuard<'static, ()>,
 }
+
+/// Only one headless device may exist at a time. Several full-scene devices created in parallel (tests run on
+/// all cores) exhaust the video memory of small GPUs (2 GB class) and fail with "Out of Memory"; this is a
+/// resource limit of the machine, not a defect to hide, so the devices are serialised instead.
+static HEADLESS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Creates a headless hardware device using the first backend of `AUTO_ORDER` that works.
 /// Software adapters are rejected, so tests can never silently measure a CPU renderer.
@@ -129,6 +136,9 @@ pub fn init_headless() -> Result<Headless, String> {
 
 /// Like `init_headless` but tries only the given backends, in order (used to verify one backend).
 pub fn init_headless_order(order: &[BackendChoice]) -> Result<Headless, String> {
+    let exclusive = HEADLESS_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut failures = Vec::new();
     for &b in order {
         let mut desc = wgpu::InstanceDescriptor::new_without_display_handle();
@@ -160,6 +170,7 @@ pub fn init_headless_order(order: &[BackendChoice]) -> Result<Headless, String> 
                     device,
                     queue,
                     info,
+                    _exclusive: exclusive,
                 });
             }
             Err(e) => failures.push(format!("{b:?}: {e}")),

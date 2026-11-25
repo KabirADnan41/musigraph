@@ -150,4 +150,16 @@ mod tests {
         let (_, x) = s.update(0.0);
         assert!(x.is_none_or(|(_, t)| (0.0..=1.0).contains(&t)));
     }
+
+    #[test]
+    fn an_experimental_scene_works_as_start_and_target_and_the_switch_owns_no_audio_state() {
+        assert!(!Aurora.in_selector());
+        let mut s = SceneSwitch::new(Aurora);
+        assert_eq!(s.update(0.1), (Aurora, None));
+        assert!(s.request(Spectrum));
+        assert_eq!(run(&mut s, 2.0), (Spectrum, None));
+        // the selector never offers it
+        assert_eq!(s.target().next().next().next(), Spectrum);
+        assert!(SceneKind::selector().all(|k| k != Aurora));
+    }
 }
