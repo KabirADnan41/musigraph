@@ -9,7 +9,8 @@
 //! dropped with `Dispatch::Busy`. `send` never blocks the caller. No queue exists. The real WinRT calls sit
 //! behind `SessionBackend` so tests use a fake and never touch a live player.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use crate::PlaybackState;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -67,6 +68,27 @@ impl Capabilities {
     }
 }
 
+impl Capabilities {
+    /// The command to actually send, or `None` if unsupported. Toggle falls back to Play/Pause by the
+    /// current playback `state` when the player has no toggle flag.
+    pub fn resolve(&self, c: MediaCommand, state: PlaybackState) -> Option<MediaCommand> {
+        if self.allows(c) {
+            return Some(c);
+        }
+        match (c, state) {
+            (MediaCommand::TogglePlayPause, PlaybackState::Playing) if self.can_pause => {
+                Some(MediaCommand::Pause)
+            }
+            (MediaCommand::TogglePlayPause, PlaybackState::Paused | PlaybackState::Stopped)
+                if self.can_play =>
+            {
+                Some(MediaCommand::Play)
+            }
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum MediaCommand {
     Play,
@@ -100,13 +122,21 @@ pub enum CommandResult {
     Failed(FailClass),
     NoSession,
     Unsupported,
-    Busy,
 }
 
 /// The only place real session calls happen. `execute` runs on a worker thread, must resolve the selected
 /// session itself, re-check capabilities/seek range, and be bounded in time.
 pub trait SessionBackend: Send + Sync + 'static {
     fn execute(&self, cmd: MediaCommand) -> CommandResult;
+}
+
+/// Seekable range in ticks: the session's Min/MaxSeekTime when both are readable and non-empty, else
+/// Start/End.
+pub fn seek_range(min: Option<i64>, max: Option<i64>, start: i64, end: i64) -> (i64, i64) {
+    match (min, max) {
+        (Some(a), Some(b)) if b > a => (a, b),
+        _ => (start, end),
+    }
 }
 
 /// Target for a seek in 100 ns ticks within `[start, end]`. NaN or an empty range => `None`; negative or huge
@@ -123,7 +153,20 @@ pub fn seek_ticks(target_s: f64, start: i64, end: i64) -> Option<i64> {
 struct Inner {
     busy: AtomicBool,
     last_accept: Mutex<Option<Instant>>,
-    result: Mutex<Option<CommandResult>>,
+    /// Last issued command sequence number.
+    seq: AtomicU64,
+    /// Result with the sequence of the command that produced it; only a higher sequence replaces it.
+    result: Mutex<Option<(u64, CommandResult)>>,
+}
+
+impl Inner {
+    fn record(&self, seq: u64, r: CommandResult) {
+        if let Ok(mut g) = self.result.lock() {
+            if g.is_none_or(|(s, _)| seq > s) {
+                *g = Some((seq, r));
+            }
+        }
+    }
 }
 
 /// Sends commands to the selected session off the caller's thread.
@@ -133,16 +176,14 @@ pub struct MediaController {
 }
 
 /// Records the result and clears `busy` even if the backend panics.
-struct Finish(Arc<Inner>, Option<CommandResult>);
+struct Finish(Arc<Inner>, u64, Option<CommandResult>);
 impl Drop for Finish {
     fn drop(&mut self) {
         let r = self
-            .1
+            .2
             .take()
             .unwrap_or(CommandResult::Failed(FailClass::Error));
-        if let Ok(mut g) = self.0.result.lock() {
-            *g = Some(r);
-        }
+        self.0.record(self.1, r);
         self.0.busy.store(false, Ordering::Release);
     }
 }
@@ -161,19 +202,24 @@ impl MediaController {
         Self::new(Arc::new(crate::session::SystemBackend))
     }
 
-    fn note(&self, r: CommandResult) {
-        if let Ok(mut g) = self.inner.result.lock() {
-            *g = Some(r);
-        }
+    fn next_seq(&self) -> u64 {
+        self.inner.seq.fetch_add(1, Ordering::AcqRel) + 1
     }
 
-    /// `caps` are the flags of the latest snapshot; the backend re-checks on the fresh session.
-    pub fn send(&self, cmd: MediaCommand, caps: &Capabilities, now: Instant) -> Dispatch {
-        if !caps.allows(cmd) {
-            self.note(CommandResult::Unsupported);
+    /// `caps` and `state` are from the latest snapshot; the backend re-checks on the fresh session.
+    pub fn send(
+        &self,
+        cmd: MediaCommand,
+        caps: &Capabilities,
+        state: PlaybackState,
+        now: Instant,
+    ) -> Dispatch {
+        let Some(cmd) = caps.resolve(cmd, state) else {
+            let seq = self.next_seq();
+            self.inner.record(seq, CommandResult::Unsupported);
             return Dispatch::Unsupported;
-        }
-        // Busy leaves the in-flight command's result untouched: it is only the dispatch answer.
+        };
+        // Busy is only the dispatch answer: it records nothing and never touches the in-flight result.
         if self
             .inner
             .busy
@@ -193,15 +239,19 @@ impl MediaController {
             self.inner.busy.store(false, Ordering::Release);
             return Dispatch::Busy;
         }
+        let seq = self.next_seq();
         let (backend, inner) = (self.backend.clone(), self.inner.clone());
         let spawned = std::thread::Builder::new()
             .name("mg-media-cmd".into())
             .spawn(move || {
-                let mut fin = Finish(inner, None);
-                fin.1 = Some(backend.execute(cmd));
+                let mut fin = Finish(inner, seq, None);
+                fin.2 = Some(backend.execute(cmd));
             });
         if spawned.is_err() {
-            self.note(CommandResult::Failed(FailClass::Error));
+            // Thread could not start: result is Failed, the dispatch answer is Busy, and this attempt
+            // already consumed the 150 ms gap.
+            self.inner
+                .record(seq, CommandResult::Failed(FailClass::Error));
             self.inner.busy.store(false, Ordering::Release);
             return Dispatch::Busy;
         }
@@ -214,7 +264,11 @@ impl MediaController {
 
     /// Result of the most recent finished (or refused-as-unsupported) command.
     pub fn last_result(&self) -> Option<CommandResult> {
-        self.inner.result.lock().ok().and_then(|g| *g)
+        self.inner
+            .result
+            .lock()
+            .ok()
+            .and_then(|g| g.map(|(_, r)| r))
     }
 }
 
@@ -224,8 +278,11 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
     use std::sync::mpsc;
 
+    const ST: PlaybackState = PlaybackState::Playing;
+
     struct Fake {
         calls: AtomicUsize,
+        last: Mutex<Option<MediaCommand>>,
         reply: CommandResult,
         gate: Mutex<Option<mpsc::Receiver<()>>>,
     }
@@ -233,13 +290,15 @@ mod tests {
         fn new(reply: CommandResult) -> Arc<Self> {
             Arc::new(Self {
                 calls: AtomicUsize::new(0),
+                last: Mutex::new(None),
                 reply,
                 gate: Mutex::new(None),
             })
         }
     }
     impl SessionBackend for Fake {
-        fn execute(&self, _c: MediaCommand) -> CommandResult {
+        fn execute(&self, c: MediaCommand) -> CommandResult {
+            *self.last.lock().unwrap() = Some(c);
             self.calls.fetch_add(1, Ordering::SeqCst);
             let gate = self.gate.lock().unwrap().take();
             if let Some(rx) = gate {
@@ -282,10 +341,13 @@ mod tests {
             ..Default::default()
         };
         let t = Instant::now();
-        assert_eq!(c.send(MediaCommand::Pause, &caps, t), Dispatch::Unsupported);
+        assert_eq!(
+            c.send(MediaCommand::Pause, &caps, ST, t),
+            Dispatch::Unsupported
+        );
         assert_eq!(c.last_result(), Some(CommandResult::Unsupported));
         assert_eq!(f.calls.load(Ordering::SeqCst), 0);
-        assert_eq!(c.send(MediaCommand::Next, &caps, t), Dispatch::Started);
+        assert_eq!(c.send(MediaCommand::Next, &caps, ST, t), Dispatch::Started);
         settle(&c);
         assert_eq!(f.calls.load(Ordering::SeqCst), 1);
         assert_eq!(c.last_result(), Some(CommandResult::Ok));
@@ -298,7 +360,7 @@ mod tests {
             CommandResult::NoSession,
         ] {
             let c = MediaController::new(Fake::new(r));
-            let d = c.send(MediaCommand::Play, &Capabilities::all(), Instant::now());
+            let d = c.send(MediaCommand::Play, &Capabilities::all(), ST, Instant::now());
             assert_eq!(d, Dispatch::Started);
             settle(&c);
             assert_eq!(c.last_result(), Some(r));
@@ -314,17 +376,105 @@ mod tests {
         let t0 = Instant::now();
         let all = Capabilities::all();
         let at = |ms| t0 + Duration::from_millis(ms);
-        assert_eq!(c.send(MediaCommand::Next, &all, t0), Dispatch::Started);
+        assert_eq!(c.send(MediaCommand::Next, &all, ST, t0), Dispatch::Started);
         // in flight: even long after the gap a second command is Busy and never reaches the backend
-        assert_eq!(c.send(MediaCommand::Next, &all, at(1000)), Dispatch::Busy);
+        assert_eq!(
+            c.send(MediaCommand::Next, &all, ST, at(1000)),
+            Dispatch::Busy
+        );
         tx.send(()).unwrap();
         settle(&c);
         assert_eq!(f.calls.load(Ordering::SeqCst), 1);
         // finished but inside the 150 ms window: dropped; after it: accepted
-        assert_eq!(c.send(MediaCommand::Next, &all, at(100)), Dispatch::Busy);
-        assert_eq!(c.send(MediaCommand::Next, &all, at(160)), Dispatch::Started);
+        assert_eq!(
+            c.send(MediaCommand::Next, &all, ST, at(100)),
+            Dispatch::Busy
+        );
+        assert_eq!(
+            c.send(MediaCommand::Next, &all, ST, at(160)),
+            Dispatch::Started
+        );
         settle(&c);
         assert_eq!(f.calls.load(Ordering::SeqCst), 2);
+    }
+
+    fn toggle_via(caps: Capabilities, st: PlaybackState) -> (Dispatch, Option<MediaCommand>) {
+        let f = Fake::new(CommandResult::Ok);
+        let c = MediaController::new(f.clone());
+        let d = c.send(MediaCommand::TogglePlayPause, &caps, st, Instant::now());
+        if d == Dispatch::Started {
+            settle(&c);
+        }
+        let last = *f.last.lock().unwrap();
+        (d, last)
+    }
+
+    #[test]
+    fn toggle_falls_back_to_play_or_pause_by_state() {
+        use PlaybackState::*;
+        let tog = Capabilities {
+            can_toggle: true,
+            ..Default::default()
+        };
+        let pp = Capabilities {
+            can_play: true,
+            can_pause: true,
+            ..Default::default()
+        };
+        let started = |m| (Dispatch::Started, Some(m));
+        assert_eq!(
+            toggle_via(tog, Playing),
+            started(MediaCommand::TogglePlayPause)
+        );
+        assert_eq!(toggle_via(pp, Playing), started(MediaCommand::Pause));
+        assert_eq!(toggle_via(pp, Paused), started(MediaCommand::Play));
+        assert_eq!(toggle_via(pp, Stopped), started(MediaCommand::Play));
+        assert_eq!(toggle_via(pp, Other), (Dispatch::Unsupported, None));
+        let only_play = Capabilities {
+            can_play: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            toggle_via(only_play, Playing),
+            (Dispatch::Unsupported, None)
+        );
+        assert_eq!(
+            toggle_via(Capabilities::default(), Paused),
+            (Dispatch::Unsupported, None)
+        );
+    }
+
+    #[test]
+    fn older_finish_never_overwrites_newer_result() {
+        let f = Fake::new(CommandResult::Ok);
+        let (tx, rx) = mpsc::channel();
+        *f.gate.lock().unwrap() = Some(rx);
+        let c = MediaController::new(f.clone());
+        let caps = Capabilities {
+            can_next: true,
+            ..Default::default()
+        };
+        let t = Instant::now();
+        assert_eq!(c.send(MediaCommand::Next, &caps, ST, t), Dispatch::Started);
+        // a later unsupported command is recorded while the first is in flight
+        assert_eq!(
+            c.send(MediaCommand::Pause, &caps, ST, t),
+            Dispatch::Unsupported
+        );
+        // Busy records nothing
+        assert_eq!(c.send(MediaCommand::Next, &caps, ST, t), Dispatch::Busy);
+        assert_eq!(c.last_result(), Some(CommandResult::Unsupported));
+        tx.send(()).unwrap();
+        settle(&c);
+        assert_eq!(c.last_result(), Some(CommandResult::Unsupported));
+    }
+
+    #[test]
+    fn seek_range_prefers_min_max() {
+        assert_eq!(seek_range(Some(5), Some(50), 0, 100), (5, 50));
+        assert_eq!(seek_range(None, Some(50), 0, 100), (0, 100));
+        assert_eq!(seek_range(Some(5), None, 0, 100), (0, 100));
+        assert_eq!(seek_range(Some(9), Some(9), 0, 100), (0, 100));
     }
 
     #[test]
@@ -336,7 +486,7 @@ mod tests {
             }
         }
         let c = MediaController::new(Arc::new(Boom));
-        let d = c.send(MediaCommand::Play, &Capabilities::all(), Instant::now());
+        let d = c.send(MediaCommand::Play, &Capabilities::all(), ST, Instant::now());
         assert_eq!(d, Dispatch::Started);
         settle(&c);
         assert_eq!(
@@ -358,9 +508,8 @@ mod tests {
         assert_eq!(seek_ticks(5.0, 7, 3), None);
         assert_eq!(seek_ticks(1.0, 5 * s, 10 * s), Some(6 * s));
         assert_eq!(seek_ticks(1e30, 0, i64::MAX), Some(i64::MAX));
-        // hostile range: never panics and stays inside [start, end]
-        let v = seek_ticks(1e30, i64::MIN, i64::MAX).unwrap();
-        assert!((i64::MIN..=i64::MAX).contains(&v));
+        // hostile range: must not panic (saturating arithmetic)
+        assert!(seek_ticks(1e30, i64::MIN, i64::MAX).is_some());
         assert_eq!(seek_ticks(1e30, i64::MAX - 5, i64::MAX), Some(i64::MAX));
     }
 }

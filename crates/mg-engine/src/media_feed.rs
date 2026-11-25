@@ -152,9 +152,15 @@ impl MediaFeed {
     /// simulated immediately; Off: unsupported.
     pub fn send(&mut self, cmd: MediaCommand, now: Instant) -> Dispatch {
         let caps = self.caps();
+        let state = match self {
+            MediaFeed::Live { cache, .. } => {
+                cache.as_ref().map_or(PlaybackState::Other, |n| n.state)
+            }
+            _ => PlaybackState::Other,
+        };
         match self {
             MediaFeed::Off => Dispatch::Unsupported,
-            MediaFeed::Live { controller, .. } => controller.send(cmd, &caps, now),
+            MediaFeed::Live { controller, .. } => controller.send(cmd, &caps, state, now),
             MediaFeed::Demo(d) => {
                 let r = d.apply(cmd, now);
                 d.last = Some(r);

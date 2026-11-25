@@ -2,7 +2,7 @@
 //! selected session as a `NowPlaying` snapshot. WinRT calls through windows-rs are safe code.
 
 use crate::control::{
-    Capabilities, CommandResult, FailClass, MediaCommand, SessionBackend, seek_ticks,
+    Capabilities, CommandResult, FailClass, MediaCommand, SessionBackend, seek_range, seek_ticks,
 };
 use crate::{
     Candidate, MAX_ART_BYTES, NowPlaying, PlaybackState, sanitize_text, select_session,
@@ -207,7 +207,7 @@ impl SessionBackend for SystemBackend {
 
 fn run_command(cmd: MediaCommand) -> CommandResult {
     let Some(mgr) = wait!(Manager::RequestAsync()) else {
-        return CommandResult::NoSession;
+        return CommandResult::Failed(FailClass::Error); // failure or timeout, not "no session"
     };
     let Ok((sessions, cands)) = candidates(&mgr) else {
         return CommandResult::Failed(FailClass::Error);
@@ -216,9 +216,10 @@ fn run_command(cmd: MediaCommand) -> CommandResult {
         return CommandResult::NoSession;
     };
     let s = &sessions[i];
-    if !read_caps(s).allows(cmd) {
+    // Fresh caps and state: Toggle may translate to Play/Pause when the player has no toggle flag.
+    let Some(cmd) = read_caps(s).resolve(cmd, cands[i].state) else {
         return CommandResult::Unsupported;
-    }
+    };
     let done = match cmd {
         MediaCommand::Play => wait!(s.TryPlayAsync()),
         MediaCommand::Pause => wait!(s.TryPauseAsync()),
@@ -227,12 +228,21 @@ fn run_command(cmd: MediaCommand) -> CommandResult {
         MediaCommand::Previous => wait!(s.TrySkipPreviousAsync()),
         MediaCommand::SeekTo(secs) => {
             let Ok(t) = s.GetTimelineProperties() else {
-                return CommandResult::Unsupported;
+                return CommandResult::Failed(FailClass::Error);
             };
             let tick = |r: windows::core::Result<windows::Foundation::TimeSpan>| {
                 r.map_or(0, |d| d.Duration)
             };
-            let Some(target) = seek_ticks(secs, tick(t.StartTime()), tick(t.EndTime())) else {
+            let opt = |r: windows::core::Result<windows::Foundation::TimeSpan>| {
+                r.ok().map(|d| d.Duration)
+            };
+            let (lo, hi) = seek_range(
+                opt(t.MinSeekTime()),
+                opt(t.MaxSeekTime()),
+                tick(t.StartTime()),
+                tick(t.EndTime()),
+            );
+            let Some(target) = seek_ticks(secs, lo, hi) else {
                 return CommandResult::Unsupported;
             };
             wait!(s.TryChangePlaybackPositionAsync(target))
