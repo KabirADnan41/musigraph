@@ -1,7 +1,10 @@
 //! Windows-only watcher: polls the system media sessions on its own thread (MTA) and publishes the
 //! selected session as a `NowPlaying` snapshot. WinRT calls through windows-rs are safe code.
 
-use crate::{Candidate, MAX_ART_BYTES, NowPlaying, PlaybackState, sanitize_text, select_session};
+use crate::{
+    Candidate, MAX_ART_BYTES, NowPlaying, PlaybackState, sanitize_text, select_session,
+    timeline_seconds,
+};
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -42,8 +45,6 @@ macro_rules! wait {
 }
 
 const POLL: Duration = Duration::from_millis(500);
-/// 100 ns ticks between 1601-01-01 and 1970-01-01.
-const EPOCH_DIFF_TICKS: i64 = 116_444_736_000_000_000;
 
 #[derive(Default)]
 struct Shared {
@@ -72,23 +73,22 @@ fn state_of(s: Status) -> PlaybackState {
     }
 }
 
-fn ticks_to_s(t: i64) -> f64 {
-    t as f64 / 10_000_000.0
-}
-
 fn read_art(
     props: &windows::Media::Control::GlobalSystemMediaTransportControlsSessionMediaProperties,
-) -> Option<Vec<u8>> {
+) -> Option<Arc<[u8]>> {
     let stream = wait!(props.Thumbnail().ok()?.OpenReadAsync())?;
     let size = stream.Size().ok()?;
     if size == 0 || size > MAX_ART_BYTES as u64 {
         return None; // absent or implausibly large: ignore rather than allocate
     }
     let reader = DataReader::CreateDataReader(&stream).ok()?;
-    let n = wait!(reader.LoadAsync(size as u32))?;
+    let n = wait!(reader.LoadAsync(size as u32))?.min(size as u32);
+    if n == 0 {
+        return None;
+    }
     let mut buf = vec![0u8; n as usize];
     reader.ReadBytes(&mut buf).ok()?;
-    Some(buf)
+    Some(Arc::from(buf))
 }
 
 fn track_hash(title: &str, artist: &str, album: &str, app: &str) -> u64 {
@@ -98,7 +98,11 @@ fn track_hash(title: &str, artist: &str, album: &str, app: &str) -> u64 {
 }
 
 /// One poll: returns the selected session's snapshot (reusing `prev` artwork when the track is unchanged).
-fn poll(mgr: &Manager, prev: Option<&NowPlaying>) -> Result<Option<NowPlaying>, String> {
+fn poll(
+    mgr: &Manager,
+    prev: Option<&NowPlaying>,
+    retry_art: bool,
+) -> Result<Option<NowPlaying>, String> {
     let e = |what: &str, x: windows::core::Error| format!("{what}: {x}");
     let sessions: Vec<Session> = mgr
         .GetSessions()
@@ -143,27 +147,27 @@ fn poll(mgr: &Manager, prev: Option<&NowPlaying>) -> Result<Option<NowPlaying>, 
     // Timeline: position at the session's last update, converted to "seconds at the time we sampled".
     let (mut position_s, mut duration_s) = (None, None);
     if let Ok(t) = s.GetTimelineProperties() {
-        let start = t.StartTime().map_or(0, |d| d.Duration);
-        let end = t.EndTime().map_or(0, |d| d.Duration);
-        let pos = t.Position().map_or(0, |d| d.Duration);
-        if end > start {
-            duration_s = Some(ticks_to_s(end - start));
-            position_s = Some(ticks_to_s(pos - start));
-            if let (Ok(upd), Ok(now)) = (
-                t.LastUpdatedTime(),
-                SystemTime::now().duration_since(UNIX_EPOCH),
-            ) {
-                let now_ticks = (now.as_nanos() / 100) as i64 + EPOCH_DIFF_TICKS;
-                let age = ticks_to_s((now_ticks - upd.UniversalTime).max(0)).min(3600.0);
-                let playing = cands[i].state == PlaybackState::Playing;
-                if let (Some(p), true) = (position_s, playing) {
-                    position_s = Some(p + age);
-                }
-            }
+        let tick =
+            |r: windows::core::Result<windows::Foundation::TimeSpan>| r.map_or(0, |d| d.Duration);
+        let now_unix_ticks = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| i64::try_from(d.as_nanos() / 100).unwrap_or(i64::MAX));
+        let updated = t.LastUpdatedTime().map_or(0, |d| d.UniversalTime);
+        let playing = cands[i].state == PlaybackState::Playing;
+        if let Some((p, d)) = timeline_seconds(
+            tick(t.StartTime()),
+            tick(t.EndTime()),
+            tick(t.Position()),
+            updated,
+            now_unix_ticks,
+            playing,
+        ) {
+            (position_s, duration_s) = (Some(p), Some(d));
         }
     }
+    let sampled_at = Instant::now();
     let same = prev.is_some_and(|p| p.track_id == id);
-    let art = if same {
+    let art = if same && !(retry_art && prev.is_some_and(|p| p.art.is_none())) {
         prev.and_then(|p| p.art.clone())
     } else {
         read_art(&props)
@@ -176,7 +180,7 @@ fn poll(mgr: &Manager, prev: Option<&NowPlaying>) -> Result<Option<NowPlaying>, 
         state: cands[i].state,
         position_s,
         duration_s,
-        sampled_at: Instant::now(),
+        sampled_at,
         art,
         track_id: id,
     }))
@@ -202,7 +206,8 @@ fn run(stop: &AtomicBool, shared: &Mutex<Shared>) {
         Some(mgr) => {
             while !stop.load(Ordering::Acquire) {
                 let prev = shared.lock().ok().and_then(|s| s.now.clone());
-                let r = poll(&mgr, prev.as_ref());
+                let retry = shared.lock().is_ok_and(|s| s.polls % 10 == 0);
+                let r = poll(&mgr, prev.as_ref(), retry);
                 if let Ok(mut s) = shared.lock() {
                     s.polls += 1;
                     match r {
@@ -236,7 +241,13 @@ impl NowPlayingWatcher {
         let thread = std::thread::Builder::new()
             .name("mg-media-watcher".into())
             .spawn(move || {
-                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(&s2, &sh2)));
+                if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(&s2, &sh2)))
+                    .is_err()
+                {
+                    if let Ok(mut s) = sh2.lock() {
+                        s.last_error = Some("media watcher panicked and stopped".into());
+                    }
+                }
                 d2.store(true, Ordering::Release);
             })
             .map_err(|e| format!("cannot start media watcher: {e}"))?;
