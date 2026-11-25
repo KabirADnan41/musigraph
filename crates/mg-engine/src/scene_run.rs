@@ -9,11 +9,12 @@
 use crate::media_feed::MediaFeed;
 use crate::presentation::{GpuOp, Layout, Presentation, Worker, apply_album};
 use crate::scene_map::{Input, MapTuning, SceneMapper};
+use crate::scene_switch::SceneSwitch;
 use mg_audio::capture::Loopback;
 use mg_dsp::{AnalysisParams, Analyzer, AudioFrame};
 use mg_gfx::context::{BackendChoice, FrameStatus, Gpu};
 use mg_gfx::overlay::Overlay;
-use mg_gfx::scene::{SceneKind, SceneMode, SceneSet};
+use mg_gfx::scene::{SceneKind, SceneMode, SceneParams, SceneSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use winit::application::ApplicationHandler;
@@ -32,8 +33,6 @@ fn toggle_allowed(m: ModifiersState) -> bool {
 
 const CURSOR_HIDE_AFTER: Duration = Duration::from_secs(3);
 const MAX_SKIP_TIME: Duration = Duration::from_secs(30);
-/// Scene crossfade length.
-const XFADE_SECS: f32 = 1.0;
 
 #[derive(Debug, PartialEq)]
 pub enum Source {
@@ -205,10 +204,12 @@ struct App {
     pres: Presentation,
     worker: Worker,
     last_media_poll: Option<Instant>,
-    style: SceneKind,
-    /// Running crossfade: (target scene, progress 0..1). Audio capture is never touched by a switch.
-    xfade: Option<(SceneKind, f32)>,
+    switch: SceneSwitch,
     last_auto_switch: Instant,
+    /// Album Focus: last artwork rectangle and how present it is (eased), so the composition glides to the
+    /// centre orb when the artwork goes away instead of snapping.
+    focus_last: [f32; 4],
+    focus_vis: f32,
     gpu: Option<Gpu>,
     window: Option<Arc<Window>>,
     start: Instant,
@@ -361,7 +362,7 @@ impl ApplicationHandler for App {
                         | KeyCode::Digit3
                 ) =>
             {
-                let from = self.xfade.map_or(self.style, |(to, _)| to);
+                let from = self.switch.target();
                 let to = match code {
                     KeyCode::ArrowLeft => from.prev(),
                     KeyCode::ArrowRight => from.next(),
@@ -369,7 +370,8 @@ impl ApplicationHandler for App {
                     KeyCode::Digit2 => SceneKind::Aurora,
                     _ => SceneKind::Focus,
                 };
-                self.switch_scene(to);
+                self.switch.request(to);
+                self.last_auto_switch = Instant::now(); // a manual choice restarts the tour timer
                 self.touch_input();
             }
             WindowEvent::KeyboardInput {
@@ -423,14 +425,6 @@ impl ApplicationHandler for App {
 }
 
 impl App {
-    /// Starts a crossfade to `to` (a switch during a crossfade restarts from the scene currently shown).
-    fn switch_scene(&mut self, to: SceneKind) {
-        let showing = self.style;
-        if to != showing || self.xfade.is_some_and(|(t, _)| t != to) {
-            self.xfade = (to != showing).then_some((to, 0.0));
-        }
-    }
-
     fn touch_input(&mut self) {
         self.last_input = Instant::now();
         if self.cursor_hidden {
@@ -523,29 +517,27 @@ impl App {
             .update(dt as f32, surface, params.energy, params.swell);
         overlay_params.time = params.time;
         // Album Focus radiates from the artwork rectangle (one source of truth: the overlay layout).
-        if let Some(a) = overlay_params.art {
-            let (w, h) = (surface.0.max(1) as f32, surface.1.max(1) as f32);
-            params.focus = [a.cx / w, a.cy / h, a.hw / h, a.hh / h];
-            params.focus_active = a.alpha.clamp(0.0, 1.0);
-        }
+        let target_vis = match overlay_params.art {
+            Some(a) => {
+                let (w, h) = (surface.0.max(1) as f32, surface.1.max(1) as f32);
+                self.focus_last = [a.cx / w, a.cy / h, a.hw / h, a.hh / h];
+                a.alpha.clamp(0.0, 1.0)
+            }
+            None => 0.0,
+        };
+        let step = dt as f32 / 0.6;
+        self.focus_vis += (target_vis - self.focus_vis).clamp(-step, step);
+        let orb = SceneParams::default().focus;
+        params.focus =
+            [0, 1, 2, 3].map(|i| orb[i] + (self.focus_last[i] - orb[i]) * self.focus_vis);
+        params.focus_active = self.focus_vis;
         if let Some(every) = self.opts.auto_scenes {
-            if self.xfade.is_none() && now.duration_since(self.last_auto_switch).as_secs() >= every
-            {
+            if now.duration_since(self.last_auto_switch).as_secs() >= every {
                 self.last_auto_switch = now;
-                self.switch_scene(self.style.next());
+                self.switch.request(self.switch.target().next());
             }
         }
-        if let Some((to, t)) = self.xfade {
-            let t = t + dt as f32 / XFADE_SECS;
-            if t >= 1.0 {
-                self.style = to;
-                self.xfade = None;
-            } else {
-                self.xfade = Some((to, t));
-            }
-        }
-        let xfade = self.xfade.map(|(to, t)| (to, t * t * (3.0 - 2.0 * t)));
-        let style = self.style;
+        let (style, xfade) = self.switch.update(dt as f32);
         let (album, album_w) = self.pres.album();
         apply_album(
             &mut params.palette,
@@ -703,9 +695,10 @@ pub fn run(opts: SceneOpts) -> i32 {
         pres: Presentation::new(layout),
         worker: Worker::start(),
         last_media_poll: None,
-        style,
-        xfade: None,
+        switch: SceneSwitch::new(style),
         last_auto_switch: Instant::now(),
+        focus_last: SceneParams::default().focus,
+        focus_vis: 0.0,
         gpu: None,
         window: None,
         start: Instant::now(),

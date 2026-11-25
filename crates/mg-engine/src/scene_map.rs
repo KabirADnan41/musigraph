@@ -396,4 +396,94 @@ mod tests {
             prev = p.dust;
         }
     }
+
+    fn live(frame: &AudioFrame) -> Input<'_> {
+        Input {
+            frame,
+            onsets: 0,
+            onset_strength: 0.0,
+            fresh: true,
+            mode: SceneMode::Live,
+        }
+    }
+
+    #[test]
+    fn aurora_bands_follow_frequency_and_phases_stay_wrapped_and_continuous() {
+        let mut m = SceneMapper::new(MapTuning::default());
+        // energy only in the lowest bands: ribbon 0 (bass) must be taller than ribbon 3 (treble)
+        let mut bands = [0.0f32; mg_dsp::MAX_BANDS];
+        for b in bands.iter_mut().take(10) {
+            *b = 0.9;
+        }
+        let bass = AudioFrame {
+            silent: false,
+            bands,
+            band_count: mg_dsp::MAX_BANDS,
+            rms_db: -10.0,
+            energy: 0.9,
+            ..AudioFrame::default()
+        };
+        let mut p = m.update(&live(&bass), 1.0 / 60.0);
+        for _ in 0..120 {
+            p = m.update(&live(&bass), 1.0 / 60.0);
+        }
+        assert!(
+            p.aurora_band[0] > p.aurora_band[3] + 0.1,
+            "{:?}",
+            p.aurora_band
+        );
+        assert!(p.aurora_band.iter().all(|b| (0.0..=1.0).contains(b)));
+        // phases advance, never leave 0..64, and the only large step is the wrap itself
+        let mut prev = p.aurora_phase;
+        let mut wrapped = false;
+        for _ in 0..(60 * 600) {
+            let q = m.update(&live(&bass), 1.0 / 60.0);
+            for i in 0..4 {
+                assert!(
+                    (0.0..64.0).contains(&q.aurora_phase[i]),
+                    "{:?}",
+                    q.aurora_phase
+                );
+                let step = q.aurora_phase[i] - prev[i];
+                if step < 0.0 {
+                    wrapped = true;
+                    assert!((step + 64.0).abs() < 0.1, "wrap step {step}");
+                } else {
+                    assert!(step < 0.1, "phase jumped by {step}");
+                }
+            }
+            prev = q.aurora_phase;
+        }
+        assert!(wrapped, "ten minutes of loud music must reach the wrap");
+    }
+
+    #[test]
+    fn the_onset_front_origin_changes_with_every_onset() {
+        let mut m = SceneMapper::new(MapTuning::default());
+        let f = AudioFrame {
+            silent: false,
+            bands: [0.8; mg_dsp::MAX_BANDS],
+            band_count: mg_dsp::MAX_BANDS,
+            rms_db: -10.0,
+            ..AudioFrame::default()
+        };
+        let mut origins = Vec::new();
+        for k in 0..4 {
+            for _ in 0..30 {
+                m.update(&live(&f), 1.0 / 60.0);
+            }
+            let p = m.update(
+                &Input {
+                    onsets: 1,
+                    onset_strength: 0.8,
+                    ..live(&f)
+                },
+                1.0 / 60.0,
+            );
+            origins.push(p.front_x0);
+            assert!((0.0..1.0).contains(&p.front_x0), "onset {k}");
+        }
+        origins.dedup_by(|a, b| (*a - *b).abs() < 1e-6);
+        assert_eq!(origins.len(), 4, "every onset moves the front origin");
+    }
 }

@@ -36,7 +36,7 @@ fn fs(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
     let h = max(u.ex2.zw, vec2<f32>(0.02));
     let d = sd_round_box(p2 - c, h, 0.012);
     let q = p2 - c;
-    let ang = atan2(q.y, q.x);
+    let ang = atan2(q.y, q.x + 0.00001);   // never atan2(0, 0)
     let gap = smoothstep(0.0, 0.012, d);               // thin dark gap: the halo never bleeds onto the edge
 
     // ambient wash

@@ -8,6 +8,7 @@ mod nowplaying;
 mod presentation;
 mod scene_map;
 mod scene_run;
+mod scene_switch;
 mod selftest;
 mod sim;
 

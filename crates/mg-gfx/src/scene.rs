@@ -539,15 +539,16 @@ mod tests {
         let x0 = render(SceneKind::Spectrum, Some((SceneKind::Aurora, 0.0)));
         let x1 = render(SceneKind::Spectrum, Some((SceneKind::Aurora, 1.0)));
         let xm = render(SceneKind::Spectrum, Some((SceneKind::Aurora, 0.5)));
+        let maxd = |x: &[u8], y: &[u8]| x.iter().zip(y).map(|(p, q)| p.abs_diff(*q)).max().unwrap();
         assert!(
-            diff(&x0, &a) < 1.0,
+            maxd(&x0, &a) <= 2,
             "t=0 shows the first scene ({})",
-            diff(&x0, &a)
+            maxd(&x0, &a)
         );
         assert!(
-            diff(&x1, &b) < 1.0,
+            maxd(&x1, &b) <= 2,
             "t=1 shows the second scene ({})",
-            diff(&x1, &b)
+            maxd(&x1, &b)
         );
         let mid: Vec<u8> = a
             .iter()
@@ -555,11 +556,43 @@ mod tests {
             .map(|(p, q)| ((u16::from(*p) + u16::from(*q)) / 2) as u8)
             .collect();
         assert!(
-            diff(&xm, &mid) < 1.5,
+            maxd(&xm, &mid) <= 3,
             "t=0.5 is the average ({})",
-            diff(&xm, &mid)
+            maxd(&xm, &mid)
         );
         // same scene on both sides is just that scene
         assert_eq!(render(SceneKind::Aurora, Some((SceneKind::Aurora, 0.5))), b);
+    }
+
+    #[test]
+    fn aurora_phase_wrap_is_seamless_headless() {
+        let Some((h, scene)) = headless() else { return };
+        let res = (320u32, 180u32);
+        let mk = |ph: f32| SceneParams {
+            mode: SceneMode::Live,
+            energy: 0.6,
+            glow: 0.6,
+            aurora_band: [0.5, 0.6, 0.4, 0.3],
+            aurora_phase: [ph; 4],
+            ..Default::default()
+        };
+        let render = |p: &SceneParams| {
+            scene
+                .render_offscreen_scenes(
+                    &h.device,
+                    &h.queue,
+                    res,
+                    p,
+                    SceneKind::Aurora,
+                    None,
+                    &|_, _| {},
+                )
+                .unwrap()
+        };
+        let a = render(&mk(0.0));
+        let b = render(&mk(64.0));
+        let max = a.iter().zip(&b).map(|(x, y)| x.abs_diff(*y)).max().unwrap();
+        assert!(max <= 3, "phase 0 and 64 cycles differ by {max} levels");
+        assert!(a != render(&mk(0.3)), "the phase must move the ribbons");
     }
 }
