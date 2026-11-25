@@ -143,8 +143,14 @@ fn presentation_previews(failures: &mut Vec<String>) -> bool {
                 pres.on_ready(crate::presentation::process_job(Some(&text), job));
             }
             let mut last = None;
-            for _ in 0..300 {
-                pres.set_position(Some(10.5));
+            let lyric_from: Option<f64> = std::env::var("MG_LYRIC_FROM")
+                .ok()
+                .and_then(|v| v.parse().ok());
+            for frame in 0..300 {
+                // MG_LYRIC_FROM: play the lyrics from that position (preview of a line change) instead of holding 10.5 s
+                pres.set_position(Some(
+                    lyric_from.map_or(10.5, |f| f + f64::from(frame) / 60.0),
+                ));
                 for job in pres.take_jobs() {
                     pres.on_ready(crate::presentation::process_job(Some(&text), job));
                 }

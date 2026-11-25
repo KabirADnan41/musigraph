@@ -29,6 +29,8 @@ const FADE_IN_S: f32 = 0.35;
 const FADE_OUT_S: f32 = 0.30;
 /// Alpha of the upcoming line.
 const NEXT_ALPHA: f32 = 0.35;
+/// Distance between the previous, current and next line, in line heights.
+const BAND: f32 = 1.35;
 /// First text-texture slot used by lyrics (0 and 1 are title and artist).
 pub const FIRST_TEXT_SLOT: usize = 2;
 
@@ -39,6 +41,8 @@ struct Slot {
     dims: Option<(u32, u32, u32)>,
     /// Rendered for an older window height: swap in the new bitmap at once instead of waiting for a fade.
     size_stale: bool,
+    /// Last role was "next": when it leaves it fades out in its own band instead of sweeping across the current one.
+    below: bool,
     y: Eased,
     x: Eased,
 }
@@ -227,13 +231,30 @@ impl LyricView {
         // fades and positions by role
         let lh = lyric_px(h) * 1.4;
         let base_y = self.anchor * h;
+        // lines that left (seek, track change) fade out first: a hidden line waits instead of crossfading on top
+        let on_stage = |s: &Slot| {
+            s.line.is_some() && (s.line == cur || (s.line == next && (s.below || s.alpha < 0.01)))
+        };
+        let leaving = self.slots.iter().any(|s| s.alpha > 0.08 && !on_stage(s));
         let mut out = [None; 3];
         for (s, slot) in self.slots.iter_mut().enumerate() {
             let (role_alpha, dy) = match slot.line {
                 Some(l) if Some(l) == cur => (1.0, 0.0),
-                Some(l) if Some(l) == next => (NEXT_ALPHA, 1.35 * lh),
-                _ => (0.0, -0.8 * lh),
+                Some(_) if on_stage(slot) => (NEXT_ALPHA, BAND * lh), // (a line that was current and is now next first fades out above)
+                _ => (0.0, if slot.below { BAND } else { -BAND } * lh),
             };
+            // a hidden next line starts one band lower and slides in: it never pops up inside the band the rising
+            // current line is still crossing
+            if role_alpha > 0.0 {
+                slot.below = dy > 0.0;
+            }
+            let role_alpha = if leaving && slot.alpha < 0.08 {
+                0.0
+            } else {
+                role_alpha
+            };
+            let entering = slot.alpha < 0.01 && role_alpha > 0.0;
+            let spawn = if entering && dy > 0.0 { BAND * lh } else { 0.0 };
             let rate = if role_alpha > slot.alpha {
                 1.0 / FADE_IN_S
             } else {
@@ -247,7 +268,9 @@ impl LyricView {
             let snap = slot.alpha < 0.01;
             let ink = tw.saturating_sub(2 * pad) as f32;
             let x = slot.x.to(0.5 * (w - ink) - pad as f32, dt, snap);
-            let y = slot.y.to(base_y + dy - pad as f32, dt, snap);
+            let y = slot
+                .y
+                .to(base_y + dy + spawn - pad as f32, dt, snap || entering);
             if slot.alpha > 0.002 {
                 out[s] = Some(TextDraw {
                     x,
@@ -568,5 +591,148 @@ mod tests {
         let o = r.run(6.0, 0.05, false);
         // right after the change the old line may still be fading, but never at full brightness again
         assert!(o.iter().flatten().all(|d| d.alpha < 1.0));
+    }
+}
+
+#[cfg(test)]
+mod overlap_tests {
+    use super::*;
+
+    fn lyr() -> Arc<Lyrics> {
+        Arc::new(crate::media_feed::demo_lyrics("The Lantern Parade").unwrap())
+    }
+
+    /// Bitmap the size of a real rendered line (ink height ~ 1.6 px of text size, 2 px pad).
+    fn sized(w: u32, h: u32) -> TextBitmap {
+        let (bw, bh) = (
+            lyric_max_width(w as f32).min(w) / 2,
+            (lyric_px(h as f32) * 1.6) as u32 + 4,
+        );
+        TextBitmap {
+            width: bw,
+            height: bh,
+            pad: 2,
+            coverage: vec![1; (bw * bh) as usize],
+        }
+    }
+
+    fn frame(v: &mut LyricView, pos: f64, s: (u32, u32)) -> [Option<TextDraw>; 3] {
+        let (mut ops, mut jobs) = (Vec::new(), Vec::new());
+        v.set_position(Some(pos));
+        let out = v.update(1.0 / 60.0, s, &mut ops, &mut jobs);
+        for j in jobs {
+            if let Job::Line {
+                track_id,
+                serial,
+                idx,
+                ..
+            } = j
+            {
+                v.on_ready(Ready::Line {
+                    track_id,
+                    serial,
+                    idx,
+                    bitmap: Some(sized(s.0, s.1)),
+                });
+            }
+        }
+        out
+    }
+
+    /// Worst vertical overlap (pixels of ink band) of two draws that are both visible.
+    fn worst_overlap(o: &[Option<TextDraw>; 3], pad: f32) -> f32 {
+        let vis: Vec<_> = o.iter().flatten().filter(|d| d.alpha > 0.08).collect();
+        let mut worst = 0.0f32;
+        for (i, a) in vis.iter().enumerate() {
+            for b in &vis[i + 1..] {
+                let (a0, a1) = (a.y + pad, a.y + a.h - pad);
+                let (b0, b1) = (b.y + pad, b.y + b.h - pad);
+                worst = worst.max(a1.min(b1) - a0.max(b0));
+            }
+        }
+        worst
+    }
+
+    #[test]
+    fn visible_lyric_lines_never_overlap_around_line_changes() {
+        for s in [(1920u32, 1080u32), (1280, 720), (720, 1280)] {
+            for anchor in [0.70f32, 0.72, 0.80] {
+                // boundaries of the demo lyrics (2, 6, 10, 14, 18 s)
+                for boundary in [2.0f64, 6.0, 10.0, 14.0, 18.0] {
+                    let mut v = LyricView::new(LyricSource::Demo);
+                    v.set_anchor(anchor);
+                    v.on_track(Some(1), "T", "A", &mut Vec::new());
+                    v.on_ready(Ready::Lyrics {
+                        track_id: 1,
+                        lyrics: Some(lyr()),
+                    });
+                    let mut t = boundary - 2.0;
+                    while t < boundary - 0.3 {
+                        frame(&mut v, t, s);
+                        t += 1.0 / 60.0;
+                    }
+                    while t < boundary + 1.2 {
+                        let o = frame(&mut v, t, s);
+                        let ov = worst_overlap(&o, 2.0);
+                        assert!(
+                            ov <= 2.0,
+                            "{s:?} anchor {anchor} boundary {boundary} t {t:.2}: overlap {ov:.1}px {o:?}"
+                        );
+                        t += 1.0 / 60.0;
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn seeks_and_pauses_never_stack_visible_lines() {
+        let s = (1920, 1080);
+        let mut v = LyricView::new(LyricSource::Demo);
+        v.on_track(Some(1), "T", "A", &mut Vec::new());
+        v.on_ready(Ready::Lyrics {
+            track_id: 1,
+            lyrics: Some(lyr()),
+        });
+        // (position, seconds to hold): play, seek forward, pause, seek back, seek to the same neighbourhood
+        for (pos, secs) in [
+            (3.0f64, 1.5f32),
+            (11.0, 1.0),
+            (11.0, 1.0),
+            (3.0, 0.5),
+            (19.0, 0.5),
+            (6.1, 0.2),
+            (14.2, 1.0),
+        ] {
+            for _ in 0..(secs * 60.0) as usize {
+                let o = frame(&mut v, pos, s);
+                let ov = worst_overlap(&o, 2.0);
+                assert!(ov <= 2.0, "seek to {pos}: overlap {ov:.1}px {o:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_track_change_never_stacks_old_and_new_lines() {
+        let s = (1920, 1080);
+        let mut v = LyricView::new(LyricSource::Demo);
+        v.on_track(Some(1), "T", "A", &mut Vec::new());
+        v.on_ready(Ready::Lyrics {
+            track_id: 1,
+            lyrics: Some(lyr()),
+        });
+        for _ in 0..90 {
+            frame(&mut v, 11.0, s);
+        }
+        v.on_track(Some(2), "T", "A", &mut Vec::new());
+        v.on_ready(Ready::Lyrics {
+            track_id: 2,
+            lyrics: Some(lyr()),
+        });
+        for _ in 0..120 {
+            let o = frame(&mut v, 3.0, s);
+            let ov = worst_overlap(&o, 2.0);
+            assert!(ov <= 2.0, "track change: overlap {ov:.1}px {o:?}");
+        }
     }
 }
