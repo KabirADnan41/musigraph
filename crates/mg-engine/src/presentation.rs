@@ -81,6 +81,13 @@ pub enum Job {
         px: f32,
         max_width: u32,
     },
+    /// Render one control-bar time string (slot 0 elapsed, 1 duration).
+    Clock {
+        serial: u64,
+        slot: usize,
+        text: String,
+        px: f32,
+    },
 }
 
 pub enum Ready {
@@ -103,6 +110,11 @@ pub enum Ready {
         track_id: u64,
         serial: u64,
         idx: usize,
+        bitmap: Option<TextBitmap>,
+    },
+    Clock {
+        serial: u64,
+        slot: usize,
         bitmap: Option<TextBitmap>,
     },
 }
@@ -331,7 +343,10 @@ impl Presentation {
         std::mem::take(&mut self.jobs)
     }
 
-    /// Where synchronised lyrics may come from (default: nowhere).
+    pub fn lyrics_on(&self) -> bool {
+        self.lyrics_on
+    }
+
     /// Shows or hides the lyrics (returns the new state).
     pub fn toggle_lyrics(&mut self) -> bool {
         self.lyrics_on = !self.lyrics_on;
@@ -436,6 +451,7 @@ impl Presentation {
     pub fn on_ready(&mut self, r: Ready) {
         match r {
             r @ (Ready::Lyrics { .. } | Ready::Line { .. }) => self.lyrics.on_ready(r),
+            Ready::Clock { .. } => {} // the control bar owns these (controls.rs)
             Ready::Art {
                 track_id,
                 image,
@@ -611,6 +627,7 @@ impl Presentation {
                 lerp3(p.main, p.accent, 0.5),
                 w,
             ),
+            controls: None,
         }
     }
 
@@ -798,6 +815,25 @@ pub fn process_job(text: Option<&mg_text::TextRenderer>, job: Job) -> Ready {
             px,
             max_width,
         } => process_line(text, track_id, serial, idx, &line, px, max_width),
+        Job::Clock {
+            serial,
+            slot,
+            text: s,
+            px,
+        } => Ready::Clock {
+            serial,
+            slot,
+            bitmap: text.and_then(|r| {
+                r.render_line(
+                    &s,
+                    &mg_text::LineStyle {
+                        px,
+                        weight: 500,
+                        max_width: (px * 10.0) as u32,
+                    },
+                )
+            }),
+        },
     }
 }
 
@@ -812,7 +848,7 @@ fn run_worker(rx: Receiver<Job>, tx: Sender<Ready>) {
                 Job::Art { .. } => art = Some(j),
                 Job::Text(_) => txt = Some(j),
                 Job::Lyrics { .. } => lyr = Some(j),
-                Job::Line { .. } => lines.push(j),
+                Job::Line { .. } | Job::Clock { .. } => lines.push(j),
             }
         }
         // cheap, visible things first; the (bounded but slower) artwork decode last

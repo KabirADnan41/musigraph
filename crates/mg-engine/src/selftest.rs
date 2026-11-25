@@ -265,6 +265,156 @@ fn presentation_previews(failures: &mut Vec<String>) -> bool {
     true
 }
 
+/// Control bar: enabled (demo caps, hover, lyrics toggled on), disabled (no media source) and keyboard-focus
+/// states rendered headless over a real scene with DirectWrite time texts. Checks that the bar is drawn, that the
+/// states differ where they should and that nothing is black/NaN; with `MG_SCENE_DUMP=<dir>` writes PNGs.
+fn controls_previews(failures: &mut Vec<String>) -> bool {
+    use crate::controls::{Availability, ButtonId, ControlsUi, FrameInput, Toggles};
+    use crate::presentation::{GpuOp, process_job};
+    use mg_gfx::overlay::{Overlay, OverlayParams};
+    use mg_media::Capabilities;
+    let Ok(h) = headless() else { return false };
+    let Some(text) = mg_text::TextRenderer::new() else {
+        failures.push("controls: DirectWrite unavailable".into());
+        return true;
+    };
+    let res = (1280u32, 720u32);
+    let x = fixture("demo", SR).expect("demo fixture");
+    let ticks = Sim::new(SR, FPS, MapTuning::default()).run(&x[..x.len().min(SR as usize * 12)]);
+    let base_params = ticks.last().expect("ticks").params.clone();
+    let scene = SceneSet::new_headless(&h.device);
+    let dump = std::env::var("MG_SCENE_DUMP").ok();
+    let demo = Availability {
+        caps: Capabilities::all(),
+        state: mg_media::PlaybackState::Playing,
+        has_timeline: true,
+    };
+    let off = Availability {
+        caps: Capabilities::default(),
+        state: mg_media::PlaybackState::Other,
+        has_timeline: false,
+    };
+    // (name, availability, hover target, tab presses)
+    let cases = [
+        ("enabled", demo, Some(ButtonId::Next), 0),
+        ("disabled", off, None, 0),
+        ("focus", demo, None, 2),
+    ];
+    let bare = scene.render_offscreen_scenes(
+        &h.device,
+        &h.queue,
+        res,
+        &base_params,
+        SceneKind::Spectrum,
+        None,
+        &|_, _| {},
+    );
+    let Ok(bare) = bare else {
+        failures.push("controls: bare render failed".into());
+        return true;
+    };
+    let mut images: Vec<(&str, Vec<u8>)> = Vec::new();
+    for (name, av, hover, tabs) in cases {
+        let mut ui = ControlsUi::new(true);
+        ui.set_view(res, 1.0);
+        ui.key_activity();
+        if let Some(b) = hover {
+            let r = ui.geometry().buttons[b.index()];
+            ui.pointer_moved((r.x + 0.5 * r.w, r.y + 0.5 * r.h));
+        }
+        for _ in 0..tabs {
+            ui.tab(false, &av);
+        }
+        let mut ov = Overlay::new_headless(&h.device, &h.queue);
+        let input = |dt| FrameInput {
+            dt,
+            av,
+            toggles: Toggles {
+                lyrics: true,
+                artwork: true,
+                fullscreen: false,
+            },
+            position: av.has_timeline.then_some(83.0),
+            duration: av.has_timeline.then_some(212.0),
+            fg: [0.9, 0.9, 0.92],
+            tint: [0.18, 0.38, 0.85],
+        };
+        let mut draw = None;
+        for _ in 0..45 {
+            draw = ui.frame(&input(1.0 / 60.0));
+            // time texts go through the same job path as the live loop
+            for job in ui.take_jobs() {
+                ui.on_ready(process_job(Some(&text), job));
+            }
+            for op in ui.take_ops() {
+                if let GpuOp::SetText(k, b) = op {
+                    ov.set_text(&h.device, &h.queue, k, (b.width, b.height), &b.coverage);
+                }
+            }
+        }
+        let Some(draw) = draw else {
+            failures.push(format!("controls {name}: nothing to draw"));
+            continue;
+        };
+        let p = OverlayParams {
+            res,
+            time: 0.0,
+            energy: 0.0,
+            art: None,
+            title: None,
+            artist: None,
+            lyrics: [None; 3],
+            lyric_glow: 0.0,
+            shadow: 0.5,
+            text_color: [0.9, 0.9, 0.92],
+            halo_color: [0.18, 0.38, 0.85],
+            controls: Some(draw.clone()),
+        };
+        let Ok(img) = scene.render_offscreen_scenes(
+            &h.device,
+            &h.queue,
+            res,
+            &base_params,
+            SceneKind::Spectrum,
+            None,
+            &|enc, view| ov.draw(&h.queue, enc, view, &p),
+        ) else {
+            failures.push(format!("controls {name}: render failed"));
+            continue;
+        };
+        let changed = img.iter().zip(&bare).filter(|(a, b)| a != b).count();
+        let bright = img
+            .chunks_exact(4)
+            .any(|px| px[0].max(px[1]).max(px[2]) > 180);
+        let opaque = img.chunks_exact(4).all(|px| px[3] == 255);
+        if changed < 4000 || !bright || !opaque {
+            failures.push(format!(
+                "controls {name}: changed={changed} bright_icons={bright} opaque={opaque}"
+            ));
+        }
+        if av.has_timeline && (draw.elapsed.is_none() || draw.duration.is_none()) {
+            failures.push(format!("controls {name}: time texts missing"));
+        }
+        println!(
+            "CONTROLS {name}: changed_bytes={changed} progress={} times={}",
+            draw.progress.is_some(),
+            draw.elapsed.is_some() && draw.duration.is_some()
+        );
+        if let Some(dir) = &dump {
+            let png = mg_media::synth::png_rgba(res.0, res.1, &img);
+            let _ = std::fs::write(format!("{dir}/controls-{name}.png"), png);
+        }
+        images.push((name, img));
+    }
+    if images.len() == 3 {
+        let d = |a: &[u8], b: &[u8]| a.iter().zip(b).filter(|(x, y)| x != y).count();
+        if d(&images[0].1, &images[1].1) < 500 || d(&images[0].1, &images[2].1) < 200 {
+            failures.push("controls: enabled/disabled/focus states do not differ".into());
+        }
+    }
+    true
+}
+
 /// Orb: real analyzer + mapper on the synthetic fixtures, rendered headless (Orb scene only). Returns whether a
 /// GPU was available. Thresholds are on mean absolute byte difference (0..255) at 160x90 and sit well below the
 /// measured differences but far above render noise (identical params give 0).
@@ -494,6 +644,7 @@ pub fn run(allow_no_gpu: bool) -> i32 {
         let _ = SLOTS;
     }
     gpu_seen |= presentation_previews(&mut failures);
+    gpu_seen |= controls_previews(&mut failures);
     gpu_seen |= orb_checks(&mut failures);
     if !gpu_seen {
         println!(

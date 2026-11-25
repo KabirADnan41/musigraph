@@ -67,6 +67,13 @@ pub fn lyric_px(h: f32) -> f32 {
     0.036 * h
 }
 
+/// Lowest ink the lyric stack can reach (as a fraction of the window height) when the current line sits at
+/// `anchor`: a line that slides in starts one band below the "next" position (two bands under the current line)
+/// and its bitmap is about 1.6 text sizes tall. Used to keep the lyrics clear of the control bar.
+pub fn lowest_ink_frac(anchor: f32) -> f32 {
+    anchor + (2.0 * BAND * 1.4 + 1.6) * 0.036 + 0.002
+}
+
 fn lyric_max_width(w: f32) -> u32 {
     (0.80 * w).max(64.0) as u32
 }
@@ -679,6 +686,64 @@ mod overlap_tests {
                             "{s:?} anchor {anchor} boundary {boundary} t {t:.2}: overlap {ov:.1}px {o:?}"
                         );
                         t += 1.0 / 60.0;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Lowest visible ink (px) of the three lyric slots.
+    fn lowest(o: &[Option<TextDraw>; 3], pad: f32) -> f32 {
+        o.iter()
+            .flatten()
+            .filter(|d| d.alpha > 0.08)
+            .map(|d| d.y + d.h - pad)
+            .fold(0.0, f32::max)
+    }
+
+    #[test]
+    fn lifted_lyrics_never_reach_the_control_bar_zone_at_any_size_anchor_or_dpi() {
+        use crate::controls::{lyric_lift, ui_scale};
+        for s in [
+            (1920u32, 1080u32),
+            (1280, 720),
+            (720, 1280),
+            (3840, 2160),
+            (800, 600),
+        ] {
+            for dpi in [1.0f32, 1.5, 2.0] {
+                for anchor in [0.70f32, 0.72, 0.80] {
+                    let zone_top = s.1 as f32 - 128.0 * ui_scale(s, dpi);
+                    let mut worst_lifted = 0.0f32;
+                    let mut worst_plain = 0.0f32;
+                    for lift in [0.0, lyric_lift(anchor, s, dpi)] {
+                        let mut v = LyricView::new(LyricSource::Demo);
+                        v.set_anchor(anchor - lift);
+                        v.on_track(Some(1), "T", "A", &mut Vec::new());
+                        v.on_ready(Ready::Lyrics {
+                            track_id: 1,
+                            lyrics: Some(lyr()),
+                        });
+                        let mut worst = 0.0f32;
+                        let mut t = 0.0f64;
+                        while t < 20.0 {
+                            let o = frame(&mut v, t, s);
+                            worst = worst.max(lowest(&o, 2.0));
+                            t += 1.0 / 30.0;
+                        }
+                        if lift == 0.0 {
+                            worst_plain = worst;
+                        } else {
+                            worst_lifted = worst;
+                        }
+                    }
+                    assert!(
+                        worst_lifted > 0.0 && worst_lifted <= zone_top,
+                        "{s:?} dpi {dpi} anchor {anchor}: lyrics end at {worst_lifted:.1}, bar zone starts at {zone_top:.1}"
+                    );
+                    // the check is not vacuous: where the unlifted lines reach the zone, the lift is what clears it
+                    if worst_plain > zone_top {
+                        assert!(worst_lifted < worst_plain);
                     }
                 }
             }

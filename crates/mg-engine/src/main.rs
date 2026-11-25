@@ -2,6 +2,7 @@
 //! `--gpu-report` (P3.1); `--gpu-test` (P3.2 clear colour); `--gpu-bench` (P3.3 stress shader).
 //! Options: `--backend dx12|vulkan|gl` `--seconds N` `--fullscreen` `--vsync on|off` `--scale F` (bench).
 
+mod controls;
 mod levels;
 mod lyric_view;
 mod media_feed;

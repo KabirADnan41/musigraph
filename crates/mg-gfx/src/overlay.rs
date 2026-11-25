@@ -6,8 +6,11 @@
 //! only rewrites one 128-byte uniform and records one draw.
 
 const UNIFORM_BYTES: usize = 12 * 16;
-/// Text slots: 0 title, 1 artist, 2..=4 lyric lines.
-pub const TEXT_SLOTS: usize = 5;
+const CONTROLS_BYTES: usize = 34 * 16;
+/// Text slots: 0 title, 1 artist, 2..=4 lyric lines, 5 elapsed time, 6 duration (control bar).
+pub const TEXT_SLOTS: usize = 7;
+/// First text slot of the control bar: `CLOCK_SLOT` is the elapsed time, `CLOCK_SLOT + 1` the duration.
+pub const CLOCK_SLOT: usize = 5;
 /// Largest texture side accepted (defence in depth; callers already bound their content).
 const MAX_TEXTURE_SIDE: u32 = 4096;
 
@@ -36,6 +39,176 @@ pub struct TextDraw {
     pub alpha: f32,
 }
 
+/// Icon ids understood by `overlay.wgsl` (`icon_cov`).
+pub mod icon {
+    pub const PREV: u32 = 0;
+    pub const PLAY: u32 = 1;
+    pub const PAUSE: u32 = 2;
+    pub const NEXT: u32 = 3;
+    pub const SCENE: u32 = 4;
+    pub const LYRICS: u32 = 5;
+    pub const LAYOUT: u32 = 6;
+    pub const FULLSCREEN: u32 = 7;
+    pub const EXIT: u32 = 8;
+}
+
+/// Number of buttons the control bar shader draws.
+pub const CONTROL_BUTTONS: usize = 8;
+
+/// One button, final surface pixels: centre, half size of the square hit target, icon id and states (0..1).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ButtonDraw {
+    pub cx: f32,
+    pub cy: f32,
+    pub half: f32,
+    pub icon: u32,
+    /// 1 enabled, ~0.35 disabled.
+    pub opacity: f32,
+    pub hover: f32,
+    pub toggled: f32,
+    pub focus: bool,
+    pub press: f32,
+}
+
+/// Progress line: track x range, centre y, half thickness, played fraction and hover (knob) amount.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ProgressDraw {
+    pub x0: f32,
+    pub x1: f32,
+    pub y: f32,
+    pub half_thick: f32,
+    pub frac: f32,
+    pub hover: f32,
+}
+
+/// The temporary on-screen control bar (drawn as a second, scissored draw of the overlay pass).
+#[derive(Clone, Debug, PartialEq)]
+pub struct ControlsDraw {
+    /// Master alpha 0..1 (the draw is skipped at 0).
+    pub alpha: f32,
+    /// Pixels per design pixel.
+    pub scale: f32,
+    /// Pill centre x, centre y, half width, half height.
+    pub bar: [f32; 4],
+    /// Divider x, centre y, half height.
+    pub sep: [f32; 3],
+    pub buttons: [ButtonDraw; CONTROL_BUTTONS],
+    pub progress: Option<ProgressDraw>,
+    pub elapsed: Option<TextDraw>,
+    pub duration: Option<TextDraw>,
+    pub time_alpha: f32,
+    /// Linear RGB: pill fill, icons/text, accent.
+    pub bg: [f32; 3],
+    pub bg_alpha: f32,
+    pub fg: [f32; 3],
+    pub accent: [f32; 3],
+}
+
+impl ControlsDraw {
+    /// Packs the WGSL `C` layout for a surface of `surface` pixels (public for tests).
+    pub fn pack(&self, surface: (u32, u32)) -> Vec<u8> {
+        let mut o = Vec::with_capacity(CONTROLS_BYTES);
+        put(
+            &mut o,
+            &[
+                surface.0 as f32,
+                surface.1 as f32,
+                self.alpha.clamp(0.0, 1.0),
+                self.scale.max(0.01),
+            ],
+        );
+        put(&mut o, &self.bar);
+        put(
+            &mut o,
+            &[
+                self.bg[0],
+                self.bg[1],
+                self.bg[2],
+                self.bg_alpha.clamp(0.0, 1.0),
+            ],
+        );
+        put(&mut o, &[self.fg[0], self.fg[1], self.fg[2], 0.0]);
+        put(
+            &mut o,
+            &[self.accent[0], self.accent[1], self.accent[2], 0.0],
+        );
+        match &self.progress {
+            Some(p) => {
+                put(&mut o, &[p.x0, p.x1, p.y, p.half_thick.max(0.0)]);
+                put(
+                    &mut o,
+                    &[
+                        p.frac.clamp(0.0, 1.0),
+                        p.hover.clamp(0.0, 1.0),
+                        self.time_alpha.clamp(0.0, 1.0),
+                        0.0,
+                    ],
+                );
+            }
+            None => put(&mut o, &[0.0; 8]),
+        }
+        put(
+            &mut o,
+            &[self.sep[0], self.sep[1], self.sep[2].max(0.0), 0.0],
+        );
+        let text = |t: &Option<TextDraw>| match t {
+            Some(t) => [t.x, t.y, t.w.max(0.0), t.h.max(0.0)],
+            None => [0.0; 4],
+        };
+        put(&mut o, &text(&self.elapsed));
+        put(&mut o, &text(&self.duration));
+        for b in &self.buttons {
+            put(&mut o, &[b.cx, b.cy, b.half.max(0.0), b.icon as f32]);
+            put(
+                &mut o,
+                &[
+                    b.opacity.clamp(0.0, 1.0),
+                    b.hover.clamp(0.0, 1.0),
+                    b.toggled.clamp(0.0, 1.0),
+                    if b.focus { 1.0 } else { 0.0 },
+                ],
+            );
+            put(&mut o, &[b.press.clamp(0.0, 1.0), 0.0, 0.0, 0.0]);
+        }
+        debug_assert_eq!(o.len(), CONTROLS_BYTES);
+        o
+    }
+
+    /// Scissor rectangle `(x, y, w, h)` covering the pill, its shadow, the progress line and the times,
+    /// clamped inside a `surface` (always at least 1x1).
+    pub fn scissor(&self, surface: (u32, u32)) -> (u32, u32, u32, u32) {
+        let s = self.scale.max(0.01);
+        let m = 28.0 * s;
+        let mut x0 = self.bar[0] - self.bar[2] - m;
+        let mut x1 = self.bar[0] + self.bar[2] + m;
+        let mut y0 = self.bar[1] - self.bar[3] - m;
+        let y1 = self.bar[1] + self.bar[3] + m;
+        if let Some(p) = &self.progress {
+            x0 = x0.min(p.x0 - 8.0 * s);
+            x1 = x1.max(p.x1 + 8.0 * s);
+            y0 = y0.min(p.y - 14.0 * s);
+        }
+        for t in [&self.elapsed, &self.duration].into_iter().flatten() {
+            x0 = x0.min(t.x - 4.0 * s);
+            x1 = x1.max(t.x + t.w + 4.0 * s);
+            y0 = y0.min(t.y - 4.0 * s);
+        }
+        let (sw, sh) = (surface.0.max(1), surface.1.max(1));
+        let f = |v: f32, hi: u32| {
+            if v.is_finite() {
+                v.clamp(0.0, hi as f32)
+            } else {
+                0.0
+            }
+        };
+        let x0 = (f(x0, sw - 1).floor() as u32).min(sw - 1);
+        let y0 = (f(y0, sh - 1).floor() as u32).min(sh - 1);
+        let x1 = (f(x1, sw).ceil() as u32).clamp(x0 + 1, sw);
+        let y1 = (f(y1, sh).ceil() as u32).clamp(y0 + 1, sh);
+        (x0, y0, x1 - x0, y1 - y0)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct OverlayParams {
     pub res: (u32, u32),
@@ -52,6 +225,8 @@ pub struct OverlayParams {
     /// Linear RGB.
     pub text_color: [f32; 3],
     pub halo_color: [f32; 3],
+    /// The control bar when visible (None or alpha 0 = nothing drawn, zero cost).
+    pub controls: Option<ControlsDraw>,
 }
 
 fn put(out: &mut Vec<u8>, vals: &[f32]) {
@@ -134,7 +309,12 @@ impl OverlayParams {
         o
     }
 
-    /// True when drawing would change no pixel (nothing present or everything fully transparent).
+    /// The control bar, when it would change pixels.
+    fn visible_controls(&self) -> Option<&ControlsDraw> {
+        self.controls.as_ref().filter(|c| c.alpha > 0.002)
+    }
+
+    /// True when the artwork/text part would change no pixel (nothing present or fully transparent).
     pub fn is_empty(&self) -> bool {
         let vis = |a: f32| a > 0.002;
         !(self.art.is_some_and(|a| vis(a.alpha))
@@ -146,9 +326,11 @@ impl OverlayParams {
 
 pub struct Overlay {
     pipeline: wgpu::RenderPipeline,
+    controls_pipeline: wgpu::RenderPipeline,
     bgl: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
     uniform: wgpu::Buffer,
+    controls_uniform: wgpu::Buffer,
     art: Option<wgpu::TextureView>,
     texts: [Option<wgpu::TextureView>; TEXT_SLOTS],
     /// 1x1 stand-ins so the bind group is always complete.
@@ -250,6 +432,18 @@ impl Overlay {
                 tex_entry(5),
                 tex_entry(6),
                 tex_entry(7),
+                tex_entry(8),
+                tex_entry(9),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 10,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: wgpu::BufferSize::new(CONTROLS_BYTES as u64),
+                    },
+                    count: None,
+                },
                 wgpu::BindGroupLayoutEntry {
                     binding: 4,
                     visibility: wgpu::ShaderStages::FRAGMENT,
@@ -275,31 +469,35 @@ impl Overlay {
                 operation: wgpu::BlendOperation::Add,
             },
         };
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("overlay"),
-            layout: Some(&layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs"),
-                compilation_options: Default::default(),
-                buffers: &[],
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs"),
-                compilation_options: Default::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format,
-                    blend: Some(blend),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            multiview_mask: None,
-            cache: None,
-        });
+        let make_pipeline = |label: &str, fs: &str| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(&layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some("vs"),
+                    compilation_options: Default::default(),
+                    buffers: &[],
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some(fs),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format,
+                        blend: Some(blend),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                primitive: wgpu::PrimitiveState::default(),
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                multiview_mask: None,
+                cache: None,
+            })
+        };
+        let pipeline = make_pipeline("overlay", "fs");
+        let controls_pipeline = make_pipeline("overlay controls", "fs_controls");
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("overlay"),
             address_mode_u: wgpu::AddressMode::ClampToEdge,
@@ -311,6 +509,12 @@ impl Overlay {
         let uniform = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("overlay"),
             size: UNIFORM_BYTES as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let controls_uniform = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("overlay controls"),
+            size: CONTROLS_BYTES as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -338,17 +542,19 @@ impl Overlay {
             bind_group: Self::group(
                 device,
                 &bgl,
-                &uniform,
+                [&uniform, &controls_uniform],
                 &blank_rgba,
                 [&blank_r8; TEXT_SLOTS],
                 &sampler,
             ),
             pipeline,
+            controls_pipeline,
             bgl,
             sampler,
             uniform,
+            controls_uniform,
             art: None,
-            texts: [None, None, None, None, None],
+            texts: Default::default(),
             blank_rgba,
             blank_r8,
         };
@@ -359,7 +565,7 @@ impl Overlay {
     fn group(
         device: &wgpu::Device,
         bgl: &wgpu::BindGroupLayout,
-        uniform: &wgpu::Buffer,
+        uniforms: [&wgpu::Buffer; 2],
         art: &wgpu::TextureView,
         texts: [&wgpu::TextureView; TEXT_SLOTS],
         sampler: &wgpu::Sampler,
@@ -370,7 +576,19 @@ impl Overlay {
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: uniform.as_entire_binding(),
+                    resource: uniforms[0].as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 10,
+                    resource: uniforms[1].as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 8,
+                    resource: wgpu::BindingResource::TextureView(texts[5]),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 9,
+                    resource: wgpu::BindingResource::TextureView(texts[6]),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
@@ -408,7 +626,7 @@ impl Overlay {
         self.bind_group = Self::group(
             device,
             &self.bgl,
-            &self.uniform,
+            [&self.uniform, &self.controls_uniform],
             self.art.as_ref().unwrap_or(&self.blank_rgba),
             std::array::from_fn(|i| self.texts[i].as_ref().unwrap_or(&self.blank_r8)),
             &self.sampler,
@@ -479,10 +697,17 @@ impl Overlay {
         view: &wgpu::TextureView,
         p: &OverlayParams,
     ) {
-        if p.is_empty() {
+        let main = !p.is_empty();
+        let controls = p.visible_controls();
+        if !main && controls.is_none() {
             return;
         }
-        queue.write_buffer(&self.uniform, 0, &p.pack());
+        if main {
+            queue.write_buffer(&self.uniform, 0, &p.pack());
+        }
+        if let Some(c) = controls {
+            queue.write_buffer(&self.controls_uniform, 0, &c.pack(p.res));
+        }
         let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("overlay"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -499,9 +724,18 @@ impl Overlay {
             occlusion_query_set: None,
             multiview_mask: None,
         });
-        pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &self.bind_group, &[]);
-        pass.draw(0..3, 0..1);
+        if main {
+            pass.set_pipeline(&self.pipeline);
+            pass.draw(0..3, 0..1);
+        }
+        if let Some(c) = controls {
+            // Only the bar area is shaded: a hidden bar costs nothing, a visible one a small scissored draw.
+            let (x, y, w, h) = c.scissor(p.res);
+            pass.set_scissor_rect(x, y, w, h);
+            pass.set_pipeline(&self.controls_pipeline);
+            pass.draw(0..3, 0..1);
+        }
     }
 }
 
@@ -538,7 +772,182 @@ mod tests {
             shadow: 0.5,
             text_color: [1.0, 1.0, 1.0],
             halo_color: [0.2, 0.4, 1.0],
+            controls: None,
         }
+    }
+
+    fn bar(res: (u32, u32)) -> ControlsDraw {
+        let s = res.1 as f32 / 1080.0;
+        let (cx, cy) = (res.0 as f32 / 2.0, res.1 as f32 - 60.0 * s);
+        let ids = [
+            icon::PREV,
+            icon::PLAY,
+            icon::NEXT,
+            icon::SCENE,
+            icon::LYRICS,
+            icon::LAYOUT,
+            icon::FULLSCREEN,
+            icon::EXIT,
+        ];
+        ControlsDraw {
+            alpha: 1.0,
+            scale: s,
+            bar: [cx, cy, 280.0 * s, 32.0 * s],
+            sep: [cx - 4.0 * s, cy, 18.0 * s],
+            buttons: std::array::from_fn(|i| ButtonDraw {
+                cx: cx - 230.0 * s + 66.0 * s * i as f32,
+                cy,
+                half: 22.0 * s,
+                icon: ids[i],
+                opacity: 1.0,
+                hover: 0.0,
+                toggled: 0.0,
+                focus: false,
+                press: 0.0,
+            }),
+            progress: Some(ProgressDraw {
+                x0: cx - 224.0 * s,
+                x1: cx + 224.0 * s,
+                y: cy - 52.0 * s,
+                half_thick: 1.5 * s,
+                frac: 0.4,
+                hover: 0.0,
+            }),
+            elapsed: None,
+            duration: None,
+            time_alpha: 1.0,
+            bg: [0.01, 0.012, 0.02],
+            bg_alpha: 0.62,
+            fg: [0.9, 0.9, 0.9],
+            accent: [0.2, 0.5, 1.0],
+        }
+    }
+
+    #[test]
+    fn controls_pack_matches_wgsl_scissor_is_inside_and_hostile_values_are_finite() {
+        let res = (1920u32, 1080u32);
+        let mut c = bar(res);
+        let b = c.pack(res);
+        assert_eq!(b.len(), CONTROLS_BYTES);
+        let src = include_str!("overlay.wgsl");
+        assert!(src.contains("b: array<vec4<f32>, 24>") && src.contains("fn fs_controls"));
+        c.alpha = f32::NAN;
+        c.bar[0] = f32::INFINITY;
+        c.buttons[3].hover = f32::NAN;
+        assert!(
+            c.pack(res)
+                .chunks_exact(4)
+                .all(|c| f32::from_ne_bytes([c[0], c[1], c[2], c[3]]).is_finite())
+        );
+        for res in [(1920u32, 1080u32), (320, 180), (1, 1), (100, 4000)] {
+            let (x, y, w, h) = bar(res).scissor(res);
+            assert!(w >= 1 && h >= 1 && x + w <= res.0.max(1) && y + h <= res.1.max(1));
+        }
+        let (x, y, w, h) = c.scissor(res); // NaN/inf geometry still yields a legal rectangle
+        assert!(w >= 1 && h >= 1 && x + w <= res.0 && y + h <= res.1);
+    }
+
+    #[test]
+    fn controls_draw_enabled_disabled_hover_and_focus_states_headless() {
+        let Ok(h) = init_headless() else {
+            eprintln!("SKIPPED (no hardware GPU)");
+            return;
+        };
+        let res = (960u32, 540u32);
+        let scene = SceneSet::new_headless(&h.device);
+        let ov = Overlay::new_headless(&h.device, &h.queue);
+        let sp = SceneParams::default();
+        let bare = scene
+            .render_offscreen(&h.device, &h.queue, res, &sp)
+            .unwrap();
+        let render = |c: Option<ControlsDraw>| {
+            let mut p = params(res);
+            p.art = None;
+            p.controls = c;
+            scene
+                .render_offscreen_with(&h.device, &h.queue, res, &sp, &|enc, view| {
+                    ov.draw(&h.queue, enc, view, &p)
+                })
+                .unwrap()
+        };
+        let diff = |a: &[u8], b: &[u8], x0: u32, x1: u32, y0: u32, y1: u32| {
+            let mut n = 0u64;
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    let i = ((y * res.0 + x) * 4) as usize;
+                    n += (0..3)
+                        .map(|k| u64::from(a[i + k].abs_diff(b[i + k])))
+                        .sum::<u64>();
+                }
+            }
+            n
+        };
+        let on = bar(res);
+        let img = render(Some(on.clone()));
+        let b = on.buttons[1]; // play
+        let reg = |r: &[u8]| {
+            diff(
+                r,
+                &bare,
+                (b.cx - b.half) as u32,
+                (b.cx + b.half) as u32,
+                (b.cy - b.half) as u32,
+                (b.cy + b.half) as u32,
+            )
+        };
+        assert!(reg(&img) > 5000, "bar and icon drawn");
+        // alpha 0 / None leave the scene untouched (zero cost path)
+        let mut hidden = on.clone();
+        hidden.alpha = 0.0;
+        assert_eq!(render(Some(hidden)), bare);
+        assert_eq!(render(None), bare);
+        // far from the bar nothing changes (scissor + coverage)
+        assert_eq!(diff(&img, &bare, 0, res.0, 0, 200), 0);
+        // disabled icon is dimmer than the enabled one, hover and focus change the pixels
+        let mut dis = on.clone();
+        dis.buttons[1].opacity = 0.35;
+        let mut hov = on.clone();
+        hov.buttons[1].hover = 1.0;
+        let mut foc = on.clone();
+        foc.buttons[1].focus = true;
+        let mut tog = on.clone();
+        tog.buttons[1].toggled = 1.0;
+        let (i_dis, i_hov, i_foc, i_tog) = (
+            render(Some(dis)),
+            render(Some(hov)),
+            render(Some(foc)),
+            render(Some(tog)),
+        );
+        // regions that must differ from the plain enabled state
+        let around = |r: &[u8], pad: f32| {
+            diff(
+                r,
+                &img,
+                (b.cx - b.half - pad) as u32,
+                (b.cx + b.half + pad) as u32,
+                (b.cy - b.half - pad) as u32,
+                (b.cy + b.half + pad) as u32,
+            )
+        };
+        assert!(around(&i_dis, 0.0) > 800, "disabled differs");
+        assert!(reg(&i_dis) < reg(&img), "disabled is dimmer");
+        assert!(around(&i_hov, 0.0) > 800, "hover plate differs");
+        assert!(
+            around(&i_foc, 8.0) > around(&i_foc, 0.0) + 100,
+            "focus ring is drawn outside the hit target"
+        );
+        assert!(around(&i_tog, 0.0) > 500, "toggled differs");
+        // nothing is NaN-black: the pill interior is a translucent dark tint, not pure black or transparent
+        let px = |r: &[u8], x: u32, y: u32| {
+            let i = ((y * res.0 + x) * 4) as usize;
+            [r[i], r[i + 1], r[i + 2], r[i + 3]]
+        };
+        let (bx, by) = (on.bar[0] as u32 + 60, on.bar[1] as u32 + 20);
+        let (a0, a1) = (px(&bare, bx, by), px(&img, bx, by));
+        assert!(a1 != a0, "pill tints the scene: {a0:?} -> {a1:?}");
+        assert!(a1[3] >= 250, "output stays opaque over the opaque scene");
+        let sum: u64 = img.iter().map(|&v| u64::from(v)).sum();
+        assert!(sum > 0);
     }
 
     #[test]

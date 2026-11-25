@@ -9,9 +9,12 @@
 //! arrives (capture failed or stalled) the scene decays to silence and shows the NO AUDIO state, and the
 //! window title says so. Samples are never stored or logged (ADR-0003).
 
+use crate::controls::{
+    Availability, ButtonId, Click, ControlsUi, FrameInput, Toggles, seek_seconds,
+};
 use crate::lyric_view::LyricSource;
 use crate::media_feed::MediaFeed;
-use crate::presentation::{GpuOp, Layout, Presentation, Worker, apply_album};
+use crate::presentation::{GpuOp, Layout, Presentation, Ready, Worker, apply_album};
 use crate::scene_map::{Input, MapTuning, SceneMapper};
 use crate::scene_switch::SceneSwitch;
 use mg_audio::capture::Loopback;
@@ -24,7 +27,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
-use winit::event::{ElementState, KeyEvent, WindowEvent};
+use winit::event::{ElementState, KeyEvent, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
 use winit::window::{Fullscreen, Window, WindowId};
@@ -89,10 +92,23 @@ fn key_action(code: KeyCode, mods: ModifiersState, repeat: bool) -> Option<KeyAc
     })
 }
 
+/// A control-bar button runs exactly the action of its key (one implementation, `run_action`).
+fn button_action(b: ButtonId) -> KeyAction {
+    match b {
+        ButtonId::Previous => KeyAction::Media(MediaCommand::Previous),
+        ButtonId::PlayPause => KeyAction::Media(MediaCommand::TogglePlayPause),
+        ButtonId::Next => KeyAction::Media(MediaCommand::Next),
+        ButtonId::Scene => KeyAction::NextScene,
+        ButtonId::Lyrics => KeyAction::ToggleLyrics,
+        ButtonId::Artwork => KeyAction::CycleArtwork,
+        ButtonId::Fullscreen => KeyAction::ToggleFullscreen,
+        ButtonId::Exit => KeyAction::Exit,
+    }
+}
+
 /// At most one "command unsupported" stderr note per this interval.
 const NOTE_EVERY: Duration = Duration::from_secs(5);
 
-const CURSOR_HIDE_AFTER: Duration = Duration::from_secs(3);
 const MAX_SKIP_TIME: Duration = Duration::from_secs(30);
 /// Frames longer than this are recorded with a per-section CPU time breakdown.
 const HITCH_MS: f64 = 40.0;
@@ -129,6 +145,14 @@ pub struct SceneOpts {
     /// Folder of user-supplied `.lrc` files (synchronised lyrics). Default: `Music\Musigraph Lyrics` in the
     /// user profile, only if it exists.
     pub lyrics_dir: Option<std::path::PathBuf>,
+    /// Control bar visibility: `Auto` (idle timer) or `Always` (developer flag for screenshots and draw-cost measurement).
+    pub controls: ControlsMode,
+}
+
+#[derive(Debug, PartialEq, Clone, Copy)]
+pub enum ControlsMode {
+    Auto,
+    Always,
 }
 
 pub fn parse(args: &[String], source: Source) -> Result<SceneOpts, String> {
@@ -144,6 +168,7 @@ pub fn parse(args: &[String], source: Source) -> Result<SceneOpts, String> {
         style: SceneKind::Spectrum,
         auto_scenes: None,
         lyrics_dir: None,
+        controls: ControlsMode::Auto,
     };
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -171,6 +196,13 @@ pub fn parse(args: &[String], source: Source) -> Result<SceneOpts, String> {
                         .ok_or("--lyrics-dir needs a folder")?
                         .into(),
                 );
+            }
+            "--controls" => {
+                o.controls = match it.next().map(String::as_str) {
+                    Some("auto") => ControlsMode::Auto,
+                    Some("always") => ControlsMode::Always,
+                    _ => return Err("--controls needs auto|always".into()),
+                }
             }
             "--no-media" => o.media = MediaChoice::Off,
             "--demo-media" => o.media = MediaChoice::Demo,
@@ -292,7 +324,7 @@ struct App {
     last_tick: Instant,
     last_seq: u64,
     last_change: Instant,
-    last_input: Instant,
+    ctl: ControlsUi,
     cursor_hidden: bool,
     mods: ModifiersState,
     last_unsupported_note: Option<Instant>,
@@ -385,7 +417,6 @@ impl ApplicationHandler for App {
         self.start = Instant::now();
         self.last_tick = self.start;
         self.last_change = self.start;
-        self.last_input = self.start;
     }
 
     fn window_event(&mut self, el: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
@@ -405,12 +436,19 @@ impl ApplicationHandler for App {
                         ..
                     },
                 ..
-            } => {
-                if let Some(action) = key_action(code, self.mods, repeat) {
-                    self.run_action(el, action);
-                }
+            } => self.on_key(el, code, repeat),
+            WindowEvent::CursorMoved { position, .. } => {
+                self.sync_view();
+                self.ctl
+                    .pointer_moved((position.x as f32, position.y as f32));
             }
-            WindowEvent::CursorMoved { .. } | WindowEvent::MouseInput { .. } => self.touch_input(),
+            WindowEvent::CursorLeft { .. } => self.ctl.pointer_left(),
+            WindowEvent::MouseInput {
+                state,
+                button: MouseButton::Left,
+                ..
+            } => self.on_left_button(el, state == ElementState::Pressed),
+            WindowEvent::MouseInput { .. } => self.ctl.key_activity(),
             WindowEvent::Resized(s) => {
                 if let Some(g) = self.gpu.as_mut() {
                     g.resize(s.width, s.height);
@@ -422,14 +460,12 @@ impl ApplicationHandler for App {
     }
 
     fn about_to_wait(&mut self, el: &ActiveEventLoop) {
-        // Immersive mode: hide the cursor after inactivity; any mouse movement restores it.
-        if self.opts.fullscreen
-            && !self.cursor_hidden
-            && self.last_input.elapsed() > CURSOR_HIDE_AFTER
-        {
+        // Immersive mode: the cursor hides together with the control bar (one idle timer, `Visibility`).
+        let hide = self.opts.fullscreen && !self.ctl.vis.wants_visible();
+        if hide != self.cursor_hidden {
             if let Some(w) = &self.window {
-                w.set_cursor_visible(false);
-                self.cursor_hidden = true;
+                w.set_cursor_visible(!hide);
+                self.cursor_hidden = hide;
             }
         }
         if self.window.is_some() && self.start.elapsed().as_secs() >= self.opts.seconds + 2 {
@@ -449,7 +485,6 @@ impl App {
             KeyAction::Exit => {
                 self.exit_reason = "Esc pressed";
                 el.exit();
-                return;
             }
             KeyAction::ToggleFullscreen => {
                 self.opts.fullscreen = !self.opts.fullscreen;
@@ -491,16 +526,64 @@ impl App {
                 }
             }
         }
-        self.touch_input();
     }
 
-    fn touch_input(&mut self) {
-        self.last_input = Instant::now();
-        if self.cursor_hidden {
-            if let Some(w) = &self.window {
-                w.set_cursor_visible(true);
+    fn surface(&self) -> (u32, u32) {
+        self.gpu
+            .as_ref()
+            .map_or((0, 0), |g| (g.config.width, g.config.height))
+    }
+
+    /// Gives the control bar the current surface and DPI factor (before any pointer or key handling).
+    fn sync_view(&mut self) {
+        let dpi = self
+            .window
+            .as_ref()
+            .map_or(1.0, |w| w.scale_factor() as f32);
+        let s = self.surface();
+        self.ctl.set_view(s, dpi);
+    }
+
+    fn availability(&self) -> Availability {
+        Availability::new(self.media.caps(), self.last_np.as_ref())
+    }
+
+    /// Key press. Tab / Shift+Tab move the bar's focus ring; Enter and Space activate the focused button (and
+    /// only then: with no keyboard focus Space stays the global play/pause shortcut); everything else is the
+    /// approved key map, identical whether the bar is visible or not.
+    fn on_key(&mut self, el: &ActiveEventLoop, code: KeyCode, repeat: bool) {
+        self.sync_view();
+        self.ctl.key_activity();
+        if !repeat && toggle_allowed(self.mods) {
+            let av = self.availability();
+            match code {
+                KeyCode::Tab => return self.ctl.tab(self.mods.shift_key(), &av),
+                KeyCode::Enter | KeyCode::NumpadEnter | KeyCode::Space => {
+                    if let Some(b) = self.ctl.activate_focused(&av) {
+                        return self.run_action(el, button_action(b));
+                    }
+                }
+                _ => {}
             }
-            self.cursor_hidden = false;
+        }
+        if let Some(action) = key_action(code, self.mods, repeat) {
+            self.run_action(el, action);
+        }
+    }
+
+    fn on_left_button(&mut self, el: &ActiveEventLoop, down: bool) {
+        self.sync_view();
+        let av = self.availability();
+        match self.ctl.mouse_left(down, &av) {
+            Some(Click::Button(b)) => self.run_action(el, button_action(b)),
+            Some(Click::Seek(f)) => {
+                if let Some(d) = self.last_np.as_ref().and_then(|n| n.duration_s) {
+                    // same command path as the keys: capability-gated, rate-limited, never blocks
+                    self.media
+                        .send(MediaCommand::SeekTo(seek_seconds(f, d)), Instant::now());
+                }
+            }
+            None => {}
         }
     }
 
@@ -511,9 +594,7 @@ impl App {
         if self.opts.fullscreen {
             w.set_fullscreen(Some(Fullscreen::Borderless(w.current_monitor())));
         } else {
-            w.set_fullscreen(None);
-            w.set_cursor_visible(true);
-            self.cursor_hidden = false;
+            w.set_fullscreen(None); // the cursor comes back through the idle-timer sync in about_to_wait
         }
     }
 
@@ -580,22 +661,46 @@ impl App {
             self.worker.submit(job);
         }
         while let Some(r) = self.worker.try_recv() {
-            self.pres.on_ready(r);
+            match r {
+                Ready::Clock { .. } => self.ctl.on_ready(r),
+                r => self.pres.on_ready(r),
+            }
         }
         let poll_ms = t_poll.elapsed().as_secs_f64() * 1000.0;
         self.pres
             .set_position(self.last_np.as_ref().and_then(|n| n.position_now(now)));
-        self.pres.set_lyric_anchor(match self.switch.target() {
+        self.sync_view();
+        let anchor = match self.switch.target() {
             SceneKind::Spectrum => 0.70,
             SceneKind::Aurora => 0.72,
             SceneKind::Orb => 0.72,
             SceneKind::Focus if self.pres.layout() == Layout::Center => 0.80,
             SceneKind::Focus => 0.72,
-        });
+        };
+        // While the bar is visible the lyrics ride above it (eased by the bar's own 250 ms lift ramp).
+        self.pres
+            .set_lyric_anchor(anchor - self.ctl.lyric_lift(anchor));
         let mut overlay_params = self
             .pres
             .update(dt as f32, surface, params.energy, params.swell);
         overlay_params.time = params.time;
+        let av = self.availability();
+        overlay_params.controls = self.ctl.frame(&FrameInput {
+            dt: dt as f32,
+            av,
+            toggles: Toggles {
+                lyrics: self.pres.lyrics_on(),
+                artwork: self.pres.layout() != Layout::Off,
+                fullscreen: self.opts.fullscreen,
+            },
+            position: self.last_np.as_ref().and_then(|n| n.position_now(now)),
+            duration: self.last_np.as_ref().and_then(|n| n.duration_s),
+            fg: overlay_params.text_color,
+            tint: overlay_params.halo_color,
+        });
+        for job in self.ctl.take_jobs() {
+            self.worker.submit(job);
+        }
         // Album Focus radiates from the artwork rectangle (one source of truth: the overlay layout).
         let target_vis = match overlay_params.art {
             Some(a) => {
@@ -645,7 +750,13 @@ impl App {
         }
         let t_ops = Instant::now();
         if let Some(ov) = self.overlay.as_mut() {
-            for op in self.pres.take_ops() {
+            let ops: Vec<GpuOp> = self
+                .pres
+                .take_ops()
+                .into_iter()
+                .chain(self.ctl.take_ops())
+                .collect();
+            for op in ops {
                 match op {
                     GpuOp::SetArt(img) => {
                         ov.set_art(&g.device, &g.queue, (img.width, img.height), &img.rgba);
@@ -788,6 +899,7 @@ pub fn run(opts: SceneOpts) -> i32 {
         _ => LyricSource::None,
     };
     let style = opts.style;
+    let controls_always = opts.controls == ControlsMode::Always;
     if style.lifecycle() == mg_gfx::scene::Lifecycle::Experimental {
         eprintln!("experimental scene: {}", style.name());
     }
@@ -821,7 +933,7 @@ pub fn run(opts: SceneOpts) -> i32 {
         last_tick: Instant::now(),
         last_seq: 0,
         last_change: Instant::now(),
-        last_input: Instant::now(),
+        ctl: ControlsUi::new(controls_always),
         cursor_hidden: false,
         mods: ModifiersState::empty(),
         last_unsupported_note: None,
@@ -897,6 +1009,41 @@ mod tests {
 
     fn a(s: &[&str]) -> Vec<String> {
         s.iter().map(|x| x.to_string()).collect()
+    }
+
+    #[test]
+    fn every_button_runs_the_action_of_its_key_and_controls_flag_parses() {
+        let none = ModifiersState::empty();
+        let key = |c| key_action(c, none, false).unwrap();
+        assert_eq!(button_action(ButtonId::PlayPause), key(KeyCode::Space));
+        assert_eq!(button_action(ButtonId::Previous), key(KeyCode::ArrowLeft));
+        assert_eq!(button_action(ButtonId::Next), key(KeyCode::ArrowRight));
+        assert_eq!(button_action(ButtonId::Scene), key(KeyCode::BracketRight));
+        assert_eq!(button_action(ButtonId::Lyrics), key(KeyCode::KeyL));
+        assert_eq!(button_action(ButtonId::Artwork), key(KeyCode::KeyA));
+        assert_eq!(button_action(ButtonId::Fullscreen), key(KeyCode::KeyF));
+        assert_eq!(button_action(ButtonId::Exit), key(KeyCode::Escape));
+        // the key map itself does not change with the bar (Tab is handled before it and is not a mapped key)
+        assert_eq!(key_action(KeyCode::Tab, none, false), None);
+        assert_eq!(key_action(KeyCode::Enter, none, false), None);
+        assert_eq!(
+            parse(&a(&[]), Source::Live).unwrap().controls,
+            ControlsMode::Auto
+        );
+        for (v, m) in [
+            ("auto", ControlsMode::Auto),
+            ("always", ControlsMode::Always),
+        ] {
+            assert_eq!(
+                parse(&a(&["--controls", v]), Source::Live)
+                    .unwrap()
+                    .controls,
+                m
+            );
+        }
+        for bad in [&["--controls"][..], &["--controls", "never"]] {
+            assert!(parse(&a(bad), Source::Live).is_err(), "{bad:?}");
+        }
     }
 
     #[test]
