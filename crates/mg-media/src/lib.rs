@@ -21,6 +21,7 @@ pub use art::decode_art;
 #[cfg(windows)]
 pub use session::NowPlayingWatcher;
 
+pub mod lrc;
 pub mod palette;
 pub mod synth;
 
