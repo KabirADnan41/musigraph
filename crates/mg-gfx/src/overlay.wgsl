@@ -12,11 +12,18 @@ struct O {
     text_p: vec4<f32>,    // title alpha, artist alpha, shadow strength, unused
     col_text: vec4<f32>,  // linear rgb
     col_halo: vec4<f32>,  // linear rgb
+    lyr0: vec4<f32>,      // lyric slot rects: left, top, width, height (px); width 0 = absent
+    lyr1: vec4<f32>,
+    lyr2: vec4<f32>,
+    lyr_p: vec4<f32>,     // slot alphas 0..2, slow glow boost (0..1, never per beat)
 };
 @group(0) @binding(0) var<uniform> o: O;
 @group(0) @binding(1) var art_tex: texture_2d<f32>;
 @group(0) @binding(2) var title_tex: texture_2d<f32>;
 @group(0) @binding(3) var artist_tex: texture_2d<f32>;
+@group(0) @binding(5) var lyr_tex0: texture_2d<f32>;
+@group(0) @binding(6) var lyr_tex1: texture_2d<f32>;
+@group(0) @binding(7) var lyr_tex2: texture_2d<f32>;
 @group(0) @binding(4) var smp: sampler;
 
 struct VOut { @builtin(position) pos: vec4<f32> };
@@ -90,6 +97,25 @@ fn fs(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
     a = ta + a * (1.0 - ta);
     rgb = tcol * 0.86 * aa + rgb * (1.0 - aa);   // artist line a touch dimmer than the title
     a = aa + a * (1.0 - aa);
+
+    // ---- lyrics: up to three lines (previous fading out, current, next), same soft shadow as the title ----
+    let boost = 1.0 + 0.10 * clamp(o.lyr_p.w, 0.0, 1.0);
+    let lcol = min(tcol * boost, vec3<f32>(1.0));
+    let sh0 = max(text_cov(lyr_tex0, o.lyr0, p - off), 0.5 * text_cov(lyr_tex0, o.lyr0, p - 2.0 * off)) * o.lyr_p.x;
+    let sh1 = max(text_cov(lyr_tex1, o.lyr1, p - off), 0.5 * text_cov(lyr_tex1, o.lyr1, p - 2.0 * off)) * o.lyr_p.y;
+    let sh2 = max(text_cov(lyr_tex2, o.lyr2, p - off), 0.5 * text_cov(lyr_tex2, o.lyr2, p - 2.0 * off)) * o.lyr_p.z;
+    let lshadow = clamp(max(sh0, max(sh1, sh2)) * sh, 0.0, 0.85);
+    rgb = rgb * (1.0 - lshadow);
+    a = lshadow + a * (1.0 - lshadow);
+    let l0 = clamp(text_cov(lyr_tex0, o.lyr0, p) * o.lyr_p.x, 0.0, 1.0);
+    let l1 = clamp(text_cov(lyr_tex1, o.lyr1, p) * o.lyr_p.y, 0.0, 1.0);
+    let l2 = clamp(text_cov(lyr_tex2, o.lyr2, p) * o.lyr_p.z, 0.0, 1.0);
+    rgb = lcol * l0 + rgb * (1.0 - l0);
+    a = l0 + a * (1.0 - l0);
+    rgb = lcol * l1 + rgb * (1.0 - l1);
+    a = l1 + a * (1.0 - l1);
+    rgb = lcol * l2 + rgb * (1.0 - l2);
+    a = l2 + a * (1.0 - l2);
 
     return vec4<f32>(rgb, a);
 }

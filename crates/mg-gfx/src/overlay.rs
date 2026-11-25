@@ -5,7 +5,9 @@
 //! dropped immediately when the content goes away. Nothing is allocated or uploaded per frame; a frame
 //! only rewrites one 128-byte uniform and records one draw.
 
-const UNIFORM_BYTES: usize = 8 * 16;
+const UNIFORM_BYTES: usize = 12 * 16;
+/// Text slots: 0 title, 1 artist, 2..=4 lyric lines.
+pub const TEXT_SLOTS: usize = 5;
 /// Largest texture side accepted (defence in depth; callers already bound their content).
 const MAX_TEXTURE_SIDE: u32 = 4096;
 
@@ -42,6 +44,9 @@ pub struct OverlayParams {
     pub art: Option<ArtDraw>,
     pub title: Option<TextDraw>,
     pub artist: Option<TextDraw>,
+    /// Lyric lines (slot 2, 3, 4 of the text textures) and their slow glow boost (0..1).
+    pub lyrics: [Option<TextDraw>; 3],
+    pub lyric_glow: f32,
     /// Shadow strength under the text (0..1).
     pub shadow: f32,
     /// Linear RGB.
@@ -113,6 +118,18 @@ impl OverlayParams {
                 0.0,
             ],
         );
+        for l in &self.lyrics {
+            put(&mut o, &text(l));
+        }
+        put(
+            &mut o,
+            &[
+                al(&self.lyrics[0]),
+                al(&self.lyrics[1]),
+                al(&self.lyrics[2]),
+                self.lyric_glow.clamp(0.0, 1.0),
+            ],
+        );
         debug_assert_eq!(o.len(), UNIFORM_BYTES);
         o
     }
@@ -122,7 +139,8 @@ impl OverlayParams {
         let vis = |a: f32| a > 0.002;
         !(self.art.is_some_and(|a| vis(a.alpha))
             || self.title.is_some_and(|t| vis(t.alpha))
-            || self.artist.is_some_and(|t| vis(t.alpha)))
+            || self.artist.is_some_and(|t| vis(t.alpha))
+            || self.lyrics.iter().any(|l| l.is_some_and(|t| vis(t.alpha))))
     }
 }
 
@@ -132,8 +150,7 @@ pub struct Overlay {
     sampler: wgpu::Sampler,
     uniform: wgpu::Buffer,
     art: Option<wgpu::TextureView>,
-    title: Option<wgpu::TextureView>,
-    artist: Option<wgpu::TextureView>,
+    texts: [Option<wgpu::TextureView>; TEXT_SLOTS],
     /// 1x1 stand-ins so the bind group is always complete.
     blank_rgba: wgpu::TextureView,
     blank_r8: wgpu::TextureView,
@@ -230,6 +247,9 @@ impl Overlay {
                 tex_entry(1),
                 tex_entry(2),
                 tex_entry(3),
+                tex_entry(5),
+                tex_entry(6),
+                tex_entry(7),
                 wgpu::BindGroupLayoutEntry {
                     binding: 4,
                     visibility: wgpu::ShaderStages::FRAGMENT,
@@ -320,8 +340,7 @@ impl Overlay {
                 &bgl,
                 &uniform,
                 &blank_rgba,
-                &blank_r8,
-                &blank_r8,
+                [&blank_r8; TEXT_SLOTS],
                 &sampler,
             ),
             pipeline,
@@ -329,8 +348,7 @@ impl Overlay {
             sampler,
             uniform,
             art: None,
-            title: None,
-            artist: None,
+            texts: [None, None, None, None, None],
             blank_rgba,
             blank_r8,
         };
@@ -343,8 +361,7 @@ impl Overlay {
         bgl: &wgpu::BindGroupLayout,
         uniform: &wgpu::Buffer,
         art: &wgpu::TextureView,
-        title: &wgpu::TextureView,
-        artist: &wgpu::TextureView,
+        texts: [&wgpu::TextureView; TEXT_SLOTS],
         sampler: &wgpu::Sampler,
     ) -> wgpu::BindGroup {
         device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -361,11 +378,23 @@ impl Overlay {
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
-                    resource: wgpu::BindingResource::TextureView(title),
+                    resource: wgpu::BindingResource::TextureView(texts[0]),
                 },
                 wgpu::BindGroupEntry {
                     binding: 3,
-                    resource: wgpu::BindingResource::TextureView(artist),
+                    resource: wgpu::BindingResource::TextureView(texts[1]),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: wgpu::BindingResource::TextureView(texts[2]),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: wgpu::BindingResource::TextureView(texts[3]),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: wgpu::BindingResource::TextureView(texts[4]),
                 },
                 wgpu::BindGroupEntry {
                     binding: 4,
@@ -381,8 +410,7 @@ impl Overlay {
             &self.bgl,
             &self.uniform,
             self.art.as_ref().unwrap_or(&self.blank_rgba),
-            self.title.as_ref().unwrap_or(&self.blank_r8),
-            self.artist.as_ref().unwrap_or(&self.blank_r8),
+            std::array::from_fn(|i| self.texts[i].as_ref().unwrap_or(&self.blank_r8)),
             &self.sampler,
         );
     }
@@ -414,7 +442,7 @@ impl Overlay {
         self.rebuild(device);
     }
 
-    /// Replaces the title (`which == 0`) or artist (`1`) coverage bitmap (8-bit, `w x h`).
+    /// Replaces text slot `which` (0 title, 1 artist, 2..=4 lyric lines) with a coverage bitmap (8-bit, `w x h`).
     pub fn set_text(
         &mut self,
         device: &wgpu::Device,
@@ -433,21 +461,13 @@ impl Overlay {
             coverage,
         );
         let ok = t.is_some();
-        if which == 0 {
-            self.title = t;
-        } else {
-            self.artist = t;
-        }
+        self.texts[which.min(TEXT_SLOTS - 1)] = t;
         self.rebuild(device);
         ok
     }
 
     pub fn clear_text(&mut self, device: &wgpu::Device, which: usize) {
-        if which == 0 {
-            self.title = None;
-        } else {
-            self.artist = None;
-        }
+        self.texts[which.min(TEXT_SLOTS - 1)] = None;
         self.rebuild(device);
     }
 
@@ -513,6 +533,8 @@ mod tests {
             }),
             title: None,
             artist: None,
+            lyrics: [None; 3],
+            lyric_glow: 0.0,
             shadow: 0.5,
             text_color: [1.0, 1.0, 1.0],
             halo_color: [0.2, 0.4, 1.0],
@@ -628,5 +650,57 @@ mod tests {
             px(&img2, res.0, 140, 90)[0] < 100,
             "cleared artwork leaves the scene"
         );
+    }
+
+    #[test]
+    fn lyric_lines_draw_in_their_slots_and_fade_independently_headless() {
+        let Ok(h) = init_headless() else {
+            eprintln!("SKIPPED (no hardware GPU)");
+            return;
+        };
+        let res = (320u32, 180u32);
+        let scene = SceneSet::new_headless(&h.device);
+        let mut ov = Overlay::new_headless(&h.device, &h.queue);
+        assert!(ov.set_text(&h.device, &h.queue, 2, (60, 12), &vec![255u8; 720]));
+        assert!(ov.set_text(&h.device, &h.queue, 4, (60, 12), &vec![255u8; 720]));
+        let sp = SceneParams::default();
+        let bare = scene
+            .render_offscreen(&h.device, &h.queue, res, &sp)
+            .unwrap();
+        let mut p = params(res);
+        p.art = None;
+        p.lyrics = [
+            Some(TextDraw {
+                x: 20.0,
+                y: 40.0,
+                w: 60.0,
+                h: 12.0,
+                alpha: 1.0,
+            }),
+            None,
+            Some(TextDraw {
+                x: 20.0,
+                y: 120.0,
+                w: 60.0,
+                h: 12.0,
+                alpha: 0.4,
+            }),
+        ];
+        let img = scene
+            .render_offscreen_with(&h.device, &h.queue, res, &sp, &|enc, view| {
+                ov.draw(&h.queue, enc, view, &p)
+            })
+            .unwrap();
+        let a = px(&img, res.0, 50, 46);
+        let b = px(&img, res.0, 50, 126);
+        assert!(a[0] > 230 && a[1] > 230, "full-alpha line is bright: {a:?}");
+        assert!(b[0] > 60 && b[0] < 200, "40% line is dimmer: {b:?}");
+        assert_eq!(
+            px(&img, res.0, 200, 90),
+            px(&bare, res.0, 200, 90),
+            "elsewhere untouched"
+        );
+        // an absent slot draws nothing even if its texture exists
+        assert_eq!(px(&img, res.0, 50, 86), px(&bare, res.0, 50, 86));
     }
 }

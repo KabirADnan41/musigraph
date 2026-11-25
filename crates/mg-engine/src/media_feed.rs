@@ -60,9 +60,14 @@ impl MediaFeed {
                 cache.clone()
             }
             MediaFeed::Demo { tracks, start } => {
-                let i = (now.duration_since(*start).as_secs() / DEMO_TRACK_SECS) as usize
-                    % tracks.len().max(1);
-                tracks.get(i).cloned()
+                let elapsed = now.duration_since(*start).as_secs_f64();
+                let i = (elapsed as u64 / DEMO_TRACK_SECS) as usize % tracks.len().max(1);
+                let mut t = tracks.get(i).cloned()?;
+                // a live timeline, as a real player would report it
+                t.position_s = Some(elapsed % DEMO_TRACK_SECS as f64);
+                t.duration_s = Some(DEMO_TRACK_SECS as f64);
+                t.sampled_at = now;
+                Some(t)
             }
         }
     }
@@ -192,6 +197,29 @@ pub fn demo_tracks() -> Vec<NowPlaying> {
         ),
         track(5, "No Artwork Example", "Anonymous", None),
     ]
+}
+
+/// Original, invented demo lyrics (never real songs) for the demo tracks, keyed by title; `None` for others.
+pub fn demo_lyrics(title: &str) -> Option<mg_media::lrc::Lyrics> {
+    let lrc = match title {
+        "Midnight Harbour" => {
+            "[00:02.00]Lanterns drift across the water\n[00:05.00]Every wave remembers your name\n[00:08.00]\n[00:10.00]Hold the light a little longer\n[00:14.00]The tide is turning slow\n[00:18.00]We sail before the morning\n"
+        }
+        "The Lantern Parade" => {
+            "[00:02.00]Paper boats and golden sparks\n[00:06.00]Dancing through the evening air\n[00:10.00]Every window hums along\n[00:14.00]Nobody wants to go home\n[00:18.00]Not while the music is here\n"
+        }
+        "নীল আকাশের গান" => {
+            "[00:02.00]নীল আকাশে ভাসে মেঘের দল\n[00:06.00]সুরের ঢেউয়ে দুলছে মন\n[00:10.00]আলো জ্বলে নদীর বুকে\n[00:14.00]ভোরের হাওয়ায় নতুন গান\n"
+        }
+        t if t.starts_with("A Very Long Title") => {
+            "[00:02.00]These words are only a test of the layout\n[00:06.00]A single lyric line that keeps going and going until it is far wider than any window should ever need to show\n[00:12.00]Short again\n"
+        }
+        "No Artwork Example" => {
+            "[00:03.00]No cover, only words\n[00:08.00]And the light still follows the sound\n"
+        }
+        _ => return None,
+    };
+    mg_media::lrc::parse(lrc.as_bytes()).ok()
 }
 
 #[cfg(test)]

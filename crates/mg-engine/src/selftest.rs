@@ -84,9 +84,7 @@ fn max_delta_100ms(lum: &[f32]) -> f32 {
 /// was available.
 fn presentation_previews(failures: &mut Vec<String>) -> bool {
     use crate::media_feed::demo_tracks;
-    use crate::presentation::{
-        GpuOp, Layout, Presentation, apply_album, process_art, process_text,
-    };
+    use crate::presentation::{GpuOp, Layout, Presentation, apply_album};
     use mg_gfx::overlay::Overlay;
     let Ok(h) = headless() else { return false };
     let Some(text) = mg_text::TextRenderer::new() else {
@@ -110,18 +108,23 @@ fn presentation_previews(failures: &mut Vec<String>) -> bool {
             }
             let mut ov = Overlay::new_headless(&h.device, &h.queue);
             let mut pres = Presentation::new(layout);
+            pres.set_lyric_source(crate::lyric_view::LyricSource::Demo);
+            pres.set_lyric_anchor(match kind {
+                SceneKind::Spectrum => 0.70,
+                SceneKind::Aurora => 0.72,
+                SceneKind::Focus if layout == Layout::Center => 0.80,
+                SceneKind::Focus => 0.72,
+            });
             pres.on_now_playing(Some(n), res);
             for job in pres.take_jobs() {
-                let r = match job {
-                    crate::presentation::Job::Art { track_id, bytes } => {
-                        process_art(track_id, &bytes)
-                    }
-                    crate::presentation::Job::Text(t) => process_text(&text, &t),
-                };
-                pres.on_ready(r);
+                pres.on_ready(crate::presentation::process_job(Some(&text), job));
             }
             let mut last = None;
             for _ in 0..300 {
+                pres.set_position(Some(10.5));
+                for job in pres.take_jobs() {
+                    pres.on_ready(crate::presentation::process_job(Some(&text), job));
+                }
                 last = Some(pres.update(1.0 / 60.0, res, base_params.energy, base_params.swell));
                 for op in pres.take_ops() {
                     match op {
@@ -163,6 +166,12 @@ fn presentation_previews(failures: &mut Vec<String>) -> bool {
             let changed = img.iter().zip(&bare).filter(|(a, b)| a != b).count();
             if n.art.is_some() && op.art.is_none() {
                 failures.push(format!("presentation {layout:?}/{i}: artwork not shown"));
+            }
+            if i <= 2 && op.lyrics.iter().all(Option::is_none) {
+                failures.push(format!(
+                    "{} {layout:?}/{i}: synchronised lyrics not drawn",
+                    kind.name()
+                ));
             }
             if op.title.is_none() || changed < 300 {
                 failures.push(format!(

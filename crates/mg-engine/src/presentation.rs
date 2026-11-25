@@ -10,7 +10,9 @@
 //! Privacy: titles, artists and artwork are shown on screen only. They are never logged, written to disk
 //! or sent anywhere.
 
+use crate::lyric_view::{LyricSource, LyricView};
 use mg_gfx::overlay::{ArtDraw, OverlayParams, TextDraw};
+use mg_media::lrc::Lyrics;
 use mg_media::palette::Palette;
 use mg_media::{ArtImage, NowPlaying};
 use mg_text::TextBitmap;
@@ -58,8 +60,27 @@ pub struct TextJob {
 }
 
 pub enum Job {
-    Art { track_id: u64, bytes: Arc<[u8]> },
+    Art {
+        track_id: u64,
+        bytes: Arc<[u8]>,
+    },
     Text(TextJob),
+    /// Find and parse the user-supplied lyrics file for a track (or build the demo lyrics).
+    Lyrics {
+        track_id: u64,
+        source: LyricSource,
+        title: String,
+        artist: String,
+    },
+    /// Render one lyric line.
+    Line {
+        track_id: u64,
+        serial: u64,
+        idx: usize,
+        text: String,
+        px: f32,
+        max_width: u32,
+    },
 }
 
 pub enum Ready {
@@ -73,6 +94,16 @@ pub enum Ready {
         serial: u64,
         title: Option<TextBitmap>,
         artist: Option<TextBitmap>,
+    },
+    Lyrics {
+        track_id: u64,
+        lyrics: Option<Arc<Lyrics>>,
+    },
+    Line {
+        track_id: u64,
+        serial: u64,
+        idx: usize,
+        bitmap: Option<TextBitmap>,
     },
 }
 
@@ -193,10 +224,10 @@ impl Fade {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
-struct Eased(f32, bool);
+pub(crate) struct Eased(f32, bool);
 
 impl Eased {
-    fn to(&mut self, target: f32, dt: f32, snap: bool) -> f32 {
+    pub(crate) fn to(&mut self, target: f32, dt: f32, snap: bool) -> f32 {
         if snap || !self.1 || !self.0.is_finite() {
             self.0 = target;
             self.1 = true;
@@ -232,6 +263,8 @@ pub struct Presentation {
     e_art: [Eased; 4],
     e_title: [Eased; 2],
     e_artist: [Eased; 2],
+    lyrics: LyricView,
+    lyric_draws: [Option<TextDraw>; 3],
 }
 
 /// Pixel sizes derived from the surface height and layout (responsive: nothing is tied to one monitor).
@@ -272,6 +305,8 @@ impl Presentation {
             text_pending: None,
             text_dims: [None, None],
             palette: PaletteState::new(),
+            lyrics: LyricView::new(LyricSource::None),
+            lyric_draws: [None; 3],
             e_art: [Eased::default(); 4],
             e_title: [Eased::default(); 2],
             e_artist: [Eased::default(); 2],
@@ -291,6 +326,21 @@ impl Presentation {
 
     pub fn take_jobs(&mut self) -> Vec<Job> {
         std::mem::take(&mut self.jobs)
+    }
+
+    /// Where synchronised lyrics may come from (default: nowhere).
+    pub fn set_lyric_source(&mut self, s: LyricSource) {
+        self.lyrics = LyricView::new(s);
+    }
+
+    /// Playback position in seconds for the lyrics (None when unknown or nothing plays).
+    pub fn set_position(&mut self, pos: Option<f64>) {
+        self.lyrics.set_position(pos);
+    }
+
+    /// Vertical anchor of the current lyric line (fraction of the window height), set per scene.
+    pub fn set_lyric_anchor(&mut self, frac: f32) {
+        self.lyrics.set_anchor(frac);
     }
 
     pub fn take_ops(&mut self) -> Vec<GpuOp> {
@@ -339,6 +389,10 @@ impl Presentation {
             self.palette.set_target(None);
             self.title.clear();
             self.artist.clear();
+            let (t, a) = np.map_or((String::new(), String::new()), |n| {
+                (n.title.clone(), n.artist.clone())
+            });
+            self.lyrics.on_track(id, &t, &a, &mut self.jobs);
             if let Some(n) = np {
                 self.title = n.title.clone();
                 self.artist = n.artist.clone();
@@ -372,6 +426,7 @@ impl Presentation {
     /// Accepts a worker result. Results for any other track (or a superseded text request) are dropped.
     pub fn on_ready(&mut self, r: Ready) {
         match r {
+            r @ (Ready::Lyrics { .. } | Ready::Line { .. }) => self.lyrics.on_ready(r),
             Ready::Art {
                 track_id,
                 image,
@@ -415,6 +470,9 @@ impl Presentation {
         self.art_fade.step(dt);
         self.text_fade.step(dt);
         self.since_text_request += dt;
+        self.lyric_draws = self
+            .lyrics
+            .update(dt, surface, &mut self.ops, &mut self.jobs);
 
         if self.art_pending.is_some() && self.art_fade.alpha <= 0.02 {
             match self.art_pending.take().flatten() {
@@ -531,6 +589,8 @@ impl Presentation {
             art,
             title,
             artist,
+            lyrics: self.lyric_draws,
+            lyric_glow: energy.clamp(0.0, 1.0),
             shadow: 0.55,
             text_color: lerp3(scene_text, p.text, w),
             halo_color: lerp3(
@@ -655,32 +715,96 @@ pub fn process_text(r: &mg_text::TextRenderer, t: &TextJob) -> Ready {
     }
 }
 
+/// Looks up and parses the lyrics for a track: the user's `.lrc` folder, or the built-in demo lyrics.
+pub fn process_lyrics(track_id: u64, source: &LyricSource, title: &str, artist: &str) -> Ready {
+    let lyrics = match source {
+        LyricSource::None => None,
+        LyricSource::Demo => crate::media_feed::demo_lyrics(title),
+        LyricSource::Dir(dir) => {
+            mg_media::lrc::find(dir, title, artist).and_then(|p| mg_media::lrc::load(&p))
+        }
+    };
+    Ready::Lyrics {
+        track_id,
+        lyrics: lyrics.map(Arc::new),
+    }
+}
+
+/// Renders one lyric line (regular weight).
+pub fn process_line(
+    r: Option<&mg_text::TextRenderer>,
+    track_id: u64,
+    serial: u64,
+    idx: usize,
+    text: &str,
+    px: f32,
+    max_width: u32,
+) -> Ready {
+    let bitmap = r.and_then(|r| {
+        r.render_line(
+            text,
+            &mg_text::LineStyle {
+                px,
+                weight: 500,
+                max_width,
+            },
+        )
+    });
+    Ready::Line {
+        track_id,
+        serial,
+        idx,
+        bitmap,
+    }
+}
+
+/// Runs any job synchronously (used by the worker and by the headless self-test).
+pub fn process_job(text: Option<&mg_text::TextRenderer>, job: Job) -> Ready {
+    match job {
+        Job::Art { track_id, bytes } => process_art(track_id, &bytes),
+        Job::Text(t) => match text {
+            Some(r) => process_text(r, &t),
+            None => Ready::Text {
+                track_id: t.track_id,
+                serial: t.serial,
+                title: None,
+                artist: None,
+            },
+        },
+        Job::Lyrics {
+            track_id,
+            source,
+            title,
+            artist,
+        } => process_lyrics(track_id, &source, &title, &artist),
+        Job::Line {
+            track_id,
+            serial,
+            idx,
+            text: line,
+            px,
+            max_width,
+        } => process_line(text, track_id, serial, idx, &line, px, max_width),
+    }
+}
+
 fn run_worker(rx: Receiver<Job>, tx: Sender<Ready>) {
     let text = mg_text::TextRenderer::new(); // owns its COM guard (dropped last)
     while let Ok(first) = rx.recv() {
-        let (mut art, mut txt) = (None, None);
+        // latest request of each kind wins; lyric lines are kept per line index
+        let (mut art, mut txt, mut lyr) = (None, None, None);
+        let mut lines: Vec<Job> = Vec::new();
         for j in std::iter::once(first).chain(std::iter::from_fn(|| rx.try_recv().ok())) {
             match j {
                 Job::Art { .. } => art = Some(j),
                 Job::Text(_) => txt = Some(j),
+                Job::Lyrics { .. } => lyr = Some(j),
+                Job::Line { .. } => lines.push(j),
             }
         }
-        if let Some(Job::Text(t)) = txt {
-            let r = match text.as_ref() {
-                Some(r) => process_text(r, &t),
-                None => Ready::Text {
-                    track_id: t.track_id,
-                    serial: t.serial,
-                    title: None,
-                    artist: None,
-                },
-            };
-            if tx.send(r).is_err() {
-                return;
-            }
-        }
-        if let Some(Job::Art { track_id, bytes }) = art {
-            if tx.send(process_art(track_id, &bytes)).is_err() {
+        // cheap, visible things first; the (bounded but slower) artwork decode last
+        for j in txt.into_iter().chain(lyr).chain(lines).chain(art) {
+            if tx.send(process_job(text.as_ref(), j)).is_err() {
                 return;
             }
         }

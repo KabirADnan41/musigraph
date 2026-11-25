@@ -6,6 +6,7 @@
 //! arrives (capture failed or stalled) the scene decays to silence and shows the NO AUDIO state, and the
 //! window title says so. Samples are never stored or logged (ADR-0003).
 
+use crate::lyric_view::LyricSource;
 use crate::media_feed::MediaFeed;
 use crate::presentation::{GpuOp, Layout, Presentation, Worker, apply_album};
 use crate::scene_map::{Input, MapTuning, SceneMapper};
@@ -63,6 +64,9 @@ pub struct SceneOpts {
     pub style: SceneKind,
     /// Switch to the next scene every N seconds (a hands-free tour; keys still work).
     pub auto_scenes: Option<u64>,
+    /// Folder of user-supplied `.lrc` files (synchronised lyrics). Default: `Music\Musigraph Lyrics` in the
+    /// user profile, only if it exists.
+    pub lyrics_dir: Option<std::path::PathBuf>,
 }
 
 pub fn parse(args: &[String], source: Source) -> Result<SceneOpts, String> {
@@ -77,6 +81,7 @@ pub fn parse(args: &[String], source: Source) -> Result<SceneOpts, String> {
         layout: Layout::Corner,
         style: SceneKind::Spectrum,
         auto_scenes: None,
+        lyrics_dir: None,
     };
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -95,6 +100,14 @@ pub fn parse(args: &[String], source: Source) -> Result<SceneOpts, String> {
                         .and_then(|v| v.parse::<u64>().ok())
                         .filter(|s| (3..=3600).contains(s))
                         .ok_or("--auto-scenes needs 3..=3600 seconds")?,
+                );
+            }
+            "--lyrics-dir" => {
+                o.lyrics_dir = Some(
+                    it.next()
+                        .filter(|p| !p.is_empty())
+                        .ok_or("--lyrics-dir needs a folder")?
+                        .into(),
                 );
             }
             "--no-media" => o.media = MediaChoice::Off,
@@ -204,6 +217,7 @@ struct App {
     pres: Presentation,
     worker: Worker,
     last_media_poll: Option<Instant>,
+    last_np: Option<mg_media::NowPlaying>,
     switch: SceneSwitch,
     last_auto_switch: Instant,
     /// Album Focus: last artwork rectangle and how present it is (eased), so the composition glides to the
@@ -503,8 +517,8 @@ impl App {
             .is_none_or(|t| now.duration_since(t) >= Duration::from_millis(250))
         {
             self.last_media_poll = Some(now);
-            let np = self.media.poll(now);
-            self.pres.on_now_playing(np.as_ref(), surface);
+            self.last_np = self.media.poll(now);
+            self.pres.on_now_playing(self.last_np.as_ref(), surface);
         }
         for job in self.pres.take_jobs() {
             self.worker.submit(job);
@@ -512,6 +526,14 @@ impl App {
         while let Some(r) = self.worker.try_recv() {
             self.pres.on_ready(r);
         }
+        self.pres
+            .set_position(self.last_np.as_ref().and_then(|n| n.position_now(now)));
+        self.pres.set_lyric_anchor(match self.switch.target() {
+            SceneKind::Spectrum => 0.70,
+            SceneKind::Aurora => 0.72,
+            SceneKind::Focus if self.pres.layout() == Layout::Center => 0.80,
+            SceneKind::Focus => 0.72,
+        });
         let mut overlay_params = self
             .pres
             .update(dt as f32, surface, params.energy, params.swell);
@@ -614,6 +636,14 @@ impl App {
     }
 }
 
+/// `%USERPROFILE%\Music\Musigraph Lyrics` when it exists (never created, never written).
+fn default_lyrics_dir() -> Option<std::path::PathBuf> {
+    let d = std::path::PathBuf::from(std::env::var_os("USERPROFILE")?)
+        .join("Music")
+        .join("Musigraph Lyrics");
+    d.is_dir().then_some(d)
+}
+
 /// Runs the scene; returns the process exit code.
 pub fn run(opts: SceneOpts) -> i32 {
     crate::spawn_watchdog(Duration::from_secs(opts.seconds + 30));
@@ -679,6 +709,14 @@ pub fn run(opts: SceneOpts) -> i32 {
         _ => MediaFeed::Off,
     };
     let layout = opts.layout;
+    let lyric_source = match (&opts.lyrics_dir, opts.media) {
+        (Some(d), _) => LyricSource::Dir(d.clone()),
+        (None, MediaChoice::Demo) => LyricSource::Demo,
+        (None, MediaChoice::Auto) if matches!(opts.source, Source::Live) => {
+            default_lyrics_dir().map_or(LyricSource::None, LyricSource::Dir)
+        }
+        _ => LyricSource::None,
+    };
     let style = opts.style;
     let tune = MapTuning::default();
     let stale_after = Duration::from_secs_f32(tune.stale_after_s);
@@ -692,9 +730,14 @@ pub fn run(opts: SceneOpts) -> i32 {
         scene: None,
         overlay: None,
         media,
-        pres: Presentation::new(layout),
+        pres: {
+            let mut p = Presentation::new(layout);
+            p.set_lyric_source(lyric_source);
+            p
+        },
         worker: Worker::start(),
         last_media_poll: None,
+        last_np: None,
         switch: SceneSwitch::new(style),
         last_auto_switch: Instant::now(),
         focus_last: SceneParams::default().focus,
@@ -846,6 +889,8 @@ mod tests {
                 "--demo-media",
                 "--auto-scenes",
                 "30",
+                "--lyrics-dir",
+                "lyrics-folder",
             ]),
             Source::Live,
         )
@@ -854,12 +899,14 @@ mod tests {
         assert_eq!(o.layout, Layout::Center);
         assert_eq!(o.media, MediaChoice::Demo);
         assert_eq!(o.auto_scenes, Some(30));
+        assert_eq!(o.lyrics_dir, Some("lyrics-folder".into()));
         for bad in [
             &["--style", "plasma"][..],
             &["--style"],
             &["--layout", "left"],
             &["--auto-scenes", "1"],
             &["--auto-scenes", "x"],
+            &["--lyrics-dir"],
         ] {
             assert!(parse(&a(bad), Source::Live).is_err(), "{bad:?}");
         }
