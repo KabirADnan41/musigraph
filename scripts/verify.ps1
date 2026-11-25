@@ -1,11 +1,16 @@
 # Musigraph verification gate. Run: powershell -NoProfile -ExecutionPolicy Bypass -File scripts\verify.ps1 [-SkipSecretScan] [-SkipOsv]
-# Needs RUSTUP_HOME/CARGO_HOME/PATH from the user environment. Never run as administrator.
+# Preferred launcher: scripts/verify.cmd (process-scoped execution-policy bypass). Toolchain: PATH, else CARGO_HOME/RUSTUP_HOME, else MUSIGRAPH_TOOLS. Never run as administrator.
 # Tool locations: PATH first, else $env:MUSIGRAPH_TOOLS (default: ..\tools next to this repository).
 param([switch]$SkipSecretScan, [switch]$SkipOsv)
 $ErrorActionPreference = 'Continue'
 $root = Split-Path $PSScriptRoot -Parent
 Set-Location $root
 $tools = if ($env:MUSIGRAPH_TOOLS) { $env:MUSIGRAPH_TOOLS } else { Join-Path (Split-Path $root -Parent) 'tools' }
+# Toolchain: PATH first; else CARGO_HOME/RUSTUP_HOME (or the tools folder) so a fresh shell works. Fails closed if cargo is still missing.
+if (-not $env:CARGO_HOME -and (Test-Path (Join-Path $tools "cargo"))) { $env:CARGO_HOME = Join-Path $tools "cargo" }
+if (-not $env:RUSTUP_HOME -and (Test-Path (Join-Path $tools "rustup"))) { $env:RUSTUP_HOME = Join-Path $tools "rustup" }
+if (-not (Get-Command cargo -ErrorAction SilentlyContinue) -and $env:CARGO_HOME) { $env:PATH = (Join-Path $env:CARGO_HOME "bin") + ";" + $env:PATH }
+if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) { throw "FAILED: cargo not found (PATH, CARGO_HOME or MUSIGRAPH_TOOLS)" }
 function Step($name, [scriptblock]$b) { Write-Host "== $name"; & $b; if ($LASTEXITCODE -ne 0) { throw "FAILED: $name" } }
 function Find-Tool($cmd, $rel) { $c = Get-Command $cmd -ErrorAction SilentlyContinue; if ($c) { return $c.Source }; $p = Join-Path $tools $rel; if (Test-Path $p) { return $p }; return $null }
 Step 'fmt'    { cargo fmt --all -- --check }
@@ -28,7 +33,7 @@ Write-Host '== privacy gate: no capture (microphone) endpoint API'
 $hit = Get-ChildItem crates -Recurse -Filter *.rs | Select-String -CaseSensitive -Pattern 'eCapture|\beAll\b|AUDIO_CAPTURE|DataFlow\s*\(\s*1|build_input_stream|default_input_device|Direction::Capture'
 if ($hit) { $hit | ForEach-Object { $_.ToString() }; throw 'FAILED: capture endpoint referenced (render-endpoint loopback only)' }
 Write-Host '== tracked-file allow-list'
-$ok = '^(\.gitignore|LICENSE|NOTICE|README\.md|THIRD-PARTY-NOTICES\.md|log\.md|rust-toolchain\.toml|Cargo\.toml|Cargo\.lock)$|^(crates|scripts|docs|assets)/.+\.(rs|toml|md|ps1|wgsl|txt|json|csv)$'
+$ok = '^(\.gitignore|LICENSE|NOTICE|README\.md|THIRD-PARTY-NOTICES\.md|log\.md|rust-toolchain\.toml|Cargo\.toml|Cargo\.lock)$|^(crates|scripts|docs|assets)/.+\.(rs|toml|md|ps1|cmd|wgsl|txt|json|csv)$'
 $unexpected = git ls-files | Where-Object { $_ -notmatch $ok }
 if ($unexpected) { $unexpected; throw 'FAILED: unexpected tracked files' }
 }
