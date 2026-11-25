@@ -31,7 +31,7 @@ pub fn run(seconds: u32) -> i32 {
                     n.position_now(Instant::now())
                         .map_or("-".into(), |p| format!("{p:.1}s")),
                     n.duration_s.map_or("-".into(), |d| format!("{d:.1}s")),
-                    n.art.as_ref().map_or(0, Vec::len),
+                    n.art.as_ref().map_or(0, |a| a.len()),
                     n.track_id
                 );
             }

@@ -114,13 +114,15 @@ fn spectrum(x: f32, d: f32, glow: f32) -> vec3<f32> {
 
 // Falling dust on a hash grid. Density comes from the real adaptive energy; the fall phase is integrated on
 // the CPU. The grid is periodic in 128 cells, so wrapping the phase is seamless and the hash input stays
-// small for any run length. `lanes` is an integer so layers stay periodic too.
+// small for any run length. The grid period is 128 x lanes cells, so every layer wraps seamlessly.
 fn dust_layer(p: vec2<f32>, aspect: f32, cell: f32, phase: f32, lanes: f32, dens: f32, seed: f32) -> f32 {
     var g = vec2<f32>(p.x * aspect, p.y) / cell;
     g.y -= phase * 128.0 * lanes;
     var id = floor(g);
     let f = fract(g) - 0.5;
-    id.y = id.y - 128.0 * floor(id.y / 128.0);
+    // The grid repeats every `period` cells, and one phase unit shifts exactly `period` cells, so the wrap is seamless.
+    let period = 128.0 * lanes;
+    id.y = id.y - period * floor(id.y / period);
     let off = vec2<f32>(hash21(id + seed) - 0.5, hash21(id * 1.7 + seed + 11.0) - 0.5) * 0.6;
     let on = step(1.0 - dens, hash21(id + seed + 5.0));
     return on * (1.0 - smoothstep(0.0, 0.10, length(f - off))) * (0.5 + 0.5 * hash21(id + seed + 2.0));

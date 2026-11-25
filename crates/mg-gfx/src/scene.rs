@@ -180,12 +180,14 @@ mod tests {
         p.peaks[1] = 0.25;
         p.glow = 0.7;
         p.mode = SceneMode::Live;
+        p.dust = 0.25;
         let b = p.pack((1280, 720));
         assert_eq!(b.len(), UNIFORM_BYTES);
         assert_eq!(UNIFORM_BYTES, 1264);
         assert_eq!(f32_at(&b, 0), 1280.0);
         assert_eq!(f32_at(&b, 16), 0.7); // glow
         assert_eq!(f32_at(&b, 44), 0.0); // mode live
+        assert_eq!(f32_at(&b, 76), 0.25); // dust phase (pal0.w)
         let bars = 112;
         assert_eq!(f32_at(&b, bars), 0.5);
         assert_eq!(f32_at(&b, bars + 95 * 4), 0.75);
@@ -265,6 +267,30 @@ mod tests {
         assert!(lb > la + 0.05, "bars region {la} -> {lb}");
         // A quiet scene is calm: dark overall (no full-screen brightness).
         assert!(mean_lum(&a, res.0, 0, res.0, 0, res.1) < 0.35);
+    }
+
+    /// The dust phase wraps at 1.0; every layer must be periodic over one phase unit or the sparkles re-roll.
+    #[test]
+    fn dust_phase_wrap_is_seamless_headless() {
+        let Some((h, scene)) = headless() else { return };
+        let res = (480u32, 270u32);
+        let mk = |dust| SceneParams {
+            mode: SceneMode::Live,
+            dust,
+            ..Default::default()
+        };
+        let a = scene
+            .render_offscreen(&h.device, &h.queue, res, &mk(0.0))
+            .unwrap();
+        let b = scene
+            .render_offscreen(&h.device, &h.queue, res, &mk(1.0))
+            .unwrap();
+        let max_diff = a.iter().zip(&b).map(|(x, y)| x.abs_diff(*y)).max().unwrap();
+        assert!(max_diff <= 1, "dust phase 0 and 1 differ by {max_diff}");
+        let c = scene
+            .render_offscreen(&h.device, &h.queue, res, &mk(0.5))
+            .unwrap();
+        assert!(a != c, "dust phase must move the sparkles");
     }
 
     #[test]
