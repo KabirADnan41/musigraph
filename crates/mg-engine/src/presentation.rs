@@ -214,6 +214,8 @@ pub struct Presentation {
     artist: String,
     art_requested: bool,
     serial: u64,
+    /// Serial of the request made for the current track change; later serials are same-track re-renders.
+    track_serial: u64,
     text_for_height: u32,
     since_text_request: f32,
     jobs: Vec<Job>,
@@ -223,7 +225,7 @@ pub struct Presentation {
     art_pending: Option<Option<ArtImage>>,
     has_art_tex: bool,
     text_fade: Fade,
-    text_pending: Option<(Option<TextBitmap>, Option<TextBitmap>)>,
+    text_pending: Option<(u64, Option<TextBitmap>, Option<TextBitmap>)>,
     /// (width, height, pad) of the uploaded title and artist bitmaps.
     text_dims: [Option<(u32, u32, u32)>; 2],
     palette: PaletteState,
@@ -257,6 +259,7 @@ impl Presentation {
             artist: String::new(),
             art_requested: false,
             serial: 0,
+            track_serial: 0,
             text_for_height: 0,
             since_text_request: 0.0,
             jobs: Vec::new(),
@@ -331,6 +334,7 @@ impl Presentation {
             self.text_fade.want = false;
             self.art_requested = false;
             self.serial += 1; // invalidates text results still in flight
+            self.track_serial = self.serial;
             self.palette.set_target(None);
             self.title.clear();
             self.artist.clear();
@@ -338,6 +342,7 @@ impl Presentation {
                 self.title = n.title.clone();
                 self.artist = n.artist.clone();
                 self.request_text(surface);
+                self.track_serial = self.serial;
                 if let (Some(bytes), false) = (&n.art, self.art_requested) {
                     self.art_requested = true;
                     self.jobs.push(Job::Art {
@@ -345,6 +350,9 @@ impl Presentation {
                         bytes: bytes.clone(),
                     });
                 }
+            }
+            if np.is_none_or(|n| n.art.is_none()) {
+                self.art_pending = Some(None); // the previous cover must not stay (texture, layout gap)
             }
         } else if let Some(n) = np {
             // Same track: artwork may arrive late (the session loads it after the title).
@@ -383,7 +391,7 @@ impl Presentation {
                 if Some(track_id) != self.track_id || serial != self.serial {
                     return;
                 }
-                self.text_pending = Some((title, artist));
+                self.text_pending = Some((serial, title, artist));
             }
         }
     }
@@ -424,8 +432,13 @@ impl Presentation {
                 }
             }
         }
-        if self.text_pending.is_some() && self.text_fade.alpha <= 0.02 {
-            let (t, a) = self.text_pending.take().unwrap_or((None, None));
+        // A same-track re-render (resize, layout change) swaps in at once; a new track waits for the fade-out.
+        let text_ready = self
+            .text_pending
+            .as_ref()
+            .is_some_and(|(s, _, _)| *s != self.track_serial || self.text_fade.alpha <= 0.02);
+        if text_ready {
+            let (_, t, a) = self.text_pending.take().unwrap_or((0, None, None));
             for (i, b) in [t, a].into_iter().enumerate() {
                 match b {
                     Some(b) => {
@@ -443,10 +456,11 @@ impl Presentation {
         }
         // A resized window or a layout change needs text at a new pixel size (debounced).
         if self.track_id.is_some()
-            && self.text_for_height != 0
+            && !self.title.is_empty()
             && surface.1 != 0
-            && self.since_text_request > 0.6
-            && (surface.1 as f32 / self.text_for_height as f32 - 1.0).abs() > 0.15
+            && (self.text_for_height == 0
+                || (self.since_text_request > 0.6
+                    && (surface.1 as f32 / self.text_for_height as f32 - 1.0).abs() > 0.15))
         {
             self.request_text(surface);
         }
@@ -642,7 +656,7 @@ pub fn process_text(r: &mg_text::TextRenderer, t: &TextJob) -> Ready {
 }
 
 fn run_worker(rx: Receiver<Job>, tx: Sender<Ready>) {
-    let text = mg_text::TextRenderer::new(); // (COM guard, renderer); guard drops last
+    let text = mg_text::TextRenderer::new(); // owns its COM guard (dropped last)
     while let Ok(first) = rx.recv() {
         let (mut art, mut txt) = (None, None);
         for j in std::iter::once(first).chain(std::iter::from_fn(|| rx.try_recv().ok())) {
@@ -651,14 +665,9 @@ fn run_worker(rx: Receiver<Job>, tx: Sender<Ready>) {
                 Job::Text(_) => txt = Some(j),
             }
         }
-        if let Some(Job::Art { track_id, bytes }) = art {
-            if tx.send(process_art(track_id, &bytes)).is_err() {
-                return;
-            }
-        }
         if let Some(Job::Text(t)) = txt {
             let r = match text.as_ref() {
-                Some((_, r)) => process_text(r, &t),
+                Some(r) => process_text(r, &t),
                 None => Ready::Text {
                     track_id: t.track_id,
                     serial: t.serial,
@@ -667,6 +676,11 @@ fn run_worker(rx: Receiver<Job>, tx: Sender<Ready>) {
                 },
             };
             if tx.send(r).is_err() {
+                return;
+            }
+        }
+        if let Some(Job::Art { track_id, bytes }) = art {
+            if tx.send(process_art(track_id, &bytes)).is_err() {
                 return;
             }
         }
@@ -1066,5 +1080,76 @@ mod tests {
         let o = run(&mut p, 3.0);
         assert!(o.art.is_none() && o.title.is_none());
         assert!(p.album().1 > 0.99);
+    }
+
+    #[test]
+    fn a_same_track_text_rerender_is_applied_without_waiting_for_a_fade_out() {
+        let mut p = Presentation::new(Layout::Corner);
+        p.on_now_playing(Some(&np(1, "T", None)), SURF);
+        p.take_jobs();
+        p.on_ready(Ready::Text {
+            track_id: 1,
+            serial: p.serial,
+            title: Some(bmp()),
+            artist: None,
+        });
+        run(&mut p, 2.0);
+        assert!(matches!(p.take_ops().as_slice(), [GpuOp::SetText(0, _)]));
+        // layout change: new pixel size requested, its result must replace the old bitmap at once
+        p.set_layout(Layout::Center, SURF);
+        let Job::Text(j) = p.take_jobs().remove(0) else {
+            panic!()
+        };
+        p.on_ready(Ready::Text {
+            track_id: 1,
+            serial: j.serial,
+            title: Some(bmp()),
+            artist: None,
+        });
+        let o = p.update(1.0 / 60.0, SURF, 0.5, 0.2);
+        assert!(
+            matches!(p.take_ops().as_slice(), [GpuOp::SetText(0, _)]),
+            "re-render not applied"
+        );
+        assert!(
+            o.title.expect("still visible").alpha > 0.9,
+            "no fade-out for a re-render"
+        );
+    }
+
+    #[test]
+    fn a_track_without_artwork_clears_the_previous_cover() {
+        let mut p = Presentation::new(Layout::Corner);
+        p.on_now_playing(Some(&np(1, "A", Some(Arc::from(vec![1u8])))), SURF);
+        p.take_jobs();
+        p.on_ready(Ready::Art {
+            track_id: 1,
+            image: Some(img([200, 20, 20, 255])),
+            palette: Some(Palette::fallback()),
+        });
+        run(&mut p, 1.5);
+        p.take_ops();
+        p.on_now_playing(Some(&np(2, "B", None)), SURF);
+        p.take_jobs();
+        let o = run(&mut p, 1.5);
+        assert!(
+            p.take_ops().iter().any(|op| matches!(op, GpuOp::ClearArt)),
+            "cover texture kept"
+        );
+        assert!(o.art.is_none(), "cover (and its layout gap) must be gone");
+        assert!(!p.has_art_tex);
+    }
+
+    #[test]
+    fn text_is_requested_once_the_surface_has_a_size() {
+        let mut p = Presentation::new(Layout::Corner);
+        p.on_now_playing(Some(&np(1, "T", None)), (0, 0)); // minimised
+        assert!(p.take_jobs().is_empty());
+        p.update(1.0 / 60.0, SURF, 0.0, 0.0);
+        assert_eq!(
+            p.take_jobs().len(),
+            1,
+            "text requested after the window got a size"
+        );
     }
 }

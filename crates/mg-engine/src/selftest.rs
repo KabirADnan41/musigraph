@@ -89,7 +89,7 @@ fn presentation_previews(failures: &mut Vec<String>) -> bool {
     };
     use mg_gfx::overlay::Overlay;
     let Ok(h) = headless() else { return false };
-    let Some((_guard, text)) = mg_text::TextRenderer::new() else {
+    let Some(text) = mg_text::TextRenderer::new() else {
         failures.push("presentation: DirectWrite unavailable".into());
         return true;
     };

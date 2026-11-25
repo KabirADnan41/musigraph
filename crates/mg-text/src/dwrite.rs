@@ -2,8 +2,8 @@
 //!
 //! Safety contract: every COM interface is owned by a `windows` smart pointer (released on drop); raw
 //! pointers are used only for the duration of one call or one bitmap lock, with lengths taken from the
-//! API (stride x height checked against the buffer size). COM is initialised per thread (MTA); keep the
-//! renderer and its guard on one worker thread and drop the renderer before the guard.
+//! API (stride x height checked against the buffer size). COM is initialised per thread (MTA) and released when
+//! the renderer is dropped (after its interfaces); keep the renderer on the thread that created it.
 
 use crate::{LineStyle, MAX_SIDE, TextBitmap, bound_text};
 use windows::Win32::Graphics::Direct2D::Common::{
@@ -33,7 +33,7 @@ use windows::core::{PCWSTR, w};
 const FAMILY: PCWSTR = w!("Segoe UI");
 
 /// Uninitialises COM on drop. Keep it alive as long as the renderer and drop the renderer first.
-pub struct ComGuard(bool);
+struct ComGuard(bool);
 
 impl Drop for ComGuard {
     fn drop(&mut self) {
@@ -48,12 +48,13 @@ pub struct TextRenderer {
     d2d: ID2D1Factory,
     dwrite: IDWriteFactory,
     wic: IWICImagingFactory,
+    /// Declared last so COM is uninitialised only after every interface above has been released.
+    _com: ComGuard,
 }
 
 impl TextRenderer {
     /// Creates the factories on the current thread. `None` if DirectWrite/Direct2D/WIC are unavailable.
-    /// The returned guard must outlive the renderer (declare it first, so it drops last).
-    pub fn new() -> Option<(ComGuard, Self)> {
+    pub fn new() -> Option<Self> {
         // SAFETY: plain apartment initialisation; an Err (already initialised differently) is not balanced.
         let hr = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
         let guard = ComGuard(hr.is_ok());
@@ -66,7 +67,12 @@ impl TextRenderer {
                 CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER).ok()?;
             (d2d, dwrite, wic)
         };
-        Some((guard, Self { d2d, dwrite, wic }))
+        Some(Self {
+            d2d,
+            dwrite,
+            wic,
+            _com: guard,
+        })
     }
 
     /// Renders one line of text. `None` for empty/whitespace-only text or on any API failure.
@@ -211,7 +217,7 @@ mod tests {
 
     #[test]
     fn latin_bangla_arabic_and_cjk_all_draw_ink() {
-        let (_g, r) = TextRenderer::new().expect("directwrite available");
+        let r = TextRenderer::new().expect("directwrite available");
         let mut widths = Vec::new();
         for s in [
             "Hello, world",
@@ -235,7 +241,7 @@ mod tests {
 
     #[test]
     fn margins_stay_empty_and_long_text_is_trimmed_to_the_width() {
-        let (_g, r) = TextRenderer::new().unwrap();
+        let r = TextRenderer::new().unwrap();
         let long =
             "A very long song title that cannot possibly fit in the available width ".repeat(3);
         let b = r.render_line(&long, &style(500)).unwrap();
@@ -258,7 +264,7 @@ mod tests {
 
     #[test]
     fn empty_and_absurd_requests_are_refused() {
-        let (_g, r) = TextRenderer::new().unwrap();
+        let r = TextRenderer::new().unwrap();
         assert!(r.render_line("", &style(100)).is_none());
         assert!(r.render_line("   \t ", &style(100)).is_none());
         let bad = |px| LineStyle {
