@@ -8,6 +8,7 @@
 #![forbid(unsafe_code)]
 
 pub mod bands;
+pub mod features;
 pub mod smooth;
 pub mod synth;
 
@@ -262,6 +263,11 @@ impl Analyzer {
             seq: 0,
             p,
         })
+    }
+
+    /// A `features::MusicTracker` matched to this analyzer's (clamped) parameters.
+    pub fn music_tracker(&self) -> features::MusicTracker {
+        features::MusicTracker::new(self.sr, &self.p)
     }
 
     pub fn sample_rate(&self) -> u32 {
