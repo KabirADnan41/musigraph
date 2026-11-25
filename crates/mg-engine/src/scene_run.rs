@@ -14,10 +14,12 @@ use crate::controls::{
 };
 use crate::lyric_view::LyricSource;
 use crate::media_feed::MediaFeed;
+use crate::music_summary::MusicSummary;
 use crate::presentation::{GpuOp, Layout, Presentation, Ready, Worker, apply_album};
 use crate::scene_map::{Input, MapTuning, SceneMapper};
 use crate::scene_switch::SceneSwitch;
 use mg_audio::capture::Loopback;
+use mg_dsp::features::{MusicFeatures, MusicTracker};
 use mg_dsp::{AnalysisParams, Analyzer, AudioFrame};
 use mg_gfx::context::{BackendChoice, FrameStatus, Gpu};
 use mg_gfx::overlay::Overlay;
@@ -257,11 +259,15 @@ struct Shared {
     seq: u64,
     onsets: u32,
     onset_strength: f32,
+    /// Latest music descriptors (plain Copy data, overwritten in place: no queue, no allocation).
+    music: MusicFeatures,
 }
 
-fn publish(sh: &Mutex<Shared>, f: &AudioFrame) {
+fn publish(sh: &Mutex<Shared>, tracker: &mut MusicTracker, f: &AudioFrame) {
+    let music = tracker.step(f);
     if let Ok(mut s) = sh.lock() {
         s.frame = Some(*f);
+        s.music = music;
         s.seq += 1;
         if f.onset_event {
             s.onsets += 1;
@@ -273,6 +279,7 @@ fn publish(sh: &Mutex<Shared>, f: &AudioFrame) {
 /// Real-time playback of a synthetic fixture through the SAME analyzer, in the render thread.
 struct SynthSource {
     analyzer: Analyzer,
+    tracker: MusicTracker,
     samples: Vec<f32>,
     pos: usize,
     sr: u32,
@@ -292,7 +299,8 @@ impl SynthSource {
             self.pos = (self.pos + take) % self.samples.len();
             self.done += take as u64;
             let t = self.done * 1_000_000_000 / u64::from(self.sr);
-            self.analyzer.push(chunk, t, |f| publish(sh, f));
+            let tracker = &mut self.tracker;
+            self.analyzer.push(chunk, t, |f| publish(sh, tracker, f));
             left -= take;
         }
     }
@@ -337,6 +345,7 @@ struct App {
     skipped: u64,
     skip_since: Option<Instant>,
     stale_ticks: u64,
+    music_summary: MusicSummary,
     timed_out: bool,
     result: Result<(), String>,
     exit_reason: &'static str,
@@ -611,14 +620,14 @@ impl App {
             s.advance(dt, &self.shared);
         }
         // Gather the newest analysis state (and onset events since the previous frame).
-        let (frame, seq, onsets, strength) = match self.shared.lock() {
+        let (frame, seq, onsets, strength, music) = match self.shared.lock() {
             Ok(mut s) => {
-                let r = (s.frame, s.seq, s.onsets, s.onset_strength);
+                let r = (s.frame, s.seq, s.onsets, s.onset_strength, s.music);
                 s.onsets = 0;
                 s.onset_strength = 0.0;
                 r
             }
-            Err(_) => (None, 0, 0, 0.0),
+            Err(_) => (None, 0, 0, 0.0, MusicFeatures::default()),
         };
         if seq != self.last_seq {
             self.last_seq = seq;
@@ -643,6 +652,10 @@ impl App {
             },
             dt as f32,
         );
+        self.mapper.observe_music(&music, fresh);
+        if fresh {
+            self.music_summary.add(self.mapper.music());
+        }
         // Song information: polled a few times a second, decoded off-thread, applied when ready.
         let surface = self
             .gpu
@@ -835,12 +848,14 @@ pub fn run(opts: SceneOpts) -> i32 {
         Source::Live => {
             let sh = shared.clone();
             let mut analyzer: Option<Analyzer> = None;
+            let mut tracker: Option<MusicTracker> = None;
             match Loopback::start(move |block, rate, t_end| {
                 if analyzer.as_ref().map(Analyzer::sample_rate) != Some(rate) {
                     analyzer = Analyzer::new(rate, AnalysisParams::default()).ok();
+                    tracker = analyzer.as_ref().map(Analyzer::music_tracker);
                 }
-                if let Some(a) = analyzer.as_mut() {
-                    a.push(block, t_end, |f| publish(&sh, f));
+                if let (Some(a), Some(tr)) = (analyzer.as_mut(), tracker.as_mut()) {
+                    a.push(block, t_end, |f| publish(&sh, tr, f));
                 }
             }) {
                 Ok(c) => capture = Some(c),
@@ -862,8 +877,10 @@ pub fn run(opts: SceneOpts) -> i32 {
                 );
                 return 2;
             };
+            let analyzer = Analyzer::new(sr, AnalysisParams::default()).expect("valid rate");
             synth = Some(SynthSource {
-                analyzer: Analyzer::new(sr, AnalysisParams::default()).expect("valid rate"),
+                tracker: analyzer.music_tracker(),
+                analyzer,
                 samples,
                 pos: 0,
                 sr,
@@ -945,6 +962,7 @@ pub fn run(opts: SceneOpts) -> i32 {
         skipped: 0,
         skip_since: None,
         stale_ticks: 0,
+        music_summary: MusicSummary::default(),
         timed_out: false,
         result: Ok(()),
         exit_reason: "event loop ended",
@@ -988,6 +1006,7 @@ pub fn run(opts: SceneOpts) -> i32 {
         pct(0.99),
         s.last().copied().unwrap_or(0.0)
     );
+    println!("{}", app.music_summary.line());
     let reason = if app.result.is_err() {
         "error (see RESULT: FAILED below)"
     } else {

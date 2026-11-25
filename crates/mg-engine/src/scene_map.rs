@@ -9,6 +9,7 @@
 //! density, speed. Colour listens only to slow signals, so a beat can never change colour.
 
 use mg_dsp::AudioFrame;
+use mg_dsp::features::MusicFeatures;
 use mg_dsp::smooth::Smoother;
 use mg_gfx::scene::{SLOTS, SceneMode, SceneParams};
 
@@ -98,6 +99,8 @@ pub struct SceneMapper {
     /// Album Focus rotation phase (slow, grows without wrapping: one hour is only a few hundred units).
     focus_rot: f32,
     onset_count: u32,
+    /// Latest music descriptors, rest values while audio is stale/absent. CPU-side only; never packed.
+    music: MusicFeatures,
     /// slot -> (band position 0..1, group index)
     slot_map: [(f32, usize); SLOTS],
 }
@@ -158,7 +161,19 @@ impl SceneMapper {
             focus_rot: 0.0,
             onset_count: 0,
             slot_map,
+            music: MusicFeatures::default(),
         }
+    }
+
+    /// Records this frame's music features; stale or absent audio gives the rest values (no fake
+    /// activity). Scenes read it through `music()` to derive their own uniform fields.
+    pub fn observe_music(&mut self, m: &MusicFeatures, fresh: bool) {
+        self.music = if fresh { *m } else { MusicFeatures::default() };
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))] // first scene consumer lands in a later slice
+    pub fn music(&self) -> &MusicFeatures {
+        &self.music
     }
 
     /// Advances the scene by `dt` seconds (clamped to 0..0.25) and returns the parameters to draw.

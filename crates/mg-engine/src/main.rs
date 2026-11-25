@@ -6,6 +6,7 @@ mod controls;
 mod levels;
 mod lyric_view;
 mod media_feed;
+mod music_summary;
 mod nowplaying;
 mod presentation;
 mod scene_map;

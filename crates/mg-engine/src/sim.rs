@@ -3,6 +3,7 @@
 //! in `scene_run` uses the same analyzer and mapper with captured system audio instead.
 
 use crate::scene_map::{Input, MapTuning, SceneMapper};
+use mg_dsp::features::{MusicFeatures, MusicTracker};
 use mg_dsp::{AnalysisParams, Analyzer, AudioFrame};
 use mg_gfx::scene::{SceneMode, SceneParams};
 
@@ -60,6 +61,7 @@ pub struct Tick {
     pub frame: AudioFrame,
     pub onsets: u32,
     pub params: SceneParams,
+    pub music: MusicFeatures,
 }
 
 pub struct Sim {
@@ -69,14 +71,19 @@ pub struct Sim {
     fps: f32,
     carry: f64,
     last: AudioFrame,
+    tracker: MusicTracker,
+    music: MusicFeatures,
     samples_done: u64,
     ticks: u64,
 }
 
 impl Sim {
     pub fn new(sr: u32, fps: f32, tune: MapTuning) -> Self {
+        let analyzer = Analyzer::new(sr, AnalysisParams::default()).expect("valid rate");
         Self {
-            analyzer: Analyzer::new(sr, AnalysisParams::default()).expect("valid rate"),
+            tracker: analyzer.music_tracker(),
+            music: MusicFeatures::default(),
+            analyzer,
             mapper: SceneMapper::new(tune),
             sr,
             fps,
@@ -101,13 +108,14 @@ impl Sim {
             self.samples_done += n as u64;
             let t_ns = self.samples_done * 1_000_000_000 / u64::from(self.sr);
             let (mut onsets, mut strength) = (0u32, 0.0f32);
-            let last = &mut self.last;
+            let (last, tracker, music) = (&mut self.last, &mut self.tracker, &mut self.music);
             self.analyzer.push(chunk, t_ns, |f| {
                 if f.onset_event {
                     onsets += 1;
                     strength = strength.max(f.onset);
                 }
                 *last = *f;
+                *music = tracker.step(f);
             });
             let dt = 1.0 / self.fps;
             let params = self.mapper.update(
@@ -120,12 +128,14 @@ impl Sim {
                 },
                 dt,
             );
+            self.mapper.observe_music(&self.music, true);
             self.ticks += 1;
             out.push(Tick {
                 t: self.ticks as f32 * dt,
                 frame: self.last,
                 onsets,
                 params,
+                music: *self.mapper.music(),
             });
         }
         out
@@ -512,6 +522,75 @@ mod tests {
         assert!(
             t.windows(10)
                 .all(|w| (lum(&w[9].params) - lum(&w[0].params)).abs() < 0.35)
+        );
+    }
+
+    /// FNV-1a over the packed GPU bytes of every tick (golden: music plumbing must not change GPU output).
+    fn pack_hash(name: &str) -> u64 {
+        let x = fixture(name, SR).unwrap();
+        let mut h = 0xcbf2_9ce4_8422_2325u64;
+        for t in run(&x[..sec(3.0).min(x.len())], 60.0) {
+            for b in t.params.pack((1280, 720)) {
+                h = (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3);
+            }
+        }
+        h
+    }
+
+    #[test]
+    fn packed_uniform_bytes_match_golden_hashes() {
+        // Captured from the code BEFORE the music plumbing existed (3 s of each fixture at 60 fps, 1280x720).
+        assert_eq!(pack_hash("kick"), 0x1484_032f_5f2a_d455);
+        assert_eq!(pack_hash("demo"), 0x0af2_f12a_f19e_5e0b);
+    }
+
+    /// Mean of a per-tick music value over the last second of a 6 s run.
+    fn music_tail(name: &str, f: impl Fn(&MusicFeatures) -> f32) -> f32 {
+        let x = fixture(name, SR).unwrap();
+        let t = run(&x[..sec(6.0).min(x.len())], 60.0);
+        assert!(t.iter().all(|k| f(&k.music).is_finite()));
+        t[t.len() - 60..].iter().map(|k| f(&k.music)).sum::<f32>() / 60.0
+    }
+
+    #[test]
+    fn music_features_differ_per_fixture_and_are_finite() {
+        let level = |m: &MusicFeatures| m.level;
+        let dens = |m: &MusicFeatures| m.onset_density;
+        let crest = |m: &MusicFeatures| m.crest_db;
+        let calm = |m: &MusicFeatures| m.calm;
+        assert!(music_tail("silence", calm) > 0.9);
+        assert_eq!(music_tail("silence", level), 0.0);
+        assert!(
+            music_tail("kick", dens) > music_tail("mid", dens) + 0.5,
+            "kick is rhythmic, a pad is not"
+        );
+        assert!(
+            music_tail("kick", crest) > music_tail("mid", crest) + 3.0,
+            "kick is peaky, a sine is not"
+        );
+        assert!(
+            music_tail("mid", calm) > music_tail("kick", calm) + 0.3,
+            "steady tone is calmer than a kick train"
+        );
+        assert!(music_tail("kick", level) > music_tail("silence", level));
+    }
+
+    #[test]
+    fn stale_audio_gives_rest_music_values() {
+        let mut m = SceneMapper::new(MapTuning::default());
+        let loud = MusicFeatures {
+            level: 0.9,
+            calm: 0.0,
+            onset_density: 5.0,
+            ..MusicFeatures::default()
+        };
+        m.observe_music(&loud, true);
+        assert_eq!(m.music().level, 0.9);
+        m.observe_music(&loud, false);
+        let rest = MusicFeatures::default();
+        assert_eq!(
+            (m.music().level, m.music().calm, m.music().onset_density),
+            (rest.level, rest.calm, rest.onset_density)
         );
     }
 }
