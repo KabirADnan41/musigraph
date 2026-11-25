@@ -1,6 +1,9 @@
 //! Windows-only watcher: polls the system media sessions on its own thread (MTA) and publishes the
 //! selected session as a `NowPlaying` snapshot. WinRT calls through windows-rs are safe code.
 
+use crate::control::{
+    Capabilities, CommandResult, FailClass, MediaCommand, SessionBackend, seek_ticks,
+};
 use crate::{
     Candidate, MAX_ART_BYTES, NowPlaying, PlaybackState, sanitize_text, select_session,
     timeline_seconds,
@@ -71,16 +74,11 @@ fn track_hash(title: &str, artist: &str, album: &str, app: &str) -> u64 {
     h.finish()
 }
 
-/// One poll: returns the selected session's snapshot (reusing `prev` artwork when the track is unchanged).
-fn poll(
-    mgr: &Manager,
-    prev: Option<&NowPlaying>,
-    retry_art: bool,
-) -> Result<Option<NowPlaying>, String> {
-    let e = |what: &str, x: windows::core::Error| format!("{what}: {x}");
+/// Current sessions with their selection candidates (resolved fresh on every call).
+fn candidates(mgr: &Manager) -> Result<(Vec<Session>, Vec<Candidate>), String> {
     let sessions: Vec<Session> = mgr
         .GetSessions()
-        .map_err(|x| e("GetSessions", x))?
+        .map_err(|x| format!("GetSessions: {x}"))?
         .into_iter()
         .collect();
     let current_app = mgr
@@ -101,6 +99,31 @@ fn poll(
                 .is_some_and(|c| s.SourceAppUserModelId().is_ok_and(|a| a == *c)),
         })
         .collect();
+    Ok((sessions, cands))
+}
+
+/// Capability flags from the session's `PlaybackInfo().Controls()`; anything unreadable is `false`.
+fn read_caps(s: &Session) -> Capabilities {
+    let Ok(c) = s.GetPlaybackInfo().and_then(|i| i.Controls()) else {
+        return Capabilities::default();
+    };
+    Capabilities::from_raw([
+        c.IsPlayEnabled().ok(),
+        c.IsPauseEnabled().ok(),
+        c.IsPlayPauseToggleEnabled().ok(),
+        c.IsNextEnabled().ok(),
+        c.IsPreviousEnabled().ok(),
+        c.IsPlaybackPositionEnabled().ok(),
+    ])
+}
+
+/// One poll: returns the selected session's snapshot (reusing `prev` artwork when the track is unchanged).
+fn poll(
+    mgr: &Manager,
+    prev: Option<&NowPlaying>,
+    retry_art: bool,
+) -> Result<Option<NowPlaying>, String> {
+    let (sessions, cands) = candidates(mgr)?;
     let Some(i) = select_session(&cands) else {
         return Ok(None);
     };
@@ -157,7 +180,69 @@ fn poll(
         sampled_at,
         art,
         track_id: id,
+        caps: read_caps(s),
     }))
+}
+
+/// Real WinRT backend: resolves the selected session at send time and performs the call (bounded waits).
+pub(crate) struct SystemBackend;
+
+impl SessionBackend for SystemBackend {
+    fn execute(&self, cmd: MediaCommand) -> CommandResult {
+        // SAFETY: balanced by CoUninitialize below on this thread; MTA so blocking waits are allowed.
+        #[allow(unsafe_code)]
+        let com = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
+        if com.is_err() {
+            return CommandResult::Failed(FailClass::Error);
+        }
+        let r = run_command(cmd);
+        // SAFETY: paired with the successful CoInitializeEx above; WinRT objects dropped in run_command.
+        #[allow(unsafe_code)]
+        unsafe {
+            CoUninitialize()
+        };
+        r
+    }
+}
+
+fn run_command(cmd: MediaCommand) -> CommandResult {
+    let Some(mgr) = wait!(Manager::RequestAsync()) else {
+        return CommandResult::NoSession;
+    };
+    let Ok((sessions, cands)) = candidates(&mgr) else {
+        return CommandResult::Failed(FailClass::Error);
+    };
+    let Some(i) = select_session(&cands) else {
+        return CommandResult::NoSession;
+    };
+    let s = &sessions[i];
+    if !read_caps(s).allows(cmd) {
+        return CommandResult::Unsupported;
+    }
+    let done = match cmd {
+        MediaCommand::Play => wait!(s.TryPlayAsync()),
+        MediaCommand::Pause => wait!(s.TryPauseAsync()),
+        MediaCommand::TogglePlayPause => wait!(s.TryTogglePlayPauseAsync()),
+        MediaCommand::Next => wait!(s.TrySkipNextAsync()),
+        MediaCommand::Previous => wait!(s.TrySkipPreviousAsync()),
+        MediaCommand::SeekTo(secs) => {
+            let Ok(t) = s.GetTimelineProperties() else {
+                return CommandResult::Unsupported;
+            };
+            let tick = |r: windows::core::Result<windows::Foundation::TimeSpan>| {
+                r.map_or(0, |d| d.Duration)
+            };
+            let Some(target) = seek_ticks(secs, tick(t.StartTime()), tick(t.EndTime())) else {
+                return CommandResult::Unsupported;
+            };
+            wait!(s.TryChangePlaybackPositionAsync(target))
+        }
+    };
+    match done {
+        Some(true) => CommandResult::Ok,
+        Some(false) => CommandResult::Failed(FailClass::Rejected),
+        None => CommandResult::Failed(FailClass::Error),
+    }
 }
 
 fn run(stop: &AtomicBool, shared: &Mutex<Shared>) {

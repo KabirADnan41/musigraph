@@ -1,6 +1,9 @@
 //! `--scene` (LIVE system audio) and `--scene-synth NAME` (explicitly labelled SYNTHETIC fixture):
 //! the fullscreen Cinematic Spectrum scene.
 //!
+//! Keys (see `key_action`): Space play/pause, Left/Right previous/next TRACK, `[` `]` previous/next scene,
+//! 1-9 scene by selector position, L lyrics, A artwork layout, F fullscreen, Esc exit.
+//!
 //! Live path: WASAPI loopback -> capture thread -> central `Analyzer` -> shared latest frame ->
 //! `SceneMapper` -> `SceneSet`. Nothing here invents musical activity: if no fresh analysis frame
 //! arrives (capture failed or stalled) the scene decays to silence and shows the NO AUDIO state, and the
@@ -16,13 +19,14 @@ use mg_dsp::{AnalysisParams, Analyzer, AudioFrame};
 use mg_gfx::context::{BackendChoice, FrameStatus, Gpu};
 use mg_gfx::overlay::Overlay;
 use mg_gfx::scene::{SceneKind, SceneMode, SceneParams, SceneSet};
+use mg_media::{Dispatch, MediaCommand};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
 use winit::event::{ElementState, KeyEvent, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
-use winit::keyboard::{Key, KeyCode, ModifiersState, NamedKey, PhysicalKey};
+use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
 use winit::window::{Fullscreen, Window, WindowId};
 
 /// A minimised/occluded window is normal for a visualizer; only a very long stall is treated as failure.
@@ -31,6 +35,62 @@ use winit::window::{Fullscreen, Window, WindowId};
 fn toggle_allowed(m: ModifiersState) -> bool {
     !(m.control_key() || m.alt_key() || m.super_key())
 }
+
+/// Everything a key can do. One owner of the key map (`key_action`); behaviour never depends on any UI.
+#[derive(Debug, PartialEq, Clone, Copy)]
+enum KeyAction {
+    Media(MediaCommand),
+    PrevScene,
+    NextScene,
+    /// Zero-based position in `SceneKind::selector()`.
+    SceneAt(usize),
+    ToggleLyrics,
+    CycleArtwork,
+    ToggleFullscreen,
+    Exit,
+}
+
+/// Owner-approved key map. Physical keys; Esc always exits; every other key ignores key repeat and any
+/// Ctrl/Alt/Win combination (Shift alone is fine): Space = play/pause, Left/Right = previous/next TRACK,
+/// `[` `]` = previous/next scene, 1-9 = scene by selector position, L lyrics, A artwork layout, F fullscreen.
+fn key_action(code: KeyCode, mods: ModifiersState, repeat: bool) -> Option<KeyAction> {
+    if code == KeyCode::Escape {
+        return Some(KeyAction::Exit);
+    }
+    if repeat || !toggle_allowed(mods) {
+        return None;
+    }
+    let digit = [
+        KeyCode::Digit1,
+        KeyCode::Digit2,
+        KeyCode::Digit3,
+        KeyCode::Digit4,
+        KeyCode::Digit5,
+        KeyCode::Digit6,
+        KeyCode::Digit7,
+        KeyCode::Digit8,
+        KeyCode::Digit9,
+    ]
+    .iter()
+    .position(|d| *d == code);
+    if let Some(i) = digit {
+        return Some(KeyAction::SceneAt(i));
+    }
+    Some(match code {
+        KeyCode::Space => KeyAction::Media(MediaCommand::TogglePlayPause),
+        KeyCode::ArrowLeft => KeyAction::Media(MediaCommand::Previous),
+        KeyCode::ArrowRight => KeyAction::Media(MediaCommand::Next),
+        KeyCode::BracketLeft => KeyAction::PrevScene,
+        KeyCode::BracketRight => KeyAction::NextScene,
+        KeyCode::KeyL => KeyAction::ToggleLyrics,
+        KeyCode::KeyA => KeyAction::CycleArtwork,
+        KeyCode::KeyF => KeyAction::ToggleFullscreen,
+        _ => return None,
+    })
+}
+
+/// At most one "command unsupported" stderr note per this interval.
+const NOTE_EVERY: Duration = Duration::from_secs(5);
 
 const CURSOR_HIDE_AFTER: Duration = Duration::from_secs(3);
 const MAX_SKIP_TIME: Duration = Duration::from_secs(30);
@@ -235,6 +295,7 @@ struct App {
     last_input: Instant,
     cursor_hidden: bool,
     mods: ModifiersState,
+    last_unsupported_note: Option<Instant>,
     title: String,
     last_frame: Option<Instant>,
     intervals_ms: Vec<f64>,
@@ -333,94 +394,21 @@ impl ApplicationHandler for App {
                 self.exit_reason = "window close requested";
                 el.exit()
             }
-            WindowEvent::KeyboardInput {
-                event:
-                    KeyEvent {
-                        logical_key: Key::Named(NamedKey::Escape),
-                        state: ElementState::Pressed,
-                        ..
-                    },
-                ..
-            } => {
-                self.exit_reason = "Esc pressed";
-                el.exit()
-            }
             WindowEvent::ModifiersChanged(m) => self.mods = m.state(),
             WindowEvent::Focused(false) => self.mods = ModifiersState::empty(),
             WindowEvent::KeyboardInput {
                 event:
                     KeyEvent {
-                        physical_key: PhysicalKey::Code(KeyCode::KeyF),
-                        state: ElementState::Pressed,
-                        repeat: false,
-                        ..
-                    },
-                ..
-            } if toggle_allowed(self.mods) => {
-                self.opts.fullscreen = !self.opts.fullscreen;
-                self.apply_fullscreen();
-                self.touch_input();
-            }
-            WindowEvent::KeyboardInput {
-                event:
-                    KeyEvent {
                         physical_key: PhysicalKey::Code(code),
                         state: ElementState::Pressed,
-                        repeat: false,
+                        repeat,
                         ..
                     },
                 ..
-            } if toggle_allowed(self.mods)
-                && matches!(
-                    code,
-                    KeyCode::ArrowLeft
-                        | KeyCode::ArrowRight
-                        | KeyCode::Digit1
-                        | KeyCode::Digit2
-                        | KeyCode::Digit3
-                ) =>
-            {
-                let from = self.switch.target();
-                let to = match code {
-                    KeyCode::ArrowLeft => from.prev(),
-                    KeyCode::ArrowRight => from.next(),
-                    KeyCode::Digit1 => SceneKind::selector().nth(0).unwrap_or(SceneKind::Spectrum),
-                    KeyCode::Digit2 => SceneKind::selector().nth(1).unwrap_or(SceneKind::Spectrum),
-                    _ => SceneKind::selector().nth(2).unwrap_or(SceneKind::Spectrum),
-                };
-                self.switch.request(to);
-                self.last_auto_switch = Instant::now(); // a manual choice restarts the tour timer
-                self.touch_input();
-            }
-            WindowEvent::KeyboardInput {
-                event:
-                    KeyEvent {
-                        physical_key: PhysicalKey::Code(KeyCode::KeyL),
-                        state: ElementState::Pressed,
-                        repeat: false,
-                        ..
-                    },
-                ..
-            } if toggle_allowed(self.mods) => {
-                self.pres.toggle_lyrics();
-                self.touch_input();
-            }
-            WindowEvent::KeyboardInput {
-                event:
-                    KeyEvent {
-                        physical_key: PhysicalKey::Code(KeyCode::KeyA),
-                        state: ElementState::Pressed,
-                        repeat: false,
-                        ..
-                    },
-                ..
-            } if toggle_allowed(self.mods) => {
-                let surface = self
-                    .gpu
-                    .as_ref()
-                    .map_or((0, 0), |g| (g.config.width, g.config.height));
-                self.pres.set_layout(self.pres.layout().next(), surface);
-                self.touch_input();
+            } => {
+                if let Some(action) = key_action(code, self.mods, repeat) {
+                    self.run_action(el, action);
+                }
             }
             WindowEvent::CursorMoved { .. } | WindowEvent::MouseInput { .. } => self.touch_input(),
             WindowEvent::Resized(s) => {
@@ -456,6 +444,56 @@ impl ApplicationHandler for App {
 }
 
 impl App {
+    fn run_action(&mut self, el: &ActiveEventLoop, action: KeyAction) {
+        match action {
+            KeyAction::Exit => {
+                self.exit_reason = "Esc pressed";
+                el.exit();
+                return;
+            }
+            KeyAction::ToggleFullscreen => {
+                self.opts.fullscreen = !self.opts.fullscreen;
+                self.apply_fullscreen();
+            }
+            KeyAction::ToggleLyrics => {
+                self.pres.toggle_lyrics();
+            }
+            KeyAction::CycleArtwork => {
+                let surface = self
+                    .gpu
+                    .as_ref()
+                    .map_or((0, 0), |g| (g.config.width, g.config.height));
+                self.pres.set_layout(self.pres.layout().next(), surface);
+            }
+            KeyAction::PrevScene | KeyAction::NextScene | KeyAction::SceneAt(_) => {
+                let from = self.switch.target();
+                let to = match action {
+                    KeyAction::PrevScene => Some(from.prev()),
+                    KeyAction::NextScene => Some(from.next()),
+                    KeyAction::SceneAt(i) => SceneKind::selector().nth(i),
+                    _ => None,
+                };
+                if let Some(to) = to {
+                    self.switch.request(to);
+                    self.last_auto_switch = Instant::now(); // a manual choice restarts the tour timer
+                }
+            }
+            KeyAction::Media(cmd) => {
+                let now = Instant::now();
+                // Busy is silently dropped; Unsupported gets one rate-limited note (never titles).
+                if self.media.send(cmd, now) == Dispatch::Unsupported
+                    && self
+                        .last_unsupported_note
+                        .is_none_or(|t| now.duration_since(t) >= NOTE_EVERY)
+                {
+                    self.last_unsupported_note = Some(now);
+                    eprintln!("media control: command not supported by the current source");
+                }
+            }
+        }
+        self.touch_input();
+    }
+
     fn touch_input(&mut self) {
         self.last_input = Instant::now();
         if self.cursor_hidden {
@@ -786,6 +824,7 @@ pub fn run(opts: SceneOpts) -> i32 {
         last_input: Instant::now(),
         cursor_hidden: false,
         mods: ModifiersState::empty(),
+        last_unsupported_note: None,
         title: String::new(),
         last_frame: None,
         intervals_ms: Vec::new(),
@@ -858,6 +897,59 @@ mod tests {
 
     fn a(s: &[&str]) -> Vec<String> {
         s.iter().map(|x| x.to_string()).collect()
+    }
+
+    #[test]
+    fn key_map_matches_the_approved_layout() {
+        use KeyAction::*;
+        let none = ModifiersState::empty();
+        let k = |c| key_action(c, none, false);
+        assert_eq!(
+            k(KeyCode::Space),
+            Some(Media(MediaCommand::TogglePlayPause))
+        );
+        assert_eq!(k(KeyCode::ArrowLeft), Some(Media(MediaCommand::Previous)));
+        assert_eq!(k(KeyCode::ArrowRight), Some(Media(MediaCommand::Next)));
+        assert_eq!(k(KeyCode::BracketLeft), Some(PrevScene));
+        assert_eq!(k(KeyCode::BracketRight), Some(NextScene));
+        assert_eq!(k(KeyCode::Digit1), Some(SceneAt(0)));
+        assert_eq!(k(KeyCode::Digit9), Some(SceneAt(8)));
+        assert_eq!(k(KeyCode::Digit0), None);
+        assert_eq!(k(KeyCode::KeyL), Some(ToggleLyrics));
+        assert_eq!(k(KeyCode::KeyA), Some(CycleArtwork));
+        assert_eq!(k(KeyCode::KeyF), Some(ToggleFullscreen));
+        assert_eq!(k(KeyCode::Escape), Some(Exit));
+        assert_eq!(k(KeyCode::KeyQ), None);
+        assert_eq!(k(KeyCode::ArrowUp), None);
+    }
+
+    #[test]
+    fn key_map_ignores_repeat_and_system_modifiers_but_esc_always_exits() {
+        for code in [
+            KeyCode::Space,
+            KeyCode::ArrowLeft,
+            KeyCode::BracketRight,
+            KeyCode::Digit2,
+            KeyCode::KeyF,
+        ] {
+            assert_eq!(
+                key_action(code, ModifiersState::empty(), true),
+                None,
+                "repeat"
+            );
+            for m in [
+                ModifiersState::ALT,
+                ModifiersState::CONTROL,
+                ModifiersState::SUPER,
+            ] {
+                assert_eq!(key_action(code, m, false), None, "{code:?} {m:?}");
+            }
+            assert!(key_action(code, ModifiersState::SHIFT, false).is_some());
+        }
+        assert_eq!(
+            key_action(KeyCode::Escape, ModifiersState::ALT, true),
+            Some(KeyAction::Exit)
+        );
     }
 
     #[test]

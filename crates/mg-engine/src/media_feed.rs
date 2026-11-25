@@ -8,7 +8,10 @@
 //!
 //! Polling is throttled: the render loop asks a few times a second, never per frame.
 
-use mg_media::{NowPlaying, NowPlayingWatcher, PlaybackState};
+use mg_media::{
+    Capabilities, CommandResult, Dispatch, MediaCommand, MediaController, NowPlaying,
+    NowPlayingWatcher, PlaybackState,
+};
 use std::time::{Duration, Instant};
 
 const POLL_EVERY: Duration = Duration::from_millis(250);
@@ -21,11 +24,85 @@ pub enum MediaFeed {
         watcher: NowPlayingWatcher,
         last_poll: Option<Instant>,
         cache: Option<NowPlaying>,
+        controller: MediaController,
     },
-    Demo {
-        tracks: Vec<NowPlaying>,
-        start: Instant,
-    },
+    Demo(DemoPlayer),
+}
+
+/// Deterministic simulated player for `--demo-media`: a position clock that can be paused, tracks that can be
+/// skipped (wrapping) and a seekable timeline, so the whole control pipeline is testable without a player.
+pub struct DemoPlayer {
+    tracks: Vec<NowPlaying>,
+    index: usize,
+    /// Position (seconds) at `since`; the clock only runs while `playing`.
+    pos_s: f64,
+    since: Instant,
+    playing: bool,
+    last: Option<CommandResult>,
+}
+
+impl DemoPlayer {
+    fn new(tracks: Vec<NowPlaying>, now: Instant) -> Self {
+        Self {
+            tracks,
+            index: 0,
+            pos_s: 0.0,
+            since: now,
+            playing: true,
+            last: None,
+        }
+    }
+
+    /// Folds elapsed time into the state: a finished demo track rolls over to the next one.
+    fn settle(&mut self, now: Instant) {
+        if self.playing {
+            self.pos_s += now.saturating_duration_since(self.since).as_secs_f64();
+        }
+        self.since = self.since.max(now);
+        let dur = DEMO_TRACK_SECS as f64;
+        if self.pos_s >= dur {
+            let n = self.tracks.len().max(1);
+            self.index = (self.index + (self.pos_s / dur) as usize) % n;
+            self.pos_s %= dur;
+        }
+    }
+
+    fn apply(&mut self, cmd: MediaCommand, now: Instant) -> CommandResult {
+        self.settle(now);
+        let n = self.tracks.len().max(1);
+        match cmd {
+            MediaCommand::Play => self.playing = true,
+            MediaCommand::Pause => self.playing = false,
+            MediaCommand::TogglePlayPause => self.playing = !self.playing,
+            MediaCommand::Next => {
+                self.index = (self.index + 1) % n;
+                self.pos_s = 0.0;
+            }
+            MediaCommand::Previous => {
+                self.index = (self.index + n - 1) % n;
+                self.pos_s = 0.0;
+            }
+            MediaCommand::SeekTo(s) if s.is_nan() => return CommandResult::Unsupported,
+            // just short of the end: seeking to the very end would roll over to the next track
+            MediaCommand::SeekTo(s) => self.pos_s = s.clamp(0.0, DEMO_TRACK_SECS as f64 - 0.001),
+        }
+        CommandResult::Ok
+    }
+
+    fn snapshot(&mut self, now: Instant) -> Option<NowPlaying> {
+        self.settle(now);
+        let mut t = self.tracks.get(self.index).cloned()?;
+        t.state = if self.playing {
+            PlaybackState::Playing
+        } else {
+            PlaybackState::Paused
+        };
+        t.position_s = Some(self.pos_s);
+        t.duration_s = Some(DEMO_TRACK_SECS as f64);
+        t.sampled_at = now;
+        t.caps = Capabilities::all();
+        Some(t)
+    }
 }
 
 impl MediaFeed {
@@ -34,14 +111,12 @@ impl MediaFeed {
             watcher: NowPlayingWatcher::start()?,
             last_poll: None,
             cache: None,
+            controller: MediaController::system(),
         })
     }
 
     pub fn demo() -> Self {
-        MediaFeed::Demo {
-            tracks: demo_tracks(),
-            start: Instant::now(),
-        }
+        MediaFeed::Demo(DemoPlayer::new(demo_tracks(), Instant::now()))
     }
 
     /// Latest snapshot, refreshed at most every 250 ms (cheap clone otherwise).
@@ -52,6 +127,7 @@ impl MediaFeed {
                 watcher,
                 last_poll,
                 cache,
+                ..
             } => {
                 if last_poll.is_none_or(|t| now.duration_since(t) >= POLL_EVERY) {
                     *last_poll = Some(now);
@@ -59,16 +135,45 @@ impl MediaFeed {
                 }
                 cache.clone()
             }
-            MediaFeed::Demo { tracks, start } => {
-                let elapsed = now.duration_since(*start).as_secs_f64();
-                let i = (elapsed as u64 / DEMO_TRACK_SECS) as usize % tracks.len().max(1);
-                let mut t = tracks.get(i).cloned()?;
-                // a live timeline, as a real player would report it
-                t.position_s = Some(elapsed % DEMO_TRACK_SECS as f64);
-                t.duration_s = Some(DEMO_TRACK_SECS as f64);
-                t.sampled_at = now;
-                Some(t)
+            MediaFeed::Demo(d) => d.snapshot(now),
+        }
+    }
+
+    /// What the current source lets the user do (all false for Off or when no session is known).
+    pub fn caps(&self) -> Capabilities {
+        match self {
+            MediaFeed::Off => Capabilities::default(),
+            MediaFeed::Live { cache, .. } => cache.as_ref().map(|n| n.caps).unwrap_or_default(),
+            MediaFeed::Demo(_) => Capabilities::all(),
+        }
+    }
+
+    /// Routes a playback command to the source. Live: the real controller (async, never blocks); Demo:
+    /// simulated immediately; Off: unsupported.
+    pub fn send(&mut self, cmd: MediaCommand, now: Instant) -> Dispatch {
+        let caps = self.caps();
+        match self {
+            MediaFeed::Off => Dispatch::Unsupported,
+            MediaFeed::Live { controller, .. } => controller.send(cmd, &caps, now),
+            MediaFeed::Demo(d) => {
+                let r = d.apply(cmd, now);
+                d.last = Some(r);
+                if r == CommandResult::Ok {
+                    Dispatch::Started
+                } else {
+                    Dispatch::Unsupported
+                }
             }
+        }
+    }
+
+    /// Result of the most recent command (for a future control bar / status line).
+    #[allow(dead_code)] // read by the future on-screen control bar (tested)
+    pub fn last_result(&self) -> Option<CommandResult> {
+        match self {
+            MediaFeed::Off => None,
+            MediaFeed::Live { controller, .. } => controller.last_result(),
+            MediaFeed::Demo(d) => d.last,
         }
     }
 }
@@ -113,6 +218,7 @@ fn track(id: u64, title: &str, artist: &str, art: Option<Vec<u8>>) -> NowPlaying
         position_s: None,
         duration_s: None,
         sampled_at: Instant::now(),
+        caps: Capabilities::default(),
         art: art.map(|b| std::sync::Arc::from(b.into_boxed_slice())),
         track_id: id,
     }
@@ -281,5 +387,76 @@ mod tests {
             .track_id;
         assert_ne!(a, b);
         assert!(MediaFeed::Off.poll(t0).is_none());
+    }
+
+    fn id(f: &mut MediaFeed, t: Instant) -> u64 {
+        f.poll(t).unwrap().track_id
+    }
+
+    #[test]
+    fn demo_next_and_previous_wrap_and_reset_position() {
+        let mut f = MediaFeed::demo();
+        let t = Instant::now();
+        let n = demo_tracks().len() as u64;
+        let first = id(&mut f, t);
+        f.send(MediaCommand::SeekTo(9.0), t);
+        assert_eq!(f.send(MediaCommand::Previous, t), Dispatch::Started);
+        assert_eq!(id(&mut f, t), first + n - 1, "previous wraps to the last");
+        assert_eq!(f.poll(t).unwrap().position_s, Some(0.0));
+        f.send(MediaCommand::Next, t);
+        assert_eq!(id(&mut f, t), first, "next wraps back");
+        for _ in 0..n {
+            f.send(MediaCommand::Next, t);
+        }
+        assert_eq!(id(&mut f, t), first);
+        assert_eq!(f.last_result(), Some(CommandResult::Ok));
+    }
+
+    #[test]
+    fn demo_toggle_freezes_and_resumes_the_position_clock() {
+        let mut f = MediaFeed::demo();
+        let t0 = Instant::now();
+        let s = Duration::from_secs;
+        let pos = |f: &mut MediaFeed, t| f.poll(t).unwrap().position_s;
+        f.send(MediaCommand::SeekTo(5.0), t0);
+        assert_eq!(pos(&mut f, t0 + s(2)), Some(7.0));
+        f.send(MediaCommand::TogglePlayPause, t0 + s(2));
+        let p = f.poll(t0 + s(10)).unwrap();
+        assert_eq!((p.state, p.position_s), (PlaybackState::Paused, Some(7.0)));
+        f.send(MediaCommand::TogglePlayPause, t0 + s(10));
+        let p = f.poll(t0 + s(13)).unwrap();
+        assert_eq!(
+            (p.state, p.position_s),
+            (PlaybackState::Playing, Some(10.0))
+        );
+        // seek clamps to the track; NaN is refused and changes nothing
+        f.send(MediaCommand::SeekTo(-3.0), t0 + s(13));
+        assert_eq!(pos(&mut f, t0 + s(13)), Some(0.0));
+        f.send(MediaCommand::SeekTo(1e9), t0 + s(13));
+        assert_eq!(
+            pos(&mut f, t0 + s(13)),
+            Some(DEMO_TRACK_SECS as f64 - 0.001)
+        );
+        f.send(MediaCommand::SeekTo(4.0), t0 + s(13));
+        let d = f.send(MediaCommand::SeekTo(f64::NAN), t0 + s(13));
+        assert_eq!(d, Dispatch::Unsupported);
+        assert_eq!(pos(&mut f, t0 + s(13)), Some(4.0));
+        assert_eq!(f.last_result(), Some(CommandResult::Unsupported));
+    }
+
+    #[test]
+    fn off_refuses_commands_and_demo_has_all_capabilities() {
+        let mut off = MediaFeed::Off;
+        let d = off.send(MediaCommand::Next, Instant::now());
+        assert_eq!(d, Dispatch::Unsupported);
+        assert_eq!(off.caps(), Capabilities::default());
+        assert_eq!(MediaFeed::demo().caps(), Capabilities::all());
+        assert!(
+            MediaFeed::demo()
+                .poll(Instant::now())
+                .unwrap()
+                .caps
+                .can_seek
+        );
     }
 }

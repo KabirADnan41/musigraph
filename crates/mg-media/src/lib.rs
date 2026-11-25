@@ -21,10 +21,12 @@ pub use art::decode_art;
 #[cfg(windows)]
 pub use session::NowPlayingWatcher;
 
+pub mod control;
 pub mod lrc;
 pub mod palette;
 pub mod synth;
 
+pub use control::{Capabilities, CommandResult, Dispatch, MediaCommand, MediaController};
 use std::time::{Duration, Instant};
 
 /// Maximum characters kept per text field.
@@ -101,6 +103,8 @@ pub struct NowPlaying {
     pub art: Option<std::sync::Arc<[u8]>>,
     /// Changes whenever title/artist/album/app change (a new track), so consumers can reset per-track state.
     pub track_id: u64,
+    /// What the session lets us do (all false when unknown).
+    pub caps: Capabilities,
 }
 
 impl NowPlaying {
@@ -242,6 +246,7 @@ mod tests {
             sampled_at: at,
             art: None,
             track_id: 1,
+            caps: Capabilities::default(),
         }
     }
 

@@ -924,6 +924,7 @@ mod tests {
             position_s: None,
             duration_s: None,
             sampled_at: Instant::now(),
+            caps: Default::default(),
             art,
             track_id: id,
         }
