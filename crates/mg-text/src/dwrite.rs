@@ -32,7 +32,7 @@ use windows::core::{PCWSTR, w};
 
 const FAMILY: PCWSTR = w!("Segoe UI");
 
-/// Uninitialises COM on drop. Keep it alive as long as the renderer and drop the renderer first.
+/// Uninitialises COM on drop; owned by `TextRenderer` as its last field so it runs after the interfaces.
 struct ComGuard(bool);
 
 impl Drop for ComGuard {

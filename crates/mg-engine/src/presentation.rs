@@ -335,6 +335,7 @@ impl Presentation {
             self.art_requested = false;
             self.serial += 1; // invalidates text results still in flight
             self.track_serial = self.serial;
+            self.text_for_height = 0; // the new track has no text yet (also when the window is minimised)
             self.palette.set_target(None);
             self.title.clear();
             self.artist.clear();
@@ -433,10 +434,9 @@ impl Presentation {
             }
         }
         // A same-track re-render (resize, layout change) swaps in at once; a new track waits for the fade-out.
-        let text_ready = self
-            .text_pending
-            .as_ref()
-            .is_some_and(|(s, _, _)| *s != self.track_serial || self.text_fade.alpha <= 0.02);
+        let text_ready = self.text_pending.as_ref().is_some_and(|(s, _, _)| {
+            (*s != self.track_serial && self.text_fade.want) || self.text_fade.alpha <= 0.02
+        });
         if text_ready {
             let (_, t, a) = self.text_pending.take().unwrap_or((0, None, None));
             for (i, b) in [t, a].into_iter().enumerate() {
@@ -1138,6 +1138,17 @@ mod tests {
         );
         assert!(o.art.is_none(), "cover (and its layout gap) must be gone");
         assert!(!p.has_art_tex);
+    }
+
+    #[test]
+    fn a_track_change_while_minimised_still_gets_text_after_a_previous_track_was_shown() {
+        let mut p = Presentation::new(Layout::Corner);
+        p.on_now_playing(Some(&np(1, "A", None)), SURF);
+        p.take_jobs();
+        p.on_now_playing(Some(&np(2, "B", None)), (0, 0));
+        assert!(p.take_jobs().is_empty());
+        p.update(1.0 / 60.0, SURF, 0.0, 0.0);
+        assert_eq!(p.take_jobs().len(), 1, "second track must get its text");
     }
 
     #[test]

@@ -33,7 +33,7 @@ pub const MAX_ART_BYTES: usize = 4 * 1024 * 1024;
 /// Largest decoded artwork side kept (the decoder scales while decoding, so big images are never expanded).
 pub const MAX_ART_SIDE: u32 = 512;
 /// Largest claimed source image accepted for decoding (pixels); larger claims are refused as hostile.
-pub const MAX_ART_DECODE_PIXELS: u64 = 16_000_000;
+pub const MAX_ART_DECODE_PIXELS: u64 = 17_000_000;
 
 /// Decoded artwork: straight (non-premultiplied) RGBA8, row-major, at most `MAX_ART_SIDE` on a side.
 #[derive(Clone, Debug, PartialEq, Eq)]
