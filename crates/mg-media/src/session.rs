@@ -1,0 +1,285 @@
+//! Windows-only watcher: polls the system media sessions on its own thread (MTA) and publishes the
+//! selected session as a `NowPlaying` snapshot. WinRT calls through windows-rs are safe code.
+
+use crate::{Candidate, MAX_ART_BYTES, NowPlaying, PlaybackState, sanitize_text, select_session};
+use std::hash::{Hash, Hasher};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use windows::Media::Control::{
+    GlobalSystemMediaTransportControlsSession as Session,
+    GlobalSystemMediaTransportControlsSessionManager as Manager,
+    GlobalSystemMediaTransportControlsSessionPlaybackStatus as Status,
+};
+use windows::Storage::Streams::DataReader;
+use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx, CoUninitialize};
+
+/// Waits for a WinRT operation with a hard timeout (a stalled session must never hang the thread); yields
+/// `Option<T>`. AsyncStatus raw values: 0 started, 1 completed.
+macro_rules! wait {
+    ($op:expr) => {{
+        match $op.ok() {
+            None => None,
+            Some(op) => {
+                let deadline = Instant::now() + Duration::from_secs(3);
+                loop {
+                    match op.Status().map(|s| s.0) {
+                        Ok(1) => break op.GetResults().ok(),
+                        Ok(0) if Instant::now() < deadline => {
+                            std::thread::sleep(Duration::from_millis(5))
+                        }
+                        Ok(0) => {
+                            let _ = op.Cancel();
+                            break None;
+                        }
+                        _ => break None,
+                    }
+                }
+            }
+        }
+    }};
+}
+
+const POLL: Duration = Duration::from_millis(500);
+/// 100 ns ticks between 1601-01-01 and 1970-01-01.
+const EPOCH_DIFF_TICKS: i64 = 116_444_736_000_000_000;
+
+#[derive(Default)]
+struct Shared {
+    now: Option<NowPlaying>,
+    last_error: Option<String>,
+    polls: u64,
+}
+
+/// Handle to the watcher thread; dropping it stops and joins the thread (bounded).
+pub struct NowPlayingWatcher {
+    stop: Arc<AtomicBool>,
+    done: Arc<AtomicBool>,
+    shared: Arc<Mutex<Shared>>,
+    thread: Option<JoinHandle<()>>,
+}
+
+fn state_of(s: Status) -> PlaybackState {
+    if s == Status::Playing {
+        PlaybackState::Playing
+    } else if s == Status::Paused {
+        PlaybackState::Paused
+    } else if s == Status::Stopped {
+        PlaybackState::Stopped
+    } else {
+        PlaybackState::Other
+    }
+}
+
+fn ticks_to_s(t: i64) -> f64 {
+    t as f64 / 10_000_000.0
+}
+
+fn read_art(
+    props: &windows::Media::Control::GlobalSystemMediaTransportControlsSessionMediaProperties,
+) -> Option<Vec<u8>> {
+    let stream = wait!(props.Thumbnail().ok()?.OpenReadAsync())?;
+    let size = stream.Size().ok()?;
+    if size == 0 || size > MAX_ART_BYTES as u64 {
+        return None; // absent or implausibly large: ignore rather than allocate
+    }
+    let reader = DataReader::CreateDataReader(&stream).ok()?;
+    let n = wait!(reader.LoadAsync(size as u32))?;
+    let mut buf = vec![0u8; n as usize];
+    reader.ReadBytes(&mut buf).ok()?;
+    Some(buf)
+}
+
+fn track_hash(title: &str, artist: &str, album: &str, app: &str) -> u64 {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    (title, artist, album, app).hash(&mut h);
+    h.finish()
+}
+
+/// One poll: returns the selected session's snapshot (reusing `prev` artwork when the track is unchanged).
+fn poll(mgr: &Manager, prev: Option<&NowPlaying>) -> Result<Option<NowPlaying>, String> {
+    let e = |what: &str, x: windows::core::Error| format!("{what}: {x}");
+    let sessions: Vec<Session> = mgr
+        .GetSessions()
+        .map_err(|x| e("GetSessions", x))?
+        .into_iter()
+        .collect();
+    let current_app = mgr
+        .GetCurrentSession()
+        .ok()
+        .and_then(|s| s.SourceAppUserModelId().ok());
+    let cands: Vec<Candidate> = sessions
+        .iter()
+        .enumerate()
+        .map(|(index, s)| Candidate {
+            index,
+            state: s
+                .GetPlaybackInfo()
+                .and_then(|i| i.PlaybackStatus())
+                .map_or(PlaybackState::Other, state_of),
+            is_system_current: current_app
+                .as_ref()
+                .is_some_and(|c| s.SourceAppUserModelId().is_ok_and(|a| a == *c)),
+        })
+        .collect();
+    let Some(i) = select_session(&cands) else {
+        return Ok(None);
+    };
+    let s = &sessions[i];
+    let props = wait!(s.TryGetMediaPropertiesAsync())
+        .ok_or("media properties unavailable (timeout or error)")?;
+    let field = |r: windows::core::Result<windows::core::HSTRING>| {
+        sanitize_text(&r.map(|h| h.to_string_lossy()).unwrap_or_default())
+    };
+    let (title, artist, album) = (
+        field(props.Title()),
+        field(props.Artist()),
+        field(props.AlbumTitle()),
+    );
+    let app_id = field(s.SourceAppUserModelId());
+    let id = track_hash(&title, &artist, &album, &app_id);
+
+    // Timeline: position at the session's last update, converted to "seconds at the time we sampled".
+    let (mut position_s, mut duration_s) = (None, None);
+    if let Ok(t) = s.GetTimelineProperties() {
+        let start = t.StartTime().map_or(0, |d| d.Duration);
+        let end = t.EndTime().map_or(0, |d| d.Duration);
+        let pos = t.Position().map_or(0, |d| d.Duration);
+        if end > start {
+            duration_s = Some(ticks_to_s(end - start));
+            position_s = Some(ticks_to_s(pos - start));
+            if let (Ok(upd), Ok(now)) = (
+                t.LastUpdatedTime(),
+                SystemTime::now().duration_since(UNIX_EPOCH),
+            ) {
+                let now_ticks = (now.as_nanos() / 100) as i64 + EPOCH_DIFF_TICKS;
+                let age = ticks_to_s((now_ticks - upd.UniversalTime).max(0)).min(3600.0);
+                let playing = cands[i].state == PlaybackState::Playing;
+                if let (Some(p), true) = (position_s, playing) {
+                    position_s = Some(p + age);
+                }
+            }
+        }
+    }
+    let same = prev.is_some_and(|p| p.track_id == id);
+    let art = if same {
+        prev.and_then(|p| p.art.clone())
+    } else {
+        read_art(&props)
+    };
+    Ok(Some(NowPlaying {
+        title,
+        artist,
+        album,
+        app_id,
+        state: cands[i].state,
+        position_s,
+        duration_s,
+        sampled_at: Instant::now(),
+        art,
+        track_id: id,
+    }))
+}
+
+fn run(stop: &AtomicBool, shared: &Mutex<Shared>) {
+    // SAFETY: balanced by CoUninitialize below on this thread; MTA so blocking `.join()` is allowed.
+    #[allow(unsafe_code)]
+    let com = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
+    if com.is_err() {
+        if let Ok(mut s) = shared.lock() {
+            s.last_error = Some(format!("CoInitializeEx failed: {com:?}"));
+        }
+        return;
+    }
+    let mgr = wait!(Manager::RequestAsync());
+    match mgr {
+        None => {
+            if let Ok(mut s) = shared.lock() {
+                s.last_error = Some("media session manager unavailable".to_string());
+            }
+        }
+        Some(mgr) => {
+            while !stop.load(Ordering::Acquire) {
+                let prev = shared.lock().ok().and_then(|s| s.now.clone());
+                let r = poll(&mgr, prev.as_ref());
+                if let Ok(mut s) = shared.lock() {
+                    s.polls += 1;
+                    match r {
+                        Ok(v) => {
+                            s.now = v;
+                            s.last_error = None;
+                        }
+                        Err(e) => s.last_error = Some(e),
+                    }
+                }
+                let end = Instant::now() + POLL;
+                while Instant::now() < end && !stop.load(Ordering::Acquire) {
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+            }
+        }
+    }
+    // SAFETY: paired with the successful CoInitializeEx above; all WinRT objects were dropped with `mgr`.
+    #[allow(unsafe_code)]
+    unsafe {
+        CoUninitialize()
+    };
+}
+
+impl NowPlayingWatcher {
+    pub fn start() -> Result<Self, String> {
+        let stop = Arc::new(AtomicBool::new(false));
+        let done = Arc::new(AtomicBool::new(false));
+        let shared = Arc::new(Mutex::new(Shared::default()));
+        let (s2, d2, sh2) = (stop.clone(), done.clone(), shared.clone());
+        let thread = std::thread::Builder::new()
+            .name("mg-media-watcher".into())
+            .spawn(move || {
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(&s2, &sh2)));
+                d2.store(true, Ordering::Release);
+            })
+            .map_err(|e| format!("cannot start media watcher: {e}"))?;
+        Ok(Self {
+            stop,
+            done,
+            shared,
+            thread: Some(thread),
+        })
+    }
+
+    /// Latest snapshot of the selected session; `None` when no usable session exists. A snapshot older
+    /// than `STALE_AFTER` (watcher stalled) is reported as `None` so stale song info is never shown.
+    pub fn now_playing(&self) -> Option<NowPlaying> {
+        let n = self.shared.lock().ok()?.now.clone()?;
+        (Instant::now().saturating_duration_since(n.sampled_at) < crate::STALE_AFTER
+            && n.is_usable())
+        .then_some(n)
+    }
+
+    pub fn last_error(&self) -> Option<String> {
+        self.shared.lock().ok()?.last_error.clone()
+    }
+
+    pub fn polls(&self) -> u64 {
+        self.shared.lock().map_or(0, |s| s.polls)
+    }
+
+    pub fn stop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        let Some(t) = self.thread.take() else { return };
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !self.done.load(Ordering::Acquire) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        if self.done.load(Ordering::Acquire) {
+            let _ = t.join();
+        } // else detached: a stalled WinRT call must never hang shutdown
+    }
+}
+
+impl Drop for NowPlayingWatcher {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}

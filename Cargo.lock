@@ -675,6 +675,7 @@ dependencies = [
  "mg-audio",
  "mg-dsp",
  "mg-gfx",
+ "mg-media",
  "winit",
 ]
 
@@ -683,6 +684,13 @@ name = "mg-gfx"
 version = "0.0.1"
 dependencies = [
  "wgpu",
+]
+
+[[package]]
+name = "mg-media"
+version = "0.0.1"
+dependencies = [
+ "windows",
 ]
 
 [[package]]

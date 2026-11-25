@@ -12,6 +12,7 @@ publish.workspace = true
 mg-gfx = { path = "../mg-gfx" }
 mg-dsp = { path = "../mg-dsp" }
 mg-audio = { path = "../mg-audio" }
+mg-media = { path = "../mg-media" }
 winit = { version = "=0.30.13", default-features = false, features = ["rwh_06"] }
 
 [lints]

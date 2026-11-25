@@ -3,6 +3,7 @@
 //! Options: `--backend dx12|vulkan|gl` `--seconds N` `--fullscreen` `--vsync on|off` `--scale F` (bench).
 
 mod levels;
+mod nowplaying;
 mod scene_map;
 mod scene_run;
 mod selftest;
@@ -513,6 +514,23 @@ fn main() {
                 || args.get(1).map(String::as_str) == Some("--allow-no-gpu") && args.len() == 2 =>
         {
             std::process::exit(selftest::run(args.len() == 2))
+        }
+        Some("--print-nowplaying") => {
+            let secs = match args.get(1).map(String::as_str) {
+                None => 10,
+                Some("--seconds") => match args.get(2).and_then(|v| v.parse::<u32>().ok()) {
+                    Some(n) if (1..=600).contains(&n) && args.len() == 3 => n,
+                    _ => {
+                        eprintln!("--seconds needs 1..600");
+                        std::process::exit(2);
+                    }
+                },
+                _ => {
+                    eprintln!("usage: --print-nowplaying [--seconds N]");
+                    std::process::exit(2);
+                }
+            };
+            std::process::exit(nowplaying::run(secs));
         }
         Some("--print-levels") => {
             let secs = match args.get(1).map(String::as_str) {
