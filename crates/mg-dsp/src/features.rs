@@ -16,6 +16,15 @@ use crate::{AnalysisParams, AudioFrame, GROUPS, MAX_BANDS};
 const BIN_S: f32 = 0.01;
 const HIST: usize = 96; // ~1 s of 10 ms flux bins
 const AGC_RANGE_FLOOR: f32 = 0.25;
+/// A group whose recent high (`group_fast` is dB-normalised on the global reference) is below `LO`
+/// is treated as empty; fully present from `HI` (steady pink noise: quietest group peaks near 0.2).
+const PRESENT_LO: f32 = 0.01;
+const PRESENT_HI: f32 = 0.05;
+/// Silence this long (s) ends the song: the next sound re-seeds every adaptive state.
+const RESTART_S: f32 = 0.5;
+/// After a (re)start, adaptive states track the input for this long (s) instead of integrating the
+/// analyzer's own attack transient as music.
+const SEED_S: f32 = 0.5;
 /// Everything that must fall to rest quickly in silence.
 const TAU_REST: f32 = 1.5;
 
@@ -23,6 +32,8 @@ const TAU_REST: f32 = 1.5;
 #[derive(Clone, Copy, Debug)]
 pub struct MusicFeatures {
     /// Per-group level normalised to this song's own recent low/high (0..1; 0.5 when steady).
+    /// Dead band: a group whose recent absolute high is at/below the noise floor (`PRESENT_LO`) reads
+    /// 0, not 0.5; it fades in to full AGC by `PRESENT_HI`, so empty bands never look half-active.
     pub agc: [f32; GROUPS],
     /// Per-group short envelope of `agc` (attack 25 ms, release 200 ms).
     pub short: [f32; GROUPS],
@@ -99,7 +110,7 @@ pub struct MusicTracker {
     centre_x: [f32; MAX_BANDS], // log-frequency position of each band, 0..1 over 200 Hz..8 kHz
     bands: usize,
     range: [Range; GROUPS],
-    short: [Smoother; GROUPS],
+    short: [f32; GROUPS],
     long: [f32; GROUPS],
     age_s: f32,
     silent_s: f32,
@@ -128,18 +139,21 @@ pub struct MusicTracker {
 impl MusicTracker {
     /// `p` must be the analyzer's (clamped) params; use `Analyzer::music_tracker`.
     pub fn new(sample_rate: u32, p: &AnalysisParams) -> Self {
-        let edges = crate::bands::log_edges_hz(p.band_count, p.f_min, p.f_max);
+        // Hardened for hostile params: no panic, finite dt (hop >= 1, sample rate >= 1 kHz).
+        let band_count = p.band_count.clamp(1, MAX_BANDS);
+        let dt = p.hop.max(1) as f32 / sample_rate.max(1000) as f32;
+        let edges = crate::bands::log_edges_hz(band_count, p.f_min, p.f_max);
         let (l0, l1) = (200f32.ln(), 8000f32.ln());
         let mut centre_x = [0.0; MAX_BANDS];
-        for (b, c) in centre_x.iter_mut().enumerate().take(p.band_count) {
+        for (b, c) in centre_x.iter_mut().enumerate().take(band_count) {
             *c = (((edges[b] * edges[b + 1]).sqrt().ln() - l0) / (l1 - l0)).clamp(0.0, 1.0);
         }
         Self {
-            dt: p.hop as f32 / sample_rate as f32,
+            dt,
             centre_x,
-            bands: p.band_count,
+            bands: band_count,
             range: [Range::default(); GROUPS],
-            short: [Smoother::new(25.0, 200.0); GROUPS],
+            short: [0.0; GROUPS],
             long: [0.0; GROUPS],
             age_s: 0.0,
             silent_s: 0.0,
@@ -171,7 +185,7 @@ impl MusicTracker {
         let silent = f.silent;
         if silent {
             self.silent_s += dt;
-            if self.silent_s >= 2.0 {
+            if self.silent_s >= RESTART_S {
                 self.started = false; // the next sound re-learns quickly
             }
         } else {
@@ -180,14 +194,32 @@ impl MusicTracker {
         self.age_s += dt;
         let rms_db = fin(f.rms_db, -120.0, 0.0);
         let first = !silent && !self.started;
+
+        // Spectral centroid target (weights = squared band levels, so leakage skirts matter little).
+        let (mut sw, mut swx) = (0.0f32, 0.0f32);
+        for b in 0..self.bands {
+            let w = fin(f.bands[b], 0.0, 1.0).powi(2);
+            sw += w;
+            swx += w * self.centre_x[b];
+        }
+        let target = if silent || sw < 1e-6 { 0.0 } else { swx / sw };
+
         if first {
             self.started = true;
             self.age_s = 0.0;
+        }
+        let seed = !silent && self.age_s < SEED_S;
+        if seed {
+            // (Re)start: slow states track the input until the analyzer settles, so steady material
+            // shows no fake accent, build or onset burst; stale pre-silence history is dropped.
             self.level_pow = 10f32.powf(rms_db / 10.0);
             self.lvl_short = rms_db;
             self.lvl_long = rms_db;
-            self.cen_short = self.centroid;
-            self.cen_long = self.centroid;
+            self.cen_short = target;
+            self.cen_long = target;
+            self.mean_sq = 10f32.powf(rms_db / 10.0);
+            self.hist_n = 0;
+            self.hist_i = 0;
         }
         let warm = self.age_s < 8.0;
         let tau_agc = if warm { 4.0 } else { 30.0 };
@@ -196,17 +228,25 @@ impl MusicTracker {
         let mut out = MusicFeatures::default();
         for g in 0..GROUPS {
             let x = fin(f.group_fast[g], 0.0, 1.0);
-            if first {
+            if seed {
                 self.range[g] = Range { lo: x, hi: x };
             }
             let n = if silent {
                 0.0
             } else {
                 self.range[g].update(x, dt, tau_agc);
-                self.range[g].norm(x)
+                let present =
+                    ((self.range[g].hi - PRESENT_LO) / (PRESENT_HI - PRESENT_LO)).clamp(0.0, 1.0);
+                self.range[g].norm(x) * present * present * (3.0 - 2.0 * present)
             };
+            if seed {
+                self.short[g] = n;
+                self.long[g] = n;
+            }
             out.agc[g] = n;
-            out.short[g] = self.short[g].step(n, dt);
+            let tau = if n > self.short[g] { 0.025 } else { 0.2 };
+            self.short[g] = ema(self.short[g], n, dt, tau);
+            out.short[g] = self.short[g];
             self.long[g] = ema(self.long[g], n, dt, if silent { TAU_REST } else { 8.0 });
             out.long[g] = self.long[g];
             out.accent[g] = (out.short[g] - out.long[g]).max(0.0);
@@ -233,14 +273,6 @@ impl MusicTracker {
         self.lvl_short = ema(self.lvl_short, l, dt, 2.0);
         self.lvl_long = ema(self.lvl_long, l, dt, 8.0);
 
-        // Spectral centroid (weights = squared band levels, so leakage skirts matter little).
-        let (mut sw, mut swx) = (0.0f32, 0.0f32);
-        for b in 0..self.bands {
-            let w = fin(f.bands[b], 0.0, 1.0).powi(2);
-            sw += w;
-            swx += w * self.centre_x[b];
-        }
-        let target = if silent || sw < 1e-6 { 0.0 } else { swx / sw };
         self.centroid = ema(
             self.centroid,
             target,
@@ -283,7 +315,8 @@ impl MusicTracker {
                 for v in &mut s[..self.hist_n] {
                     *v = (*v - med).abs();
                 }
-                med + 1.5 * median(&mut s[..self.hist_n]) + 0.02
+                // 2x median: steady noise fluctuates ~1 sigma above its mean, so MAD alone fires ~1.5/s.
+                2.0 * med + 1.5 * median(&mut s[..self.hist_n]) + 0.02
             } else {
                 f32::MAX
             };
@@ -300,6 +333,8 @@ impl MusicTracker {
         out.onset_event = event;
         out.onset_density = fin(self.density.value(), 0.0, 200.0);
 
+        // TODO(tune-on-real-audio): the crest gate (9 -> 6 dB) was tuned on synthetic fixtures and MAY be
+        // too strict for real music (pads/ballads are often 10-15 dB crest). Thresholds unchanged.
         // Calm: smooth gates on crest (6 -> 9 dB) and density (0.8 -> 1.6 /s), then a 1.5 s smoother.
         let c_crest = ((9.0 - out.crest_db) / 3.0).clamp(0.0, 1.0);
         let c_dens = ((1.6 - out.onset_density) / 0.8).clamp(0.0, 1.0);
@@ -593,5 +628,95 @@ mod tests {
         assert!((agc(q) - agc(l)).abs() < 0.15, "{} vs {}", agc(q), agc(l));
         let (lq, ll) = (mean(q, |f| f.level), mean(l, |f| f.level));
         assert!(ll - lq > 0.4, "level {lq} vs {ll}");
+    }
+
+    const DT: f32 = 512.0 / SR as f32;
+
+    fn at(s: f32) -> usize {
+        (s / DT) as usize
+    }
+
+    /// `lead` s of pink, `gap` s of digital silence, then `tail` s of the same pink, all at -18 dBFS.
+    /// Returns the features and the frame index at which the sound restarts.
+    fn pink_gap_pink(lead: f32, gap: f32, tail: f32) -> (Vec<MusicFeatures>, usize) {
+        let sec = |s: f32| (s * SR as f32) as usize;
+        let mut x = at_db(pink(sec(lead + tail)), -18.0);
+        let t1 = x.split_off(sec(lead));
+        x.extend(vec![0.0; sec(gap)]);
+        x.extend(t1);
+        (run(&x, 512), at(lead + gap))
+    }
+
+    fn mean_accent(m: &[MusicFeatures]) -> f32 {
+        mean(m, |f| f.accent.iter().sum::<f32>() / GROUPS as f32)
+    }
+
+    #[test]
+    fn steady_noise_has_no_fake_accent_or_build_at_start_or_restart() {
+        let (m, t0) = pink_gap_pink(6.0, 5.0, 8.0);
+        let a_cold = mean_accent(&m[at(0.5)..at(5.0)]);
+        let a_warm = mean_accent(&m[t0 + at(0.5)..t0 + at(5.0)]);
+        eprintln!("accent cold {a_cold} restart {a_warm}");
+        assert!(a_cold < 0.12 && a_warm < 0.12, "{a_cold} {a_warm}");
+        let (b_cold, b_warm) = (m[at(5.0)].build, m[t0 + at(4.0)].build);
+        eprintln!("build cold {b_cold} restart {b_warm}");
+        assert!(b_cold < 0.1 && b_warm < 0.1, "{b_cold} {b_warm}");
+    }
+
+    #[test]
+    fn steady_noise_after_silence_gives_at_most_one_false_onset() {
+        let (m, t0) = pink_gap_pink(6.0, 5.0, 8.0);
+        let n = m[t0..t0 + at(3.0)].iter().filter(|f| f.onset_event).count();
+        assert!(n <= 1, "{n} false onsets in 3 s");
+    }
+
+    #[test]
+    fn empty_group_reads_zero_and_steady_noise_groups_stay_mid() {
+        let m = run(&at_db(synth::sine(80.0, 1.0, SR, N30), -18.0), 512);
+        let late = &m[m.len() / 2..];
+        let (bass, treble) = (mean(late, |f| f.agc[1]), mean(late, |f| f.agc[5]));
+        let ts = mean(late, |f| f.short[5]);
+        eprintln!("sine bass agc {bass} treble agc {treble} short {ts}");
+        assert!(
+            treble < 0.1 && ts < 0.1 && bass > 0.3,
+            "{bass} {treble} {ts}"
+        );
+        let m = run(&at_db(pink(N30), -18.0), 512);
+        let late = &m[m.len() / 2..];
+        for g in 0..GROUPS {
+            let a = mean(late, |f| f.agc[g]);
+            eprintln!("pink group {g} agc {a}");
+            assert!((0.35..0.65).contains(&a), "group {g} agc {a}");
+        }
+    }
+
+    #[test]
+    fn one_second_gap_rewarms_like_a_long_gap() {
+        let (m, t0) = pink_gap_pink(20.0, 1.0, 8.0);
+        let (before, after) = (m[at(19.0)].level, m[t0 + at(3.0)].level);
+        eprintln!("level before {before} after {after}");
+        assert!((before - after).abs() < 0.1, "{before} vs {after}");
+    }
+
+    #[test]
+    fn hostile_constructor_params_do_not_panic_or_go_nan() {
+        for (sr, band_count, hop) in [
+            (0u32, 10_000usize, 0usize),
+            (1, 0, 1),
+            (u32::MAX, 3, usize::MAX),
+        ] {
+            let p = AnalysisParams {
+                band_count,
+                hop,
+                ..AnalysisParams::default()
+            };
+            let mut t = MusicTracker::new(sr, &p);
+            let f = AudioFrame {
+                silent: false,
+                rms_db: -20.0,
+                ..AudioFrame::default()
+            };
+            assert!(all_finite(&[t.step(&f), t.step(&f)]));
+        }
     }
 }
