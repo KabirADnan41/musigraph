@@ -38,6 +38,9 @@ fn vs(@builtin(vertex_index) i: u32) -> VOut {
     return o;
 }
 
+// x*x instead of pow(x, 2.0): pow with a negative base is undefined in WGSL and NaN on some drivers.
+fn sq(x: f32) -> f32 { return x * x; }
+
 fn hash21(p: vec2<f32>) -> f32 {
     var q = fract(p * vec2<f32>(123.34, 456.21));
     q += dot(q, q + 45.32);
@@ -138,7 +141,7 @@ fn fs(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
     let w = vec2<f32>(fbm(q + scroll + vec2<f32>(1.7, 9.2)), fbm(q + scroll * 1.1 + vec2<f32>(8.3, 2.8)));
     let near = fbm(q + warp * 2.2 * (w - 0.5) + scroll * 0.8);
     var haze_amt = (0.55 * near + 0.45 * far) * haze;
-    haze_amt *= 1.0 + 0.25 * swell * exp(-pow((p.y - yh) / 0.15, 2.0));   // bass bloom near the horizon
+    haze_amt *= 1.0 + 0.25 * swell * exp(-sq((p.y - yh) / 0.15));   // bass bloom near the horizon
     let below = step(yh, p.y);
     haze_amt *= mix(1.0, 0.45, below);
     col += mix(u.pal0.rgb, u.pal2.rgb, 0.25 + 0.2 * u.b.x) * haze_amt * mix(0.35, 0.95, sky_t);
@@ -162,8 +165,8 @@ fn fs(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
         let r = length(qd);
         let r1 = u.c.x * 0.55;
         let r2 = u.c.z * 0.55;
-        let ring1 = exp(-pow((r - r1) / 0.035, 2.0)) * u.c.y * exp(-u.c.x / 0.8);
-        let ring2 = exp(-pow((r - r2) / 0.035, 2.0)) * u.c.w * exp(-u.c.z / 0.8);
+        let ring1 = exp(-sq((r - r1) / 0.035)) * u.c.y * exp(-u.c.x / 0.8);
+        let ring2 = exp(-sq((r - r2) / 0.035)) * u.c.w * exp(-u.c.z / 0.8);
         col += u.pal2.rgb * (ring1 + ring2) * 1.6 * smoothstep(0.0, 0.02, dr);
     }
 

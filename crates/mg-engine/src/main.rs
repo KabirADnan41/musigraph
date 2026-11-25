@@ -508,7 +508,12 @@ fn main() {
                 }
             }
         }
-        Some("--scene-selftest") if args.len() == 1 => std::process::exit(selftest::run()),
+        Some("--scene-selftest")
+            if args.len() == 1
+                || args.get(1).map(String::as_str) == Some("--allow-no-gpu") && args.len() == 2 =>
+        {
+            std::process::exit(selftest::run(args.len() == 2))
+        }
         Some("--print-levels") => {
             let secs = match args.get(1).map(String::as_str) {
                 None => 10,

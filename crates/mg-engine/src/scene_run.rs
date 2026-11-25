@@ -20,7 +20,8 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, NamedKey};
 use winit::window::{Fullscreen, Window, WindowId};
 
-const MAX_SKIP_TIME: Duration = Duration::from_secs(2);
+/// A minimised/occluded window is normal for a visualizer; only a very long stall is treated as failure.
+const MAX_SKIP_TIME: Duration = Duration::from_secs(30);
 
 #[derive(Debug, PartialEq)]
 pub enum Source {
@@ -346,6 +347,7 @@ impl App {
             }
             Ok(FrameStatus::Skipped) => {
                 self.skipped += 1;
+                std::thread::sleep(Duration::from_millis(16)); // occluded/minimised: do not spin a core
                 self.last_frame = None;
                 let for_s = self.skip_since.get_or_insert_with(Instant::now).elapsed();
                 if for_s > MAX_SKIP_TIME {
@@ -366,7 +368,7 @@ impl App {
 
 /// Runs the scene; returns the process exit code.
 pub fn run(opts: SceneOpts) -> i32 {
-    crate::spawn_watchdog(Duration::from_secs(opts.seconds + 10));
+    crate::spawn_watchdog(Duration::from_secs(opts.seconds + 30));
     let shared = Arc::new(Mutex::new(Shared::default()));
     let mut capture = None;
     let mut synth = None;

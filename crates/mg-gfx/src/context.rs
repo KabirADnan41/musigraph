@@ -124,8 +124,13 @@ pub struct Headless {
 /// Creates a headless hardware device using the first backend of `AUTO_ORDER` that works.
 /// Software adapters are rejected, so tests can never silently measure a CPU renderer.
 pub fn init_headless() -> Result<Headless, String> {
+    init_headless_order(&AUTO_ORDER)
+}
+
+/// Like `init_headless` but tries only the given backends, in order (used to verify one backend).
+pub fn init_headless_order(order: &[BackendChoice]) -> Result<Headless, String> {
     let mut failures = Vec::new();
-    for b in AUTO_ORDER {
+    for &b in order {
         let mut desc = wgpu::InstanceDescriptor::new_without_display_handle();
         desc.backends = b.backends();
         let instance = wgpu::Instance::new(desc);

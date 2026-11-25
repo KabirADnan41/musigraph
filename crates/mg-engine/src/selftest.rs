@@ -5,12 +5,25 @@
 
 use crate::scene_map::MapTuning;
 use crate::sim::{FIXTURES, Sim, Tick, fixture};
-use mg_gfx::context::init_headless;
+use mg_gfx::context::{BackendChoice, Headless, init_headless_order};
 use mg_gfx::scene::{SLOTS, SpectrumScene};
 
 const SR: u32 = 48_000;
 const FPS: f32 = 60.0;
 const RES: (u32, u32) = (160, 90);
+
+/// Hardware device for the measurements. `MG_SELFTEST_BACKEND=vulkan|dx12|gl` restricts it to one backend
+/// (to verify the shader on every backend); default is the automatic order.
+fn headless() -> Result<Headless, String> {
+    match std::env::var("MG_SELFTEST_BACKEND")
+        .ok()
+        .as_deref()
+        .and_then(BackendChoice::parse)
+    {
+        Some(b) => init_headless_order(&[b]),
+        None => init_headless_order(&mg_gfx::context::AUTO_ORDER),
+    }
+}
 
 fn mean(v: &[f32]) -> f32 {
     v.iter().sum::<f32>() / v.len().max(1) as f32
@@ -35,7 +48,7 @@ struct Measured {
 }
 
 fn render_all(ticks: &[Tick]) -> Option<Measured> {
-    let h = init_headless().ok()?;
+    let h = headless().ok()?;
     let scene = SpectrumScene::new_headless(&h.device);
     let mut lum = Vec::with_capacity(ticks.len());
     let (mut centre, mut edge) = (0.0, 0.0);
@@ -65,7 +78,7 @@ fn max_delta_100ms(lum: &[f32]) -> f32 {
         .fold(0.0, f32::max)
 }
 
-pub fn run() -> i32 {
+pub fn run(allow_no_gpu: bool) -> i32 {
     let mut failures = Vec::new();
     let mut gpu_seen = false;
     for name in FIXTURES {
@@ -93,7 +106,7 @@ pub fn run() -> i32 {
         });
         if let Ok(dir) = std::env::var("MG_SCENE_DUMP") {
             // Developer aid: raw RGBA of the last frame at 960x540 (never inside the repository).
-            if let Ok(h) = init_headless() {
+            if let Ok(h) = headless() {
                 let scene = SpectrumScene::new_headless(&h.device);
                 if let Ok(img) = scene.render_offscreen(
                     &h.device,
@@ -130,11 +143,19 @@ pub fn run() -> i32 {
         };
         expect(finite, "non-finite shader parameter");
         expect(
+            ml.is_nan() || (ml.is_finite() && ml > 0.001),
+            "rendered image is black or NaN",
+        );
+        expect(
             ld.is_nan() || ld < 0.10,
             "luminance changed by >= 0.10 within 100 ms",
         );
         match name {
             "silence" => {
+                expect(
+                    cl.is_nan() || (cl < 0.08 && el < 0.08 && ml < 0.05),
+                    "silence must render as a calm, dark, flat scene",
+                );
                 expect(
                     tallest == 0.0 && spawns == 0 && onsets == 0,
                     "silence must be flat, no impulses",
@@ -174,8 +195,14 @@ pub fn run() -> i32 {
     }
     if !gpu_seen {
         println!(
-            "NOTE: no hardware GPU device available; rendered-pixel checks were skipped (parameter checks still ran)."
+            "NOTE: no hardware GPU device available; rendered-pixel checks were NOT run (parameter checks ran)."
         );
+        if !allow_no_gpu {
+            eprintln!(
+                "SELFTEST RESULT: FAILED (no hardware GPU; pass --allow-no-gpu to run parameter checks only)"
+            );
+            return 3;
+        }
     }
     if failures.is_empty() {
         println!("SELFTEST RESULT: ok");
