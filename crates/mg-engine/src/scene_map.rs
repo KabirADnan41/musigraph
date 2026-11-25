@@ -85,6 +85,11 @@ pub struct SceneMapper {
     onset_rate: f32,
     rings: [[f32; 2]; 2],
     since_onset: f32,
+    /// Aurora ribbon phases in cycles, wrapped at `PHASE_WRAP` (an integer, so the sines stay seamless).
+    aurora_ph: [f32; 4],
+    /// Album Focus rotation phase (slow, grows without wrapping: one hour is only a few hundred units).
+    focus_rot: f32,
+    onset_count: u32,
     /// slot -> (band position 0..1, group index)
     slot_map: [(f32, usize); SLOTS],
 }
@@ -134,6 +139,9 @@ impl SceneMapper {
             onset_rate: 1.5,
             rings: [[100.0, 0.0]; 2],
             since_onset: 10.0,
+            aurora_ph: [0.0; 4],
+            focus_rot: 0.0,
+            onset_count: 0,
             slot_map,
         }
     }
@@ -244,6 +252,22 @@ impl SceneMapper {
         self.scroll[1] += 0.012 * speed * dt;
         // dust falls (0.015 + 0.04 s) screen heights per second = that many / 0.022 cells; one phase unit = 128 cells
         self.dust = (self.dust + (0.015 + 0.04 * s) / 0.022 * dt / 128.0).fract();
+        // Aurora: ribbon phases advance faster with intensity; Focus rotates slowly; band levels bass -> treble.
+        const PHASE_WRAP: f32 = 64.0;
+        for (i, ph) in self.aurora_ph.iter_mut().enumerate() {
+            *ph = (*ph + dt * (0.04 + 0.20 * s) * (1.0 + 0.15 * i as f32)) % PHASE_WRAP;
+        }
+        self.focus_rot += dt * (0.02 + 0.06 * s);
+        let mut aurora_band = [0.0f32; 4];
+        let mut count = [0u32; 4];
+        for i in 0..SLOTS {
+            let g = ((self.slot_map[i].0 * 4.0) as usize).min(3);
+            aurora_band[g] += self.bars[i];
+            count[g] += 1;
+        }
+        for (b, n) in aurora_band.iter_mut().zip(count) {
+            *b = (*b / n.max(1) as f32).clamp(0.0, 1.0);
+        }
 
         // Colour: two fixed palette endpoints, blended by the slow per-song spectral tilt (tau 20 s).
         // Bass-heavy songs sit near teal+amber, bright songs near periwinkle+rose. Music only moves lightness
@@ -273,6 +297,7 @@ impl SceneMapper {
         self.since_onset += dt;
         if live && !silent && input.onsets > 0 && self.since_onset >= self.tune.ring_min_gap_s {
             self.since_onset = 0.0;
+            self.onset_count = self.onset_count.wrapping_add(1);
             self.rings[1] = self.rings[0];
             let amp = self.tune.ring_amp * fin(input.onset_strength).clamp(0.0, 1.0);
             self.rings[0] = [0.0, amp.min(0.25)];
@@ -288,6 +313,13 @@ impl SceneMapper {
             tilt,
             scroll: self.scroll,
             dust: self.dust,
+            aurora_phase: self.aurora_ph,
+            aurora_band,
+            focus_rot: self.focus_rot,
+            front_x0: (self.onset_count as f32 * 0.618_034).fract(),
+            // the runner overwrites `focus` and `focus_active` from the artwork layout
+            focus: [0.5, 0.4, 0.16, 0.16],
+            focus_active: 0.0,
             rings: self.rings,
             palette,
             mode: if live { input.mode } else { SceneMode::NoAudio },

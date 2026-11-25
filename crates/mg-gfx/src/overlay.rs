@@ -489,7 +489,7 @@ impl Overlay {
 mod tests {
     use super::*;
     use crate::context::init_headless;
-    use crate::scene::{SceneParams, SpectrumScene};
+    use crate::scene::{SceneParams, SceneSet};
 
     fn px(img: &[u8], w: u32, x: u32, y: u32) -> [u8; 4] {
         let i = ((y * w + x) * 4) as usize;
@@ -551,7 +551,7 @@ mod tests {
             return;
         };
         let res = (320u32, 180u32);
-        let scene = SpectrumScene::new_headless(&h.device);
+        let scene = SceneSet::new_headless(&h.device);
         let mut ov = Overlay::new(&h.device, &h.queue, wgpu::TextureFormat::Rgba8Unorm);
         // artwork: left half pure red, right half pure green (2:1 image shown at 80x40 px)
         let (aw, ah) = (8u32, 4u32);

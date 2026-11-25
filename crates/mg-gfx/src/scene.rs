@@ -11,7 +11,7 @@ use crate::fullscreen::FullscreenRenderer;
 pub const SLOTS: usize = 96;
 const VEC4S: usize = SLOTS / 4;
 /// Bytes of the packed uniform block (must equal the WGSL `U` struct size).
-pub const UNIFORM_BYTES: usize = 16 + 16 + 16 + 16 + 64 + 3 * VEC4S * 16;
+pub const UNIFORM_BYTES: usize = 16 + 16 + 16 + 16 + 64 + 3 * VEC4S * 16 + 64;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum SceneMode {
@@ -40,6 +40,15 @@ pub struct SceneParams {
     pub rings: [[f32; 2]; 2],
     /// Linear RGB roles: haze/base, bar body, accent/tips, secondary (haze tint and curtain).
     pub palette: [[f32; 3]; 4],
+    /// Aurora: ribbon phases (cycles, integrated on the CPU) and band levels (bass to treble, 0..1).
+    pub aurora_phase: [f32; 4],
+    pub aurora_band: [f32; 4],
+    /// Album Focus: artwork centre (uv x, uv y) and half size in screen heights; `focus_active` 0 when there is no artwork.
+    pub focus: [f32; 4],
+    pub focus_rot: f32,
+    pub focus_active: f32,
+    /// Aurora onset front origin (0..1 across the screen), changes with every onset.
+    pub front_x0: f32,
     pub mode: SceneMode,
     pub bars: [f32; SLOTS],
     pub peaks: [f32; SLOTS],
@@ -65,6 +74,12 @@ impl Default for SceneParams {
                 [0.55, 0.85, 0.95],
                 [0.32, 0.65, 0.78],
             ],
+            aurora_phase: [0.0; 4],
+            aurora_band: [0.0; 4],
+            focus: [0.5, 0.4, 0.16, 0.16],
+            focus_rot: 0.0,
+            focus_active: 0.0,
+            front_x0: 0.5,
             mode: SceneMode::NoAudio,
             bars: [0.0; SLOTS],
             peaks: [0.0; SLOTS],
@@ -114,27 +129,121 @@ impl SceneParams {
         for arr in [&self.bars, &self.peaks, &self.bright] {
             put(&mut o, &arr[..]);
         }
+        put(&mut o, &self.aurora_phase);
+        put(&mut o, &self.aurora_band);
+        put(&mut o, &self.focus);
+        put(
+            &mut o,
+            &[self.focus_rot, self.front_x0, self.focus_active, 0.0],
+        );
         debug_assert_eq!(o.len(), UNIFORM_BYTES);
         o
     }
 }
 
-pub struct SpectrumScene {
+/// The visual styles. Each has its own composition and animation algorithm; all read the same `SceneParams`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SceneKind {
+    /// Mirrored needle spectrum over a water horizon.
+    Spectrum,
+    /// Layered light ribbons over a ridge.
+    Aurora,
+    /// Atmosphere radiating from the album artwork.
+    Focus,
+}
+
+impl SceneKind {
+    pub const ALL: [SceneKind; 3] = [SceneKind::Spectrum, SceneKind::Aurora, SceneKind::Focus];
+
+    pub fn index(self) -> usize {
+        self as usize
+    }
+
+    pub fn next(self) -> Self {
+        Self::ALL[(self.index() + 1) % Self::ALL.len()]
+    }
+
+    pub fn prev(self) -> Self {
+        Self::ALL[(self.index() + Self::ALL.len() - 1) % Self::ALL.len()]
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            SceneKind::Spectrum => "spectrum",
+            SceneKind::Aurora => "aurora",
+            SceneKind::Focus => "focus",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|k| k.name() == s)
+    }
+}
+
+const SPECTRUM_WGSL: &str = concat!(include_str!("common.wgsl"), include_str!("spectrum.wgsl"));
+const AURORA_WGSL: &str = concat!(include_str!("common.wgsl"), include_str!("aurora.wgsl"));
+const FOCUS_WGSL: &str = concat!(include_str!("common.wgsl"), include_str!("focus.wgsl"));
+
+/// All scene pipelines, created up front (a scene switch never compiles), sharing one uniform block.
+pub struct SceneSet {
     inner: FullscreenRenderer,
 }
 
-impl SpectrumScene {
+impl SceneSet {
     pub fn new(device: &wgpu::Device, format: wgpu::TextureFormat, scale: f32) -> Self {
         Self {
-            inner: FullscreenRenderer::new(
+            inner: FullscreenRenderer::new_multi(
                 device,
                 format,
                 scale,
-                "spectrum",
-                include_str!("spectrum.wgsl"),
+                "scenes",
+                &[SPECTRUM_WGSL, AURORA_WGSL, FOCUS_WGSL],
                 UNIFORM_BYTES,
             ),
         }
+    }
+
+    /// Draws `scene` (or a crossfade `scene -> to` at blend `t`), then `post` records overlays.
+    pub fn render_scenes<F: FnOnce(&mut wgpu::CommandEncoder, &wgpu::TextureView)>(
+        &mut self,
+        gpu: &mut Gpu,
+        p: &SceneParams,
+        scene: SceneKind,
+        xfade: Option<(SceneKind, f32)>,
+        post: F,
+    ) -> Result<FrameStatus, String> {
+        let res = self.inner.current_render_size(gpu);
+        self.inner.render_scenes(
+            gpu,
+            &p.pack(res),
+            scene.index(),
+            xfade.map(|(k, t)| (k.index(), t)),
+            post,
+        )
+    }
+
+    /// Headless render of any scene or crossfade, then `post`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_offscreen_scenes(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        res: (u32, u32),
+        p: &SceneParams,
+        scene: SceneKind,
+        xfade: Option<(SceneKind, f32)>,
+        post: &dyn Fn(&mut wgpu::CommandEncoder, &wgpu::TextureView),
+    ) -> Result<Vec<u8>, String> {
+        self.inner.render_offscreen_scenes(
+            device,
+            queue,
+            res.0,
+            res.1,
+            &p.pack(res),
+            scene.index(),
+            xfade.map(|(k, t)| (k.index(), t)),
+            post,
+        )
     }
 
     /// Scene for `context::init_headless` devices: fixed RGBA8 target so tests can read pixels as RGBA.
@@ -212,7 +321,7 @@ mod tests {
         p.dust = 0.25;
         let b = p.pack((1280, 720));
         assert_eq!(b.len(), UNIFORM_BYTES);
-        assert_eq!(UNIFORM_BYTES, 1280);
+        assert_eq!(UNIFORM_BYTES, 1344);
         assert_eq!(f32_at(&b, 0), 1280.0);
         assert_eq!(f32_at(&b, 16), 0.7); // glow
         assert_eq!(f32_at(&b, 44), 0.0); // mode live
@@ -221,8 +330,14 @@ mod tests {
         assert_eq!(f32_at(&b, bars), 0.5);
         assert_eq!(f32_at(&b, bars + 95 * 4), 0.75);
         assert_eq!(f32_at(&b, bars + SLOTS * 4 + 4), 0.25); // peaks[1]
-        let src = include_str!("spectrum.wgsl");
-        assert!(src.contains("array<vec4<f32>, 24>") && src.contains("pal2: vec4<f32>"));
+        let src = include_str!("common.wgsl");
+        assert!(
+            src.contains("array<vec4<f32>, 24>")
+                && src.contains("pal3: vec4<f32>")
+                && src.contains("ex3: vec4<f32>")
+        );
+        // extras sit after the three slot arrays: 128 (bars) + 3 * 96 * 4 = 1280
+        assert_eq!(f32_at(&b, 1280), 0.0);
     }
 
     #[test]
@@ -253,10 +368,10 @@ mod tests {
         (s / n / 255.0) as f32
     }
 
-    fn headless() -> Option<(crate::context::Headless, SpectrumScene)> {
+    fn headless() -> Option<(crate::context::Headless, SceneSet)> {
         match init_headless() {
             Ok(h) => {
-                let s = SpectrumScene::new(&h.device, wgpu::TextureFormat::Rgba8Unorm, 1.0);
+                let s = SceneSet::new(&h.device, wgpu::TextureFormat::Rgba8Unorm, 1.0);
                 Some((h, s))
             }
             Err(e) => {
@@ -383,5 +498,68 @@ mod tests {
             .render_offscreen(&h.device, &h.queue, (840, 360), &p)
             .unwrap();
         assert!(mean_lum(&wide, 840, 0, 840, 0, 360) > 0.0);
+    }
+
+    #[test]
+    fn every_scene_renders_and_a_crossfade_blends_between_two_scenes_headless() {
+        let Some((h, scene)) = headless() else { return };
+        let res = (320u32, 180u32);
+        let mut p = SceneParams {
+            mode: SceneMode::Live,
+            energy: 0.6,
+            glow: 0.6,
+            ..Default::default()
+        };
+        for i in 0..SLOTS {
+            p.bars[i] = 0.2 + 0.6 * ((i as f32 * 0.37).sin() * 0.5 + 0.5);
+            p.bright[i] = 0.7;
+        }
+        p.aurora_band = [0.5, 0.6, 0.4, 0.3];
+        p.aurora_phase = [0.1, 0.4, 0.7, 0.9];
+        let render = |k: SceneKind, x: Option<(SceneKind, f32)>| {
+            scene
+                .render_offscreen_scenes(&h.device, &h.queue, res, &p, k, x, &|_, _| {})
+                .unwrap()
+        };
+        let a = render(SceneKind::Spectrum, None);
+        let b = render(SceneKind::Aurora, None);
+        let c = render(SceneKind::Focus, None);
+        assert!(a != b && b != c && a != c, "scenes must look different");
+        let diff = |x: &[u8], y: &[u8]| {
+            x.iter()
+                .zip(y)
+                .map(|(p, q)| p.abs_diff(*q) as u64)
+                .sum::<u64>() as f64
+                / x.len() as f64
+        };
+        assert!(
+            diff(&a, &b) > 3.0 && diff(&b, &c) > 3.0 && diff(&a, &c) > 3.0,
+            "scenes differ clearly"
+        );
+        let x0 = render(SceneKind::Spectrum, Some((SceneKind::Aurora, 0.0)));
+        let x1 = render(SceneKind::Spectrum, Some((SceneKind::Aurora, 1.0)));
+        let xm = render(SceneKind::Spectrum, Some((SceneKind::Aurora, 0.5)));
+        assert!(
+            diff(&x0, &a) < 1.0,
+            "t=0 shows the first scene ({})",
+            diff(&x0, &a)
+        );
+        assert!(
+            diff(&x1, &b) < 1.0,
+            "t=1 shows the second scene ({})",
+            diff(&x1, &b)
+        );
+        let mid: Vec<u8> = a
+            .iter()
+            .zip(&b)
+            .map(|(p, q)| ((u16::from(*p) + u16::from(*q)) / 2) as u8)
+            .collect();
+        assert!(
+            diff(&xm, &mid) < 1.5,
+            "t=0.5 is the average ({})",
+            diff(&xm, &mid)
+        );
+        // same scene on both sides is just that scene
+        assert_eq!(render(SceneKind::Aurora, Some((SceneKind::Aurora, 0.5))), b);
     }
 }

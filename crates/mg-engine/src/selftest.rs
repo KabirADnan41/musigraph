@@ -6,7 +6,7 @@
 use crate::scene_map::MapTuning;
 use crate::sim::{FIXTURES, Sim, Tick, fixture};
 use mg_gfx::context::{BackendChoice, Headless, init_headless_order};
-use mg_gfx::scene::{SLOTS, SpectrumScene};
+use mg_gfx::scene::{SLOTS, SceneKind, SceneSet};
 
 const SR: u32 = 48_000;
 const FPS: f32 = 60.0;
@@ -49,7 +49,7 @@ struct Measured {
 
 fn render_all(ticks: &[Tick]) -> Option<Measured> {
     let h = headless().ok()?;
-    let scene = SpectrumScene::new_headless(&h.device);
+    let scene = SceneSet::new_headless(&h.device);
     let mut lum = Vec::with_capacity(ticks.len());
     let (mut centre, mut edge) = (0.0, 0.0);
     for (i, t) in ticks.iter().enumerate() {
@@ -97,11 +97,17 @@ fn presentation_previews(failures: &mut Vec<String>) -> bool {
     let x = fixture("demo", SR).expect("demo fixture");
     let ticks = Sim::new(SR, FPS, MapTuning::default()).run(&x[..x.len().min(SR as usize * 12)]);
     let base_params = ticks.last().expect("ticks").params.clone();
-    let scene = SpectrumScene::new_headless(&h.device);
+    let scene = SceneSet::new_headless(&h.device);
     let dump = std::env::var("MG_SCENE_DUMP").ok();
     let mut themes: Vec<(String, [f32; 3])> = Vec::new();
-    for layout in [Layout::Corner, Layout::Center] {
+    for (kind, layout) in SceneKind::ALL
+        .into_iter()
+        .flat_map(|k| [Layout::Corner, Layout::Center].map(move |l| (k, l)))
+    {
         for (i, n) in demo_tracks().iter().enumerate() {
+            if kind != SceneKind::Spectrum && i > 2 {
+                continue; // the other scenes are previewed on three albums to keep the self-test quick
+            }
             let mut ov = Overlay::new_headless(&h.device, &h.queue);
             let mut pres = Presentation::new(layout);
             pres.on_now_playing(Some(n), res);
@@ -134,10 +140,22 @@ fn presentation_previews(failures: &mut Vec<String>) -> bool {
             let mut p = base_params.clone();
             let (album, w) = pres.album();
             apply_album(&mut p.palette, &album, w, 0.85 + 0.30 * p.energy);
-            let bare = scene.render_offscreen(&h.device, &h.queue, res, &p);
-            let img = scene.render_offscreen_with(&h.device, &h.queue, res, &p, &|enc, view| {
-                ov.draw(&h.queue, enc, view, &op)
-            });
+            if let Some(a) = op.art {
+                let (w, hh) = (res.0 as f32, res.1 as f32);
+                p.focus = [a.cx / w, a.cy / hh, a.hw / hh, a.hh / hh];
+                p.focus_active = a.alpha;
+            }
+            let bare =
+                scene.render_offscreen_scenes(&h.device, &h.queue, res, &p, kind, None, &|_, _| {});
+            let img = scene.render_offscreen_scenes(
+                &h.device,
+                &h.queue,
+                res,
+                &p,
+                kind,
+                None,
+                &|enc, view| ov.draw(&h.queue, enc, view, &op),
+            );
             let (Ok(bare), Ok(img)) = (bare, img) else {
                 failures.push(format!("presentation {layout:?}/{i}: render failed"));
                 continue;
@@ -163,11 +181,20 @@ fn presentation_previews(failures: &mut Vec<String>) -> bool {
                 }
             }
             let m = s.map(|v| v / cnt / 255.0);
-            if layout == Layout::Corner {
+            if kind == SceneKind::Spectrum && layout == Layout::Corner {
                 themes.push((format!("track {i}"), m));
             }
+            let lum: f32 =
+                bare.iter().map(|&v| f32::from(v)).sum::<f32>() / bare.len() as f32 / 255.0;
+            if !(0.002..0.6).contains(&lum) {
+                failures.push(format!(
+                    "{} {layout:?}/{i}: mean luminance {lum:.3} out of range",
+                    kind.name()
+                ));
+            }
+            println!("PRESENT {} {layout:?} track {i}:", kind.name());
             println!(
-                "PRESENT {layout:?} track {i}: art={} title={} artist={} changed_bytes={changed} mean_rgb=({:.3},{:.3},{:.3})",
+                "  detail: art={} title={} artist={} changed_bytes={changed} mean_rgb=({:.3},{:.3},{:.3})",
                 op.art.is_some(),
                 op.title.is_some(),
                 op.artist.is_some(),
@@ -178,7 +205,7 @@ fn presentation_previews(failures: &mut Vec<String>) -> bool {
             if let Some(dir) = &dump {
                 let png = mg_media::synth::png_rgba(res.0, res.1, &img);
                 let _ = std::fs::write(
-                    format!("{dir}/present-{layout:?}-{i}.png").to_lowercase(),
+                    format!("{dir}/present-{}-{layout:?}-{i}.png", kind.name()).to_lowercase(),
                     png,
                 );
             }
@@ -229,7 +256,7 @@ pub fn run(allow_no_gpu: bool) -> i32 {
         if let Ok(dir) = std::env::var("MG_SCENE_DUMP") {
             // Developer aid: raw RGBA of the last frame at 960x540 (never inside the repository).
             if let Ok(h) = headless() {
-                let scene = SpectrumScene::new_headless(&h.device);
+                let scene = SceneSet::new_headless(&h.device);
                 if let Ok(img) = scene.render_offscreen(
                     &h.device,
                     &h.queue,

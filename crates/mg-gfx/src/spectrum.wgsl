@@ -7,66 +7,6 @@ const HMAX: f32 = 0.36;      // tallest bar, as a fraction of screen height
 const X0: f32 = 0.07;
 const X1: f32 = 0.93;
 
-struct U {
-    res: vec2<f32>,
-    time: f32,
-    energy: f32,
-    // glow, haze, warp, swell
-    a: vec4<f32>,
-    // tilt, scroll.x, scroll.y, mode (0 live, 1 synthetic, 2 no audio / error)
-    b: vec4<f32>,
-    // ring1 (age, amp), ring2 (age, amp)
-    c: vec4<f32>,
-    pal0: vec4<f32>, // haze / base (w = dust phase 0..1)
-    pal1: vec4<f32>, // bar body
-    pal2: vec4<f32>, // accent / tips
-    pal3: vec4<f32>, // secondary (haze tint, curtain)
-    bars: array<vec4<f32>, 24>,
-    peaks: array<vec4<f32>, 24>,
-    bright: array<vec4<f32>, 24>,
-};
-@group(0) @binding(0) var<uniform> u: U;
-
-struct VOut {
-    @builtin(position) pos: vec4<f32>,
-};
-
-@vertex
-fn vs(@builtin(vertex_index) i: u32) -> VOut {
-    let p = vec2<f32>(f32((i << 1u) & 2u), f32(i & 2u));
-    var o: VOut;
-    o.pos = vec4<f32>(p * 2.0 - 1.0, 0.0, 1.0);
-    return o;
-}
-
-// x*x instead of pow(x, 2.0): pow with a negative base is undefined in WGSL and NaN on some drivers.
-fn sq(x: f32) -> f32 { return x * x; }
-
-fn hash21(p: vec2<f32>) -> f32 {
-    var q = fract(p * vec2<f32>(123.34, 456.21));
-    q += dot(q, q + 45.32);
-    return fract(q.x * q.y);
-}
-
-fn vnoise(p: vec2<f32>) -> f32 {
-    let i = floor(p);
-    let f = fract(p);
-    let w = f * f * (3.0 - 2.0 * f);
-    return mix(mix(hash21(i), hash21(i + vec2<f32>(1.0, 0.0)), w.x),
-               mix(hash21(i + vec2<f32>(0.0, 1.0)), hash21(i + vec2<f32>(1.0, 1.0)), w.x), w.y);
-}
-
-fn fbm(p: vec2<f32>) -> f32 {
-    var s = 0.0;
-    var a = 0.5;
-    var q = p;
-    for (var k = 0; k < 3; k++) {
-        s += a * vnoise(q);
-        q = q * 2.03 + vec2<f32>(17.1, 9.3);
-        a *= 0.5;
-    }
-    return s;
-}
 
 fn bar_h(i: i32) -> f32 { return u.bars[i >> 2][i & 3]; }
 fn peak_h(i: i32) -> f32 { return u.peaks[i >> 2][i & 3]; }
@@ -127,10 +67,6 @@ fn dust_layer(p: vec2<f32>, aspect: f32, cell: f32, phase: f32, lanes: f32, dens
     let off = vec2<f32>(hash21(id + seed) - 0.5, hash21(id * 1.7 + seed + 11.0) - 0.5) * 0.6;
     let on = step(1.0 - dens, hash21(id + seed + 5.0));
     return on * (1.0 - smoothstep(0.0, 0.10, length(f - off))) * (0.5 + 0.5 * hash21(id + seed + 2.0));
-}
-
-fn aces(x: vec3<f32>) -> vec3<f32> {
-    return clamp((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14), vec3<f32>(0.0), vec3<f32>(1.0));
 }
 
 @fragment

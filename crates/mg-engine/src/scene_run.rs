@@ -2,7 +2,7 @@
 //! the fullscreen Cinematic Spectrum scene.
 //!
 //! Live path: WASAPI loopback -> capture thread -> central `Analyzer` -> shared latest frame ->
-//! `SceneMapper` -> `SpectrumScene`. Nothing here invents musical activity: if no fresh analysis frame
+//! `SceneMapper` -> `SceneSet`. Nothing here invents musical activity: if no fresh analysis frame
 //! arrives (capture failed or stalled) the scene decays to silence and shows the NO AUDIO state, and the
 //! window title says so. Samples are never stored or logged (ADR-0003).
 
@@ -13,7 +13,7 @@ use mg_audio::capture::Loopback;
 use mg_dsp::{AnalysisParams, Analyzer, AudioFrame};
 use mg_gfx::context::{BackendChoice, FrameStatus, Gpu};
 use mg_gfx::overlay::Overlay;
-use mg_gfx::scene::{SceneMode, SpectrumScene};
+use mg_gfx::scene::{SceneKind, SceneMode, SceneSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use winit::application::ApplicationHandler;
@@ -32,6 +32,8 @@ fn toggle_allowed(m: ModifiersState) -> bool {
 
 const CURSOR_HIDE_AFTER: Duration = Duration::from_secs(3);
 const MAX_SKIP_TIME: Duration = Duration::from_secs(30);
+/// Scene crossfade length.
+const XFADE_SECS: f32 = 1.0;
 
 #[derive(Debug, PartialEq)]
 pub enum Source {
@@ -59,6 +61,9 @@ pub struct SceneOpts {
     pub source: Source,
     pub media: MediaChoice,
     pub layout: Layout,
+    pub style: SceneKind,
+    /// Switch to the next scene every N seconds (a hands-free tour; keys still work).
+    pub auto_scenes: Option<u64>,
 }
 
 pub fn parse(args: &[String], source: Source) -> Result<SceneOpts, String> {
@@ -71,12 +76,28 @@ pub fn parse(args: &[String], source: Source) -> Result<SceneOpts, String> {
         source,
         media: MediaChoice::Auto,
         layout: Layout::Corner,
+        style: SceneKind::Spectrum,
+        auto_scenes: None,
     };
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
             "--windowed" => o.fullscreen = false,
             "--fullscreen" => o.fullscreen = true,
+            "--style" => {
+                o.style = it
+                    .next()
+                    .and_then(|v| SceneKind::parse(v))
+                    .ok_or("--style needs spectrum|aurora|focus")?;
+            }
+            "--auto-scenes" => {
+                o.auto_scenes = Some(
+                    it.next()
+                        .and_then(|v| v.parse::<u64>().ok())
+                        .filter(|s| (3..=3600).contains(s))
+                        .ok_or("--auto-scenes needs 3..=3600 seconds")?,
+                );
+            }
             "--no-media" => o.media = MediaChoice::Off,
             "--demo-media" => o.media = MediaChoice::Demo,
             "--layout" => {
@@ -178,12 +199,16 @@ struct App {
     synth: Option<SynthSource>,
     mapper: SceneMapper,
     stale_after: Duration,
-    scene: Option<SpectrumScene>,
+    scene: Option<SceneSet>,
     overlay: Option<Overlay>,
     media: MediaFeed,
     pres: Presentation,
     worker: Worker,
     last_media_poll: Option<Instant>,
+    style: SceneKind,
+    /// Running crossfade: (target scene, progress 0..1). Audio capture is never touched by a switch.
+    xfade: Option<(SceneKind, f32)>,
+    last_auto_switch: Instant,
     gpu: Option<Gpu>,
     window: Option<Arc<Window>>,
     start: Instant,
@@ -263,7 +288,7 @@ impl ApplicationHandler for App {
                     "adapter={:?} backend={:?} present_mode={:?} surface_format={:?}",
                     gpu.info.name, gpu.info.backend, gpu.config.present_mode, gpu.config.format
                 );
-                self.scene = Some(SpectrumScene::new(
+                self.scene = Some(SceneSet::new(
                     &gpu.device,
                     gpu.config.format,
                     self.opts.scale,
@@ -320,6 +345,36 @@ impl ApplicationHandler for App {
             WindowEvent::KeyboardInput {
                 event:
                     KeyEvent {
+                        physical_key: PhysicalKey::Code(code),
+                        state: ElementState::Pressed,
+                        repeat: false,
+                        ..
+                    },
+                ..
+            } if toggle_allowed(self.mods)
+                && matches!(
+                    code,
+                    KeyCode::ArrowLeft
+                        | KeyCode::ArrowRight
+                        | KeyCode::Digit1
+                        | KeyCode::Digit2
+                        | KeyCode::Digit3
+                ) =>
+            {
+                let from = self.xfade.map_or(self.style, |(to, _)| to);
+                let to = match code {
+                    KeyCode::ArrowLeft => from.prev(),
+                    KeyCode::ArrowRight => from.next(),
+                    KeyCode::Digit1 => SceneKind::Spectrum,
+                    KeyCode::Digit2 => SceneKind::Aurora,
+                    _ => SceneKind::Focus,
+                };
+                self.switch_scene(to);
+                self.touch_input();
+            }
+            WindowEvent::KeyboardInput {
+                event:
+                    KeyEvent {
                         physical_key: PhysicalKey::Code(KeyCode::KeyL),
                         state: ElementState::Pressed,
                         repeat: false,
@@ -368,6 +423,14 @@ impl ApplicationHandler for App {
 }
 
 impl App {
+    /// Starts a crossfade to `to` (a switch during a crossfade restarts from the scene currently shown).
+    fn switch_scene(&mut self, to: SceneKind) {
+        let showing = self.style;
+        if to != showing || self.xfade.is_some_and(|(t, _)| t != to) {
+            self.xfade = (to != showing).then_some((to, 0.0));
+        }
+    }
+
     fn touch_input(&mut self) {
         self.last_input = Instant::now();
         if self.cursor_hidden {
@@ -459,6 +522,30 @@ impl App {
             .pres
             .update(dt as f32, surface, params.energy, params.swell);
         overlay_params.time = params.time;
+        // Album Focus radiates from the artwork rectangle (one source of truth: the overlay layout).
+        if let Some(a) = overlay_params.art {
+            let (w, h) = (surface.0.max(1) as f32, surface.1.max(1) as f32);
+            params.focus = [a.cx / w, a.cy / h, a.hw / h, a.hh / h];
+            params.focus_active = a.alpha.clamp(0.0, 1.0);
+        }
+        if let Some(every) = self.opts.auto_scenes {
+            if self.xfade.is_none() && now.duration_since(self.last_auto_switch).as_secs() >= every
+            {
+                self.last_auto_switch = now;
+                self.switch_scene(self.style.next());
+            }
+        }
+        if let Some((to, t)) = self.xfade {
+            let t = t + dt as f32 / XFADE_SECS;
+            if t >= 1.0 {
+                self.style = to;
+                self.xfade = None;
+            } else {
+                self.xfade = Some((to, t));
+            }
+        }
+        let xfade = self.xfade.map(|(to, t)| (to, t * t * (3.0 - 2.0 * t)));
+        let style = self.style;
         let (album, album_w) = self.pres.album();
         apply_album(
             &mut params.palette,
@@ -500,7 +587,7 @@ impl App {
         }
         let queue = g.queue.clone();
         let overlay = self.overlay.as_ref();
-        match scene.render_with(g, &params, |enc, view| {
+        match scene.render_scenes(g, &params, style, xfade, |enc, view| {
             if let Some(ov) = overlay {
                 ov.draw(&queue, enc, view, &overlay_params);
             }
@@ -600,6 +687,7 @@ pub fn run(opts: SceneOpts) -> i32 {
         _ => MediaFeed::Off,
     };
     let layout = opts.layout;
+    let style = opts.style;
     let tune = MapTuning::default();
     let stale_after = Duration::from_secs_f32(tune.stale_after_s);
     let mut app = App {
@@ -615,6 +703,9 @@ pub fn run(opts: SceneOpts) -> i32 {
         pres: Presentation::new(layout),
         worker: Worker::start(),
         last_media_poll: None,
+        style,
+        xfade: None,
+        last_auto_switch: Instant::now(),
         gpu: None,
         window: None,
         start: Instant::now(),
@@ -749,5 +840,38 @@ mod tests {
             );
         }
         assert!(crate::sim::fixture("nope", 48_000).is_none());
+    }
+
+    #[test]
+    fn parses_style_layout_media_and_auto_scene_options() {
+        let o = parse(
+            &a(&[
+                "--style",
+                "aurora",
+                "--layout",
+                "center",
+                "--demo-media",
+                "--auto-scenes",
+                "30",
+            ]),
+            Source::Live,
+        )
+        .unwrap();
+        assert_eq!(o.style, SceneKind::Aurora);
+        assert_eq!(o.layout, Layout::Center);
+        assert_eq!(o.media, MediaChoice::Demo);
+        assert_eq!(o.auto_scenes, Some(30));
+        for bad in [
+            &["--style", "plasma"][..],
+            &["--style"],
+            &["--layout", "left"],
+            &["--auto-scenes", "1"],
+            &["--auto-scenes", "x"],
+        ] {
+            assert!(parse(&a(bad), Source::Live).is_err(), "{bad:?}");
+        }
+        assert_eq!(SceneKind::Focus.next(), SceneKind::Spectrum);
+        assert_eq!(SceneKind::Spectrum.prev(), SceneKind::Focus);
+        assert_eq!(SceneKind::parse("focus"), Some(SceneKind::Focus));
     }
 }

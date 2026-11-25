@@ -17,8 +17,18 @@ struct Target {
     for_surface: (u32, u32),
 }
 
+struct MixTargets {
+    views: [wgpu::TextureView; 2],
+    bind_group: wgpu::BindGroup,
+    size: (u32, u32),
+}
+
 pub struct FullscreenRenderer {
-    pipeline: wgpu::RenderPipeline,
+    pipelines: Vec<wgpu::RenderPipeline>,
+    mix_pipeline: wgpu::RenderPipeline,
+    mix_bgl: wgpu::BindGroupLayout,
+    mix_uniform: wgpu::Buffer,
+    mix_targets: Option<MixTargets>,
     uniform: wgpu::Buffer,
     uniform_len: usize,
     bind_group: wgpu::BindGroup,
@@ -43,11 +53,20 @@ impl FullscreenRenderer {
         wgsl: &str,
         uniform_len: usize,
     ) -> Self {
+        Self::new_multi(device, format, scale, label, &[wgsl], uniform_len)
+    }
+
+    /// Several scene shaders sharing one uniform block and one bind group. All pipelines are created here so
+    /// a later scene switch never compiles anything (no hitch).
+    pub fn new_multi(
+        device: &wgpu::Device,
+        format: wgpu::TextureFormat,
+        scale: f32,
+        label: &str,
+        wgsls: &[&str],
+        uniform_len: usize,
+    ) -> Self {
         let t0 = Instant::now();
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some(label),
-            source: wgpu::ShaderSource::Wgsl(wgsl.into()),
-        });
         let uniform = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some(label),
             size: uniform_len as u64,
@@ -75,7 +94,17 @@ impl FullscreenRenderer {
                 resource: uniform.as_entire_binding(),
             }],
         });
-        let pipeline = make_pipeline(device, &shader, &bgl, label, format);
+        let pipelines: Vec<wgpu::RenderPipeline> = wgsls
+            .iter()
+            .map(|w| {
+                let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                    label: Some(label),
+                    source: wgpu::ShaderSource::Wgsl((*w).into()),
+                });
+                make_pipeline(device, &shader, &bgl, label, format)
+            })
+            .collect();
+        assert!(!pipelines.is_empty(), "at least one scene shader");
 
         let blit_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("blit"),
@@ -109,8 +138,56 @@ impl FullscreenRenderer {
             min_filter: wgpu::FilterMode::Linear,
             ..Default::default()
         });
+        let mix_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("mix"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("mix.wgsl").into()),
+        });
+        let tex = |binding| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Texture {
+                sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                view_dimension: wgpu::TextureViewDimension::D2,
+                multisampled: false,
+            },
+            count: None,
+        };
+        let mix_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("mix-bgl"),
+            entries: &[
+                tex(0),
+                tex(1),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: wgpu::BufferSize::new(16),
+                    },
+                    count: None,
+                },
+            ],
+        });
+        let mix_pipeline = make_pipeline(device, &mix_shader, &mix_bgl, "mix", format);
+        let mix_uniform = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("mix"),
+            size: 16,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         Self {
-            pipeline,
+            pipelines,
+            mix_pipeline,
+            mix_bgl,
+            mix_uniform,
+            mix_targets: None,
             uniform,
             uniform_len,
             bind_group,
@@ -199,6 +276,21 @@ impl FullscreenRenderer {
         uniform: &[u8],
         post: F,
     ) -> Result<FrameStatus, String> {
+        self.render_scenes(gpu, uniform, 0, None, post)
+    }
+
+    /// Draws scene `scene`, or - with `xfade = Some((to, t))` - a crossfade from `scene` to `to` at blend `t`
+    /// (0..1, eased by the caller). During a crossfade both scenes render into their own targets and a mix pass
+    /// blends them; outside a crossfade exactly one scene is drawn (no extra cost). Pipelines already exist, so
+    /// switching never compiles. `post` records overlays on the surface in the same submission.
+    pub fn render_scenes<F: FnOnce(&mut wgpu::CommandEncoder, &wgpu::TextureView)>(
+        &mut self,
+        gpu: &mut Gpu,
+        uniform: &[u8],
+        scene: usize,
+        xfade: Option<(usize, f32)>,
+        post: F,
+    ) -> Result<FrameStatus, String> {
         if uniform.len() != self.uniform_len {
             return Err(format!(
                 "uniform is {} bytes, shader expects {}",
@@ -206,24 +298,123 @@ impl FullscreenRenderer {
                 self.uniform_len
             ));
         }
-        self.ensure_target(&gpu.device, (gpu.config.width, gpu.config.height));
+        let surface = (gpu.config.width, gpu.config.height);
+        self.ensure_target(&gpu.device, surface);
+        let last = self.pipelines.len() - 1;
+        let scene = scene.min(last);
+        let fade = xfade
+            .map(|(to, t)| (to.min(last), t.clamp(0.0, 1.0)))
+            .filter(|(to, _)| *to != scene);
+        if fade.is_some() {
+            let size = self.render_size(surface);
+            self.ensure_mix_targets(&gpu.device, size);
+        }
         gpu.queue.write_buffer(&self.uniform, 0, uniform);
+        if let Some((_, t)) = fade {
+            gpu.queue.write_buffer(&self.mix_uniform, 0, &mix_bytes(t));
+        }
         let this = &*self;
         gpu.render(|enc, surface_view| {
-            let scene_view = this.target.as_ref().map_or(surface_view, |t| &t.view);
-            let mut pass = begin_color_pass(enc, "scene", scene_view);
-            pass.set_pipeline(&this.pipeline);
-            pass.set_bind_group(0, &this.bind_group, &[]);
-            pass.draw(0..3, 0..1);
-            drop(pass);
-            if let Some(t) = &this.target {
-                let mut blit = begin_color_pass(enc, "blit", surface_view);
-                blit.set_pipeline(&this.blit_pipeline);
-                blit.set_bind_group(0, &t.bind_group, &[]);
-                blit.draw(0..3, 0..1);
+            match fade {
+                None => {
+                    let scene_view = this.target.as_ref().map_or(surface_view, |t| &t.view);
+                    this.draw_scene(enc, scene_view, scene);
+                    if let Some(t) = &this.target {
+                        let mut blit = begin_color_pass(enc, "blit", surface_view);
+                        blit.set_pipeline(&this.blit_pipeline);
+                        blit.set_bind_group(0, &t.bind_group, &[]);
+                        blit.draw(0..3, 0..1);
+                    }
+                }
+                Some((to, _)) => {
+                    if let Some(m) = &this.mix_targets {
+                        this.draw_crossfade_with(enc, surface_view, scene, to, m);
+                    }
+                }
             }
             post(enc, surface_view);
         })
+    }
+
+    fn draw_scene(&self, enc: &mut wgpu::CommandEncoder, view: &wgpu::TextureView, scene: usize) {
+        let mut pass = begin_color_pass(enc, "scene", view);
+        pass.set_pipeline(&self.pipelines[scene]);
+        pass.set_bind_group(0, &self.bind_group, &[]);
+        pass.draw(0..3, 0..1);
+    }
+
+    /// Both scenes into the mix targets, then the mix pass onto `out`.
+    fn draw_crossfade_with(
+        &self,
+        enc: &mut wgpu::CommandEncoder,
+        out: &wgpu::TextureView,
+        from: usize,
+        to: usize,
+        m: &MixTargets,
+    ) {
+        self.draw_scene(enc, &m.views[0], from);
+        self.draw_scene(enc, &m.views[1], to);
+        let mut pass = begin_color_pass(enc, "mix", out);
+        pass.set_pipeline(&self.mix_pipeline);
+        pass.set_bind_group(0, &m.bind_group, &[]);
+        pass.draw(0..3, 0..1);
+    }
+
+    fn make_mix_targets(&self, device: &wgpu::Device, size: (u32, u32)) -> MixTargets {
+        let mk = || {
+            device
+                .create_texture(&wgpu::TextureDescriptor {
+                    label: Some("mix-target"),
+                    size: wgpu::Extent3d {
+                        width: size.0,
+                        height: size.1,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: self.format,
+                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                        | wgpu::TextureUsages::TEXTURE_BINDING,
+                    view_formats: &[],
+                })
+                .create_view(&wgpu::TextureViewDescriptor::default())
+        };
+        let views = [mk(), mk()];
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("mix-bg"),
+            layout: &self.mix_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&views[0]),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&views[1]),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: self.mix_uniform.as_entire_binding(),
+                },
+            ],
+        });
+        MixTargets {
+            views,
+            bind_group,
+            size,
+        }
+    }
+
+    /// Crossfade targets are created on the first crossfade (and when the render size changes), then kept.
+    fn ensure_mix_targets(&mut self, device: &wgpu::Device, size: (u32, u32)) {
+        if self.mix_targets.as_ref().is_none_or(|m| m.size != size) {
+            self.mix_targets = Some(self.make_mix_targets(device, size));
+        }
     }
 
     /// Renders one frame into an offscreen texture of `w x h` and returns the tightly packed pixels
@@ -247,6 +438,22 @@ impl FullscreenRenderer {
         w: u32,
         h: u32,
         uniform: &[u8],
+        post: &dyn Fn(&mut wgpu::CommandEncoder, &wgpu::TextureView),
+    ) -> Result<Vec<u8>, String> {
+        self.render_offscreen_scenes(device, queue, w, h, uniform, 0, None, post)
+    }
+
+    /// Offscreen render of scene `scene` or a crossfade (`xfade = Some((to, t))`), then `post`, then readback.
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_offscreen_scenes(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        w: u32,
+        h: u32,
+        uniform: &[u8],
+        scene: usize,
+        xfade: Option<(usize, f32)>,
         post: &dyn Fn(&mut wgpu::CommandEncoder, &wgpu::TextureView),
     ) -> Result<Vec<u8>, String> {
         if uniform.len() != self.uniform_len {
@@ -279,10 +486,19 @@ impl FullscreenRenderer {
             label: Some("offscreen"),
         });
         {
-            let mut pass = begin_color_pass(&mut enc, "offscreen", &view);
-            pass.set_pipeline(&self.pipeline);
-            pass.set_bind_group(0, &self.bind_group, &[]);
-            pass.draw(0..3, 0..1);
+            let last = self.pipelines.len() - 1;
+            let scene = scene.min(last);
+            let fade = xfade
+                .map(|(to, t)| (to.min(last), t.clamp(0.0, 1.0)))
+                .filter(|(to, _)| *to != scene);
+            match fade {
+                None => self.draw_scene(&mut enc, &view, scene),
+                Some((to, t)) => {
+                    queue.write_buffer(&self.mix_uniform, 0, &mix_bytes(t));
+                    let m = self.make_mix_targets(device, (w, h));
+                    self.draw_crossfade_with(&mut enc, &view, scene, to, &m);
+                }
+            }
         }
         post(&mut enc, &view);
         enc.copy_texture_to_buffer(
@@ -333,6 +549,13 @@ impl FullscreenRenderer {
         buf.unmap();
         Ok(out)
     }
+}
+
+fn mix_bytes(t: f32) -> Vec<u8> {
+    [t, 0.0, 0.0, 0.0]
+        .iter()
+        .flat_map(|v| v.to_ne_bytes())
+        .collect()
 }
 
 fn begin_color_pass<'e>(
