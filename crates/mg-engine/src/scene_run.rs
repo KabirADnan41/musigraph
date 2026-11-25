@@ -17,10 +17,16 @@ use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
 use winit::event::{ElementState, KeyEvent, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
-use winit::keyboard::{Key, KeyCode, NamedKey, PhysicalKey};
+use winit::keyboard::{Key, KeyCode, ModifiersState, NamedKey, PhysicalKey};
 use winit::window::{Fullscreen, Window, WindowId};
 
 /// A minimised/occluded window is normal for a visualizer; only a very long stall is treated as failure.
+/// The F key toggles fullscreen only on its own: Ctrl+F, Alt+F and Win+F belong to the user/system.
+/// (Shift is allowed: it does not form a shortcut.)
+fn toggle_allowed(m: ModifiersState) -> bool {
+    !(m.control_key() || m.alt_key() || m.super_key())
+}
+
 const CURSOR_HIDE_AFTER: Duration = Duration::from_secs(3);
 const MAX_SKIP_TIME: Duration = Duration::from_secs(30);
 
@@ -154,6 +160,7 @@ struct App {
     last_change: Instant,
     last_input: Instant,
     cursor_hidden: bool,
+    mods: ModifiersState,
     title: String,
     last_frame: Option<Instant>,
     intervals_ms: Vec<f64>,
@@ -163,6 +170,7 @@ struct App {
     stale_ticks: u64,
     timed_out: bool,
     result: Result<(), String>,
+    exit_reason: &'static str,
 }
 
 impl App {
@@ -244,7 +252,10 @@ impl ApplicationHandler for App {
 
     fn window_event(&mut self, el: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         match event {
-            WindowEvent::CloseRequested => el.exit(),
+            WindowEvent::CloseRequested => {
+                self.exit_reason = "window close requested";
+                el.exit()
+            }
             WindowEvent::KeyboardInput {
                 event:
                     KeyEvent {
@@ -253,7 +264,11 @@ impl ApplicationHandler for App {
                         ..
                     },
                 ..
-            } => el.exit(),
+            } => {
+                self.exit_reason = "Esc pressed";
+                el.exit()
+            }
+            WindowEvent::ModifiersChanged(m) => self.mods = m.state(),
             WindowEvent::KeyboardInput {
                 event:
                     KeyEvent {
@@ -263,7 +278,7 @@ impl ApplicationHandler for App {
                         ..
                     },
                 ..
-            } => {
+            } if toggle_allowed(self.mods) => {
                 self.opts.fullscreen = !self.opts.fullscreen;
                 self.apply_fullscreen();
                 self.touch_input();
@@ -292,6 +307,7 @@ impl ApplicationHandler for App {
         }
         if self.window.is_some() && self.start.elapsed().as_secs() >= self.opts.seconds + 2 {
             self.timed_out = true;
+            self.exit_reason = "time limit reached (--seconds, deadline)";
             return el.exit();
         }
         if let Some(w) = &self.window {
@@ -328,6 +344,7 @@ impl App {
         let now = Instant::now();
         if self.start.elapsed().as_secs() >= self.opts.seconds {
             self.timed_out = true;
+            self.exit_reason = "time limit reached (--seconds)";
             return el.exit();
         }
         let dt = now.duration_since(self.last_tick).as_secs_f64().min(0.25);
@@ -491,6 +508,7 @@ pub fn run(opts: SceneOpts) -> i32 {
         last_change: Instant::now(),
         last_input: Instant::now(),
         cursor_hidden: false,
+        mods: ModifiersState::empty(),
         title: String::new(),
         last_frame: None,
         intervals_ms: Vec::new(),
@@ -500,6 +518,7 @@ pub fn run(opts: SceneOpts) -> i32 {
         stale_ticks: 0,
         timed_out: false,
         result: Ok(()),
+        exit_reason: "event loop ended",
     };
     if let Err(e) = event_loop.run_app(&mut app) {
         eprintln!("event loop error: {e}");
@@ -534,6 +553,7 @@ pub fn run(opts: SceneOpts) -> i32 {
         pct(0.99),
         s.last().copied().unwrap_or(0.0)
     );
+    println!("EXIT reason: {}", app.exit_reason);
     match app.result {
         Ok(()) => 0,
         Err(e) => {
@@ -549,6 +569,18 @@ mod tests {
 
     fn a(s: &[&str]) -> Vec<String> {
         s.iter().map(|x| x.to_string()).collect()
+    }
+
+    #[test]
+    fn fullscreen_toggle_ignores_ctrl_alt_and_win_combinations() {
+        assert!(toggle_allowed(ModifiersState::empty()));
+        assert!(toggle_allowed(ModifiersState::SHIFT));
+        assert!(!toggle_allowed(ModifiersState::CONTROL));
+        assert!(!toggle_allowed(ModifiersState::ALT));
+        assert!(!toggle_allowed(ModifiersState::SUPER));
+        assert!(!toggle_allowed(
+            ModifiersState::CONTROL | ModifiersState::SHIFT
+        ));
     }
 
     #[test]

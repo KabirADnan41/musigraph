@@ -49,6 +49,9 @@ pub struct AnalysisParams {
     pub onset_k: f32,
     pub onset_min_flux: f32,
     pub onset_min_gap_s: f32,
+    /// Spectral tilt compensation (dB per octave about 1 kHz): music spectra fall roughly 4-6 dB/oct, so
+    /// without it every song looks like the same bass hump. 0 disables. Clamped to +-18 dB per band.
+    pub tilt_db_per_oct: f32,
 }
 
 impl Default for AnalysisParams {
@@ -69,6 +72,7 @@ impl Default for AnalysisParams {
             onset_k: 4.0,
             onset_min_flux: 0.015,
             onset_min_gap_s: 0.09,
+            tilt_db_per_oct: 4.5,
         }
     }
 }
@@ -137,6 +141,8 @@ pub struct Analyzer {
     mag: Vec<f32>,
     band_bins: Vec<(usize, usize)>,
     group_bins: [(usize, usize); GROUPS],
+    band_tilt_db: Vec<f32>,
+    group_tilt_db: [f32; GROUPS],
     band_s: Vec<Smoother>,
     gf: [Smoother; GROUPS],
     gm: [Smoother; GROUPS],
@@ -208,6 +214,14 @@ impl Analyzer {
                 FFT_SIZE,
             );
         }
+        let tilt = |f: f32| (p.tilt_db_per_oct * (f / 1000.0).log2()).clamp(-18.0, 18.0);
+        let band_tilt_db: Vec<f32> = (0..p.band_count)
+            .map(|b| tilt((edges[b] * edges[b + 1]).sqrt()))
+            .collect();
+        let mut group_tilt_db = [0.0; GROUPS];
+        for (g, t) in group_tilt_db.iter_mut().enumerate() {
+            *t = tilt((GROUP_EDGES_HZ[g] * GROUP_EDGES_HZ[g + 1]).sqrt());
+        }
         let sm = |(a, r): (f32, f32)| Smoother::new(a, r);
         Ok(Self {
             sr: sample_rate,
@@ -223,6 +237,8 @@ impl Analyzer {
             mag: vec![0.0; FFT_SIZE / 2 + 1],
             band_bins,
             group_bins,
+            band_tilt_db,
+            group_tilt_db,
             band_s: vec![sm(p.fast); MAX_BANDS],
             gf: [sm(p.fast); GROUPS],
             gm: [sm(p.medium); GROUPS],
@@ -302,12 +318,13 @@ impl Analyzer {
         let mut peak_db = -120.0f32;
         for (b, &(lo, hi)) in self.band_bins.iter().enumerate() {
             let m = self.mag[lo..=hi].iter().copied().fold(0.0, f32::max);
-            band_db[b] = db(m);
+            band_db[b] = db(m) + self.band_tilt_db[b];
             peak_db = peak_db.max(band_db[b]);
         }
         let mut group_db = [-120.0f32; GROUPS];
         for (g, &(lo, hi)) in self.group_bins.iter().enumerate() {
-            group_db[g] = db(self.mag[lo..=hi].iter().copied().fold(0.0, f32::max));
+            group_db[g] =
+                db(self.mag[lo..=hi].iter().copied().fold(0.0, f32::max)) + self.group_tilt_db[g];
         }
         // Rolling reference: rises at once, falls slowly, never below ref_min_db (limits gain).
         if peak_db > self.ref_db {
@@ -686,7 +703,7 @@ mod tests {
             && f.energy.is_finite()
             && (0.0..=1.0).contains(&f.energy)));
         assert!(
-            last(&frames).group_fast[2] > 0.8,
+            last(&frames).group_fast[2] > 0.6,
             "recovers: {:?}",
             last(&frames).group_fast
         );
@@ -795,6 +812,48 @@ mod tests {
     // NOTE (design): band/group levels are shape-normalised against a rolling reference, so a steady
     // tone looks full at both 0.8 and 0.1 amplitude. Absolute loudness is carried by `rms_db` and
     // `energy`; scenes must combine both (ADR-0008), never rely on band height for loudness.
+
+    /// A music-like spectrum: components log-spaced 50 Hz-14 kHz with amplitude falling 4.5 dB per octave
+    /// (typical of mastered music). Returns (mean bass level, mean treble level) of the normalised bands.
+    fn bass_and_treble_levels(tilt: f32) -> (f32, f32) {
+        let n = 3 * SR as usize;
+        let mut x = vec![0.0f32; n];
+        for k in 0..40 {
+            let f = 50.0 * (14_000.0f32 / 50.0).powf(k as f32 / 39.0);
+            let amp = 0.02 * (f / 1000.0).powf(-0.75); // -4.5 dB per octave
+            for (v, s) in x.iter_mut().zip(synth::sine(f * 1.013, amp, SR, n)) {
+                *v += s;
+            }
+        }
+        let p = AnalysisParams {
+            tilt_db_per_oct: tilt,
+            ..AnalysisParams::default()
+        };
+        let mut a = Analyzer::new(SR, p).unwrap();
+        let mut out = (0.0, 0.0);
+        for c in x.chunks(480) {
+            a.push(c, 0, |f| {
+                let m = |r: std::ops::Range<usize>| {
+                    f.bands[r.clone()].iter().sum::<f32>() / r.len() as f32
+                };
+                out = (m(0..16), m(40..64));
+            });
+        }
+        out
+    }
+
+    #[test]
+    fn tilt_compensation_flattens_a_music_like_spectrum() {
+        let (fb, ft) = bass_and_treble_levels(0.0);
+        let (tb, tt) = bass_and_treble_levels(4.5);
+        eprintln!("flat: bass {fb:.2} treble {ft:.2}; tilted: bass {tb:.2} treble {tt:.2}");
+        assert!(fb - ft > 0.3, "fixture must be bass-heavy without tilt");
+        assert!(
+            (tb - tt).abs() < (fb - ft) - 0.2,
+            "tilt must reduce the bass-treble gap"
+        );
+        assert!(tt > ft + 0.2, "treble becomes visible");
+    }
 
     #[test]
     fn works_at_other_sample_rates() {

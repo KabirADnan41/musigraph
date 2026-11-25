@@ -17,7 +17,10 @@ pub struct MapTuning {
     /// Max bar growth (fraction of full height per second).
     pub rise_per_s: f32,
     /// Bar fall speed (gravity-like).
-    pub fall_per_s: f32,
+    /// Bar fall speed range (fraction of full height per second): slow, liquid songs fall at the first value,
+    /// dense, rhythmic songs at the second (from the long-term onset rate).
+    pub fall_slow_per_s: f32,
+    pub fall_fast_per_s: f32,
     pub peak_hold_s: f32,
     pub peak_fall_per_s: f32,
     /// Loudness gate: bars are scaled by smoothstep(lo, hi, rms_db) between `gate_floor` and 1.
@@ -29,8 +32,6 @@ pub struct MapTuning {
     pub energy_down_s: f32,
     pub ring_min_gap_s: f32,
     pub ring_amp: f32,
-    /// Palette hue slew limit (hue units/s; 15 degrees/s = 0.0417).
-    pub hue_rate: f32,
     /// A frame older than this (no new sequence number) is treated as absent audio.
     pub stale_after_s: f32,
 }
@@ -39,7 +40,8 @@ impl Default for MapTuning {
     fn default() -> Self {
         Self {
             rise_per_s: 14.0,
-            fall_per_s: 1.5,
+            fall_slow_per_s: 0.6,
+            fall_fast_per_s: 3.2,
             peak_hold_s: 0.25,
             peak_fall_per_s: 0.6,
             gate_lo_db: -55.0,
@@ -49,7 +51,6 @@ impl Default for MapTuning {
             energy_down_s: 6.0,
             ring_min_gap_s: 0.12,
             ring_amp: 0.15,
-            hue_rate: 0.0417,
             stale_after_s: 0.25,
         }
     }
@@ -79,7 +80,8 @@ pub struct SceneMapper {
     tilt: f32,
     glow: Smoother,
     haze: Smoother,
-    hue: [f32; 3],
+    song_tilt: f32,
+    onset_rate: f32,
     rings: [[f32; 2]; 2],
     since_onset: f32,
     /// slot -> (band position 0..1, group index)
@@ -104,22 +106,6 @@ fn group_of(pos: f32) -> usize {
         .count()
 }
 
-/// HSV (hue in turns, may exceed 1) to linear RGB.
-fn hsv_linear(h: f32, s: f32, v: f32) -> [f32; 3] {
-    let h = h.rem_euclid(1.0) * 6.0;
-    let (i, f) = (h.floor() as i32, h.fract());
-    let (p, q, t) = (v * (1.0 - s), v * (1.0 - s * f), v * (1.0 - s * (1.0 - f)));
-    let c = match i {
-        0 => [v, t, p],
-        1 => [q, v, p],
-        2 => [p, v, t],
-        3 => [p, q, v],
-        4 => [t, p, v],
-        _ => [v, p, q],
-    };
-    c.map(|x| x.powf(2.2))
-}
-
 impl SceneMapper {
     pub fn new(tune: MapTuning) -> Self {
         let mut slot_map = [(0.0, 0); SLOTS];
@@ -142,7 +128,8 @@ impl SceneMapper {
             bars: [0.0; SLOTS],
             peaks: [0.0; SLOTS],
             hold: [0.0; SLOTS],
-            hue: [0.62, 0.52, 0.50],
+            song_tilt: 0.0,
+            onset_rate: 1.5,
             rings: [[100.0, 0.0]; 2],
             since_onset: 10.0,
             slot_map,
@@ -169,6 +156,14 @@ impl SceneMapper {
                     * smoothstep(self.tune.gate_lo_db, self.tune.gate_hi_db, fin(f.rms_db))
         };
         let gate = self.gate.step(gate_t, dt);
+        // Song-adaptive motion: long-term onset rate (tau 20 s, only while music plays) sets the fall speed.
+        if live && !silent && dt > 0.0 {
+            let inst = input.onsets as f32 / dt;
+            self.onset_rate += (inst - self.onset_rate) * (1.0 - (-dt / 20.0).exp());
+        }
+        let rate_n = (self.onset_rate / 4.0).clamp(0.0, 1.0);
+        let fall = self.tune.fall_slow_per_s
+            + (self.tune.fall_fast_per_s - self.tune.fall_slow_per_s) * rate_n;
         let mut target = [0.0f32; SLOTS];
         for (i, tg) in target.iter_mut().enumerate() {
             let fp = self.slot_map[i].0 * (bands as f32 - 1.0);
@@ -193,7 +188,7 @@ impl SceneMapper {
             self.bars[i] = if tg > h {
                 tg.min(h + self.tune.rise_per_s * dt)
             } else {
-                tg.max(h - self.tune.fall_per_s * dt)
+                tg.max(h - fall * dt)
             }
             .clamp(0.0, 1.0);
             // peak caps: hold, then ease into a fall
@@ -246,28 +241,22 @@ impl SceneMapper {
         self.scroll[0] += 0.02 * speed * dt;
         self.scroll[1] += 0.012 * speed * dt;
 
-        let bright_t = (-tilt).max(0.0);
-        let hue_t = [
-            (0.62 + 0.26 * s) * (1.0 - 0.7 * bright_t) + 0.52 * 0.7 * bright_t, // base: indigo -> purple
-            0.50 + 0.36 * s, // bars: teal -> violet
-            0.52 + 0.65 * s, // accent: azure -> warm amber
-        ];
-        let max_step = self.tune.hue_rate * dt;
-        for (h, t) in self.hue.iter_mut().zip(hue_t) {
-            *h += (t - *h).clamp(-max_step, max_step);
-        }
+        // Colour: two fixed palette endpoints, blended by the slow per-song spectral tilt (tau 20 s).
+        // Bass-heavy songs sit near teal+amber, bright songs near periwinkle+rose. Music only moves lightness
+        // (slow energy) and this slow blend; there is no hue from energy and nothing per beat.
+        let song_t = if silent {
+            self.song_tilt
+        } else {
+            (bass - treble) / (bass + treble + 0.05)
+        };
+        self.song_tilt += (song_t.clamp(-1.0, 1.0) - self.song_tilt) * (1.0 - (-dt / 20.0).exp());
+        let b = (0.5 - 0.9 * self.song_tilt).clamp(0.0, 1.0); // 0 = bass-heavy endpoint, 1 = bright endpoint
+        let k = 0.85 + 0.30 * s;
+        let mix3 = |a: [f32; 3], c: [f32; 3]| [0, 1, 2].map(|i| (a[i] + (c[i] - a[i]) * b) * k);
         let palette = [
-            hsv_linear(
-                self.hue[0],
-                (0.65 + 0.15 * s) * (1.0 - 0.35 * bright_t),
-                0.45 + 0.30 * s,
-            ),
-            hsv_linear(self.hue[1], 0.60 + 0.20 * s, 0.70 + 0.10 * s),
-            hsv_linear(
-                self.hue[2],
-                (0.35 + 0.40 * s) * (1.0 - 0.4 * bright_t),
-                0.95,
-            ),
+            mix3([0.020, 0.120, 0.160], [0.030, 0.060, 0.180]),
+            mix3([0.114, 0.480, 0.546], [0.275, 0.392, 0.871]),
+            mix3([0.888, 0.552, 0.266], [0.871, 0.254, 0.323]),
         ];
 
         // ---- fast: onset impulses (real onsets only; refractory; capped) -------------------------

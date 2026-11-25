@@ -89,7 +89,7 @@ fn spectrum(x: f32, d: f32, glow: f32) -> vec3<f32> {
     var col = vec3<f32>(0.0);
     // light curtain under the envelope: soft fill that brightens toward the horizon
     let curtain = (1.0 - smoothstep(0.0, env_h + 0.03, d)) * step(0.0, d);
-    col += u.pal1.rgb * curtain * (0.10 + 0.16 * glow) * smoothstep(0.0, 0.04, env_h);
+    col += u.pal1.rgb * curtain * (0.05 + 0.10 * glow) * smoothstep(0.0, 0.04, env_h);
     // envelope line and halo
     col += u.pal2.rgb * (1.0 - smoothstep(0.0012, 0.0045, abs(d - env_h))) * 0.55 * smoothstep(0.004, 0.05, env_h);
     col += u.pal2.rgb * exp(-abs(d - env_h) * 22.0) * 0.20 * glow * smoothstep(0.004, 0.08, env_h);
@@ -97,7 +97,8 @@ fn spectrum(x: f32, d: f32, glow: f32) -> vec3<f32> {
     if (f >= 0.0 && f < f32(SLOTS)) {
         let idx = i32(floor(f));
         let lx = abs(fract(f) - 0.5);
-        let mask_x = 1.0 - smoothstep(0.30, 0.36, lx);
+        // thin needle core plus a soft side halo (not a solid equaliser bar)
+        let mask_x = (1.0 - smoothstep(0.07, 0.15, lx)) + 0.30 * exp(-lx * 7.0);
         let h = bar_h(idx) * HMAX;
         let inside = step(0.0, d) * (1.0 - smoothstep(h - 0.0025, h + 0.0025, d));
         let tip = smoothstep(0.62, 1.0, d / max(h, 0.002));
@@ -109,6 +110,17 @@ fn spectrum(x: f32, d: f32, glow: f32) -> vec3<f32> {
         col += u.pal2.rgb * cap * mask_x * 0.8 * smoothstep(0.01, 0.05, ph);
     }
     return col;
+}
+
+// Falling dust on a hash grid. Density and speed come from the real adaptive energy; this adds depth, not beats.
+fn dust_layer(p: vec2<f32>, aspect: f32, cell: f32, speed: f32, t: f32, dens: f32, seed: f32) -> f32 {
+    var g = vec2<f32>(p.x * aspect, p.y) / cell;
+    g.y -= t * speed / cell;
+    let id = floor(g);
+    let f = fract(g) - 0.5;
+    let off = vec2<f32>(hash21(id + seed) - 0.5, hash21(id * 1.7 + seed + 11.0) - 0.5) * 0.6;
+    let on = step(1.0 - dens, hash21(id + seed + 5.0));
+    return on * smoothstep(0.10, 0.0, length(f - off)) * (0.5 + 0.5 * hash21(id + seed + 2.0));
 }
 
 fn aces(x: vec3<f32>) -> vec3<f32> {
@@ -147,10 +159,17 @@ fn fs(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
     col += mix(u.pal0.rgb, u.pal2.rgb, 0.25 + 0.2 * u.b.x) * haze_amt * mix(0.35, 0.95, sky_t);
     // horizon glow, lifted by the bass swell
     col += u.pal0.rgb * exp(-abs(p.y - yh) * 13.0) * (0.22 + 0.55 * swell);
-    col += u.pal2.rgb * (1.0 - smoothstep(0.0008, 0.0024, abs(p.y - yh))) * 0.20 * breathe;
+    // hot horizon line: breathes at idle, brightens a little on real onsets (ring amplitude), never recolours
+    let onset_lift = max(u.c.y * exp(-u.c.x / 0.35), u.c.w * exp(-u.c.z / 0.35));
+    col += mix(u.pal2.rgb, vec3<f32>(1.0), 0.45) * (1.0 - smoothstep(0.0008, 0.0026, abs(p.y - yh))) * (0.30 * breathe + 1.6 * onset_lift);
+    col += u.pal2.rgb * exp(-abs(p.y - yh) * 70.0) * 0.10 * (0.5 + glow);
 
     // ---- spectrum above the horizon -----------------------------------------------------------
     let d_up = yh - p.y;
+    let dens = 0.012 + 0.05 * u.energy;
+    let dust = dust_layer(p, aspect, 0.022, 0.015 + 0.04 * u.energy, t, dens, 3.0)
+             + 0.6 * dust_layer(p, aspect, 0.040, 0.008 + 0.02 * u.energy, t, dens * 0.8, 9.0);
+    col += mix(u.pal2.rgb, vec3<f32>(1.0), 0.5) * dust * (0.12 + 0.55 * glow) * mix(1.0, 0.3, below);
     col += spectrum(p.x, d_up, glow);
 
     // ---- reflection and ring ripples below the horizon -------------------------------------
@@ -158,7 +177,7 @@ fn fs(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
         let dr = p.y - yh;
         let ring_amp = max(u.c.y * exp(-u.c.x / 0.8), u.c.w * exp(-u.c.z / 0.8));
         let ripple = 0.0022 * sin(dr * 70.0 - t * 1.6) * (0.25 + 3.0 * ring_amp);
-        let fade = exp(-dr * 5.0) * 0.35;
+        let fade = exp(-dr * 9.0) * 0.30;
         col += spectrum(p.x + ripple, dr * 1.15, glow * 0.6) * fade;
         // expanding elliptical rings on the water plane (impulses affect geometry/glow only, never colour)
         let qd = vec2<f32>((p.x - 0.5) * aspect, dr * aspect * 2.4);
@@ -167,7 +186,7 @@ fn fs(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
         let r2 = u.c.z * 0.55;
         let ring1 = exp(-sq((r - r1) / 0.035)) * u.c.y * exp(-u.c.x / 0.8);
         let ring2 = exp(-sq((r - r2) / 0.035)) * u.c.w * exp(-u.c.z / 0.8);
-        col += u.pal2.rgb * (ring1 + ring2) * 1.6 * smoothstep(0.0, 0.02, dr);
+        col += u.pal2.rgb * (ring1 + ring2) * 1.0 * smoothstep(0.0, 0.02, dr);
     }
 
     // ---- vignette, mode markers, tone map -------------------------------------------------------
