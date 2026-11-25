@@ -10,11 +10,19 @@
 #![deny(unsafe_code)]
 
 #[cfg(windows)]
+#[macro_use]
+mod wait;
+#[cfg(windows)]
+mod art;
+#[cfg(windows)]
 mod session;
+#[cfg(windows)]
+pub use art::decode_art;
 #[cfg(windows)]
 pub use session::NowPlayingWatcher;
 
 pub mod palette;
+pub mod synth;
 
 use std::time::{Duration, Instant};
 
@@ -22,6 +30,49 @@ use std::time::{Duration, Instant};
 pub const MAX_TEXT_CHARS: usize = 200;
 /// Maximum artwork payload accepted from a session (compressed image bytes).
 pub const MAX_ART_BYTES: usize = 4 * 1024 * 1024;
+/// Largest decoded artwork side kept (the decoder scales while decoding, so big images are never expanded).
+pub const MAX_ART_SIDE: u32 = 512;
+/// Largest claimed source image accepted for decoding (pixels); larger claims are refused as hostile.
+pub const MAX_ART_DECODE_PIXELS: u64 = 40_000_000;
+
+/// Decoded artwork: straight (non-premultiplied) RGBA8, row-major, at most `MAX_ART_SIDE` on a side.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ArtImage {
+    pub width: u32,
+    pub height: u32,
+    pub rgba: Vec<u8>,
+}
+
+impl ArtImage {
+    /// Box-filter downscale so the longest side is at most `max_side` (never upscales); used for palette
+    /// extraction. Returns `(rgba, w, h)`; empty for a malformed image.
+    pub fn thumbnail(&self, max_side: u32) -> (Vec<u8>, usize, usize) {
+        let (w, h) = (self.width as usize, self.height as usize);
+        if w == 0 || h == 0 || self.rgba.len() != w * h * 4 || max_side == 0 {
+            return (Vec::new(), 0, 0);
+        }
+        let step = w.max(h).div_ceil(max_side as usize).max(1);
+        let (tw, th) = (w.div_ceil(step), h.div_ceil(step));
+        let mut out = Vec::with_capacity(tw * th * 4);
+        for ty in 0..th {
+            for tx in 0..tw {
+                let mut acc = [0u32; 4];
+                let mut n = 0u32;
+                for y in ty * step..((ty + 1) * step).min(h) {
+                    for x in tx * step..((tx + 1) * step).min(w) {
+                        let i = (y * w + x) * 4;
+                        for c in 0..4 {
+                            acc[c] += u32::from(self.rgba[i + c]);
+                        }
+                        n += 1;
+                    }
+                }
+                out.extend(acc.map(|v| (v / n.max(1)) as u8));
+            }
+        }
+        (out, tw, th)
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PlaybackState {

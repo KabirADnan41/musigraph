@@ -18,32 +18,6 @@ use windows::Media::Control::{
 use windows::Storage::Streams::DataReader;
 use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx, CoUninitialize};
 
-/// Waits for a WinRT operation with a hard timeout (a stalled session must never hang the thread); yields
-/// `Option<T>`. AsyncStatus raw values: 0 started, 1 completed.
-macro_rules! wait {
-    ($op:expr) => {{
-        match $op.ok() {
-            None => None,
-            Some(op) => {
-                let deadline = Instant::now() + Duration::from_secs(3);
-                loop {
-                    match op.Status().map(|s| s.0) {
-                        Ok(1) => break op.GetResults().ok(),
-                        Ok(0) if Instant::now() < deadline => {
-                            std::thread::sleep(Duration::from_millis(5))
-                        }
-                        Ok(0) => {
-                            let _ = op.Cancel();
-                            break None;
-                        }
-                        _ => break None,
-                    }
-                }
-            }
-        }
-    }};
-}
-
 const POLL: Duration = Duration::from_millis(500);
 
 #[derive(Default)]
