@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/mg-dsp", "crates/mg-audio", "crates/mg-media", "crates/mg-gfx", "crates/mg-engine"]
+members = ["crates/mg-dsp", "crates/mg-audio", "crates/mg-media", "crates/mg-text", "crates/mg-gfx", "crates/mg-engine"]
 
 [workspace.package]
 version = "0.0.1"

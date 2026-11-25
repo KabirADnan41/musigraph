@@ -676,6 +676,7 @@ dependencies = [
  "mg-dsp",
  "mg-gfx",
  "mg-media",
+ "mg-text",
  "winit",
 ]
 
@@ -688,6 +689,13 @@ dependencies = [
 
 [[package]]
 name = "mg-media"
+version = "0.0.1"
+dependencies = [
+ "windows",
+]
+
+[[package]]
+name = "mg-text"
 version = "0.0.1"
 dependencies = [
  "windows",
