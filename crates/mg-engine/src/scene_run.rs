@@ -17,10 +17,11 @@ use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
 use winit::event::{ElementState, KeyEvent, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
-use winit::keyboard::{Key, NamedKey};
+use winit::keyboard::{Key, KeyCode, NamedKey, PhysicalKey};
 use winit::window::{Fullscreen, Window, WindowId};
 
 /// A minimised/occluded window is normal for a visualizer; only a very long stall is treated as failure.
+const CURSOR_HIDE_AFTER: Duration = Duration::from_secs(3);
 const MAX_SKIP_TIME: Duration = Duration::from_secs(30);
 
 #[derive(Debug, PartialEq)]
@@ -151,6 +152,8 @@ struct App {
     last_tick: Instant,
     last_seq: u64,
     last_change: Instant,
+    last_input: Instant,
+    cursor_hidden: bool,
     title: String,
     last_frame: Option<Instant>,
     intervals_ms: Vec<f64>,
@@ -197,8 +200,7 @@ impl ApplicationHandler for App {
             }
         };
         if self.opts.fullscreen {
-            window.set_fullscreen(Some(Fullscreen::Borderless(None)));
-            window.set_cursor_visible(false);
+            window.set_fullscreen(Some(Fullscreen::Borderless(window.current_monitor())));
         }
         let size = window.inner_size();
         let r = match self.opts.backend {
@@ -237,6 +239,7 @@ impl ApplicationHandler for App {
         self.start = Instant::now();
         self.last_tick = self.start;
         self.last_change = self.start;
+        self.last_input = self.start;
     }
 
     fn window_event(&mut self, el: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
@@ -251,6 +254,21 @@ impl ApplicationHandler for App {
                     },
                 ..
             } => el.exit(),
+            WindowEvent::KeyboardInput {
+                event:
+                    KeyEvent {
+                        physical_key: PhysicalKey::Code(KeyCode::KeyF),
+                        state: ElementState::Pressed,
+                        repeat: false,
+                        ..
+                    },
+                ..
+            } => {
+                self.opts.fullscreen = !self.opts.fullscreen;
+                self.apply_fullscreen();
+                self.touch_input();
+            }
+            WindowEvent::CursorMoved { .. } | WindowEvent::MouseInput { .. } => self.touch_input(),
             WindowEvent::Resized(s) => {
                 if let Some(g) = self.gpu.as_mut() {
                     g.resize(s.width, s.height);
@@ -262,6 +280,16 @@ impl ApplicationHandler for App {
     }
 
     fn about_to_wait(&mut self, el: &ActiveEventLoop) {
+        // Immersive mode: hide the cursor after inactivity; any mouse movement restores it.
+        if self.opts.fullscreen
+            && !self.cursor_hidden
+            && self.last_input.elapsed() > CURSOR_HIDE_AFTER
+        {
+            if let Some(w) = &self.window {
+                w.set_cursor_visible(false);
+                self.cursor_hidden = true;
+            }
+        }
         if self.window.is_some() && self.start.elapsed().as_secs() >= self.opts.seconds + 2 {
             self.timed_out = true;
             return el.exit();
@@ -273,6 +301,29 @@ impl ApplicationHandler for App {
 }
 
 impl App {
+    fn touch_input(&mut self) {
+        self.last_input = Instant::now();
+        if self.cursor_hidden {
+            if let Some(w) = &self.window {
+                w.set_cursor_visible(true);
+            }
+            self.cursor_hidden = false;
+        }
+    }
+
+    /// Borderless fullscreen on the monitor the window is on (never a maximised decorated window);
+    /// leaving restores the normal window, and Windows restores the taskbar by itself.
+    fn apply_fullscreen(&mut self) {
+        let Some(w) = &self.window else { return };
+        if self.opts.fullscreen {
+            w.set_fullscreen(Some(Fullscreen::Borderless(w.current_monitor())));
+        } else {
+            w.set_fullscreen(None);
+            w.set_cursor_visible(true);
+            self.cursor_hidden = false;
+        }
+    }
+
     fn frame(&mut self, el: &ActiveEventLoop) {
         let now = Instant::now();
         if self.start.elapsed().as_secs() >= self.opts.seconds {
@@ -438,6 +489,8 @@ pub fn run(opts: SceneOpts) -> i32 {
         last_tick: Instant::now(),
         last_seq: 0,
         last_change: Instant::now(),
+        last_input: Instant::now(),
+        cursor_hidden: false,
         title: String::new(),
         last_frame: None,
         intervals_ms: Vec::new(),
