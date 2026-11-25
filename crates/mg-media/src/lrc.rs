@@ -85,59 +85,76 @@ fn leading_tags(line: &str) -> (Vec<&str>, &str) {
     (tags, rest)
 }
 
-/// Splits enhanced `<mm:ss.xx>word` markup into words; returns (plain text, words with timing).
+/// Longest lyric text examined per line (bytes); the rest is dropped before any scanning (hostile input).
+const MAX_LINE_BYTES: usize = 2048;
+
+/// Cuts `s` to at most `max` bytes on a character boundary.
+fn truncate_boundary(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut i = max;
+    while !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    &s[..i]
+}
+
+/// Splits enhanced `<mm:ss.xx>word` markup; returns (plain text, words with timing). Segments are joined
+/// exactly as written (syllable-timed files such as `<t>こん<t>にち<t>は` stay one word, no spaces are added).
+/// Word timing is trusted only when the line has no text before the first tag, no malformed tag and the
+/// times never run backwards; otherwise the line is line-level only. Scanning is linear: a `<` looks at most
+/// 16 characters ahead for its `>`.
 fn split_words(text: &str, offset: f64) -> (String, Vec<LyricWord>) {
+    let text = truncate_boundary(text, MAX_LINE_BYTES);
     if !text.contains('<') {
         return (sanitize_text(text), Vec::new());
     }
-    let mut words = Vec::new();
-    let mut plain = String::new();
-    let mut cur_time: Option<f64> = None;
-    let mut buf = String::new();
-    let flush = |t: Option<f64>, b: &mut String, plain: &mut String, words: &mut Vec<LyricWord>| {
-        let w = sanitize_text(b);
-        if !w.is_empty() {
-            if !plain.is_empty() {
-                plain.push(' ');
-            }
-            plain.push_str(&w);
-            if let Some(t) = t {
-                words.push(LyricWord {
-                    start_s: (t + offset).max(0.0),
-                    text: w,
-                });
-            }
-        }
-        b.clear();
-    };
+    let mut segs: Vec<(Option<f64>, String)> = vec![(None, String::new())];
+    let mut malformed = false;
     let mut rest = text;
     while let Some(i) = rest.find('<') {
-        buf.push_str(&rest[..i]);
+        if let Some(s) = segs.last_mut() {
+            s.1.push_str(&rest[..i]);
+        }
         let after = &rest[i + 1..];
-        match after
-            .find('>')
-            .and_then(|e| parse_time(&after[..e]).map(|t| (t, e)))
-        {
+        let close = after
+            .char_indices()
+            .take(16)
+            .find(|(_, c)| *c == '>')
+            .map(|(e, _)| e);
+        match close.and_then(|e| parse_time(&after[..e]).map(|t| (t, e))) {
             Some((t, e)) => {
-                flush(cur_time, &mut buf, &mut plain, &mut words);
-                cur_time = Some(t);
+                segs.push((Some(t), String::new()));
                 rest = &after[e + 1..];
             }
             None => {
-                buf.push('<');
+                malformed = true;
+                if let Some(s) = segs.last_mut() {
+                    s.1.push('<');
+                }
                 rest = after;
             }
         }
     }
-    buf.push_str(rest);
-    flush(cur_time, &mut buf, &mut plain, &mut words);
-    // Word timing is only trusted when EVERY word has a timestamp and they do not run backwards.
-    let plain_words = plain.split(' ').filter(|w| !w.is_empty()).count();
-    let monotonic = words.windows(2).all(|w| w[1].start_s >= w[0].start_s);
-    if words.len() != plain_words || !monotonic {
-        words.clear();
+    if let Some(s) = segs.last_mut() {
+        s.1.push_str(rest);
     }
-    (plain, words)
+    let plain = sanitize_text(&segs.iter().map(|s| s.1.as_str()).collect::<String>());
+    let words: Vec<LyricWord> = segs
+        .iter()
+        .skip(1)
+        .filter_map(|(t, s)| {
+            let w = sanitize_text(s);
+            (!w.is_empty()).then(|| LyricWord {
+                start_s: (t.unwrap_or(0.0) + offset).max(0.0),
+                text: w,
+            })
+        })
+        .collect();
+    let monotonic = words.windows(2).all(|w| w[1].start_s >= w[0].start_s);
+    let trusted = !malformed && monotonic && segs[0].1.trim().is_empty() && !words.is_empty();
+    (plain, if trusted { words } else { Vec::new() })
 }
 
 /// Parses a `.lrc` file's bytes.
@@ -177,12 +194,12 @@ pub fn parse(bytes: &[u8]) -> Result<Lyrics, LrcError> {
         if times.is_empty() {
             continue;
         }
+        let (plain, words) = split_words(rest, -offset_s);
         for t in times {
-            let (plain, words) = split_words(rest, -offset_s);
             lines.push(LyricLine {
                 start_s: (t - offset_s).max(0.0),
-                text: plain,
-                words,
+                text: plain.clone(),
+                words: words.clone(),
             });
             if lines.len() >= MAX_LINES {
                 break;
@@ -302,11 +319,17 @@ pub fn find(dir: &Path, title: &str, artist: &str) -> Option<PathBuf> {
 
 /// Reads and parses a lyrics file (bounded). `None` when it cannot be read or parsed.
 pub fn load(path: &Path) -> Option<Lyrics> {
-    let meta = std::fs::metadata(path).ok()?;
-    if !meta.is_file() || meta.len() > MAX_LRC_BYTES as u64 {
+    use std::io::Read;
+    // Open once, check the OPEN file, and read at most the limit (no check-then-read race on a growing file).
+    let file = std::fs::File::open(path).ok()?;
+    if !file.metadata().ok()?.is_file() {
         return None;
     }
-    parse(&std::fs::read(path).ok()?).ok()
+    let mut bytes = Vec::new();
+    file.take(MAX_LRC_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    parse(&bytes).ok()
 }
 
 #[cfg(test)]
@@ -423,5 +446,32 @@ mod tests {
         assert!(find(&dir.join("missing"), "x", "y").is_none());
         assert!(load(&f).is_some());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_hostile_line_is_cut_and_scanned_in_linear_time() {
+        // 500 KB of '<' with no '>' (and a ':' near the start): must not go quadratic
+        let line = format!("[00:00.00]a:b{}", "<".repeat(500_000));
+        let t0 = std::time::Instant::now();
+        let l = parse(line.as_bytes()).unwrap();
+        assert!(t0.elapsed().as_millis() < 500, "took {:?}", t0.elapsed());
+        assert!(l.lines[0].text.chars().count() <= 200);
+        // many time tags on one hostile line: the text is processed once, not once per tag
+        let many = format!("{}{}", "[00:01.00]".repeat(16), "<00:01.00>x ".repeat(5000));
+        let t0 = std::time::Instant::now();
+        assert!(parse(many.as_bytes()).is_ok());
+        assert!(t0.elapsed().as_millis() < 500, "took {:?}", t0.elapsed());
+    }
+
+    #[test]
+    fn syllable_timed_words_keep_the_text_exactly_as_written() {
+        let l = parse("[00:01.00]<00:01.00>こん<00:01.30>にち<00:01.60>は\n[00:05.00]<00:05.00>আমি <00:05.40>তোমাকে\n".as_bytes()).unwrap();
+        assert_eq!(l.lines[0].text, "こんにちは", "no spaces invented");
+        assert_eq!(l.lines[0].words.len(), 3);
+        assert_eq!(l.lines[1].text, "আমি তোমাকে");
+        assert_eq!(l.lines[1].words.len(), 2);
+        // text before the first tag, or a malformed tag, means line-level only
+        let l = parse(b"[00:01.00]lead <00:01.50>word\n[00:03.00]<00:03.00>a <bad b\n").unwrap();
+        assert!(l.lines[0].words.is_empty() && l.lines[1].words.is_empty());
     }
 }

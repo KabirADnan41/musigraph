@@ -180,3 +180,11 @@ Diagnosis (Opus Medium consultation, verified in code): bands were normalised to
 - Self-test: composes lyrics for the first three demo albums in every scene/layout and fails if none are drawn; PNGs inspected (Latin and Bangla lines, current bright / next dim, clear of the artwork corner).
 - Verification: fmt, clippy -D warnings, cargo test --workspace --locked pass; self-test ok on vulkan, dx12, gl; windowed demo run with scene tour (45 s, GT 730): 9136 frames, 0 skipped, p99 9.7 ms.
 - Limits: word-by-word highlighting is parsed (`Lyrics::has_word_timing`) but NOT drawn yet (line-level first, as specified); RTL-only lines are shaped by DirectWrite but centred, not RTL-aligned; lyrics are matched by title/artist from the media session, so an unmatched or differently spelled name shows nothing (by design, no fuzzy guessing).
+
+## 2026-11-25 - Review fixes for Stage F1/F2 and E1 fixes (verdict CHANGES REQUIRED, Sonnet High)
+- HIGH fixed (untrusted input bound): enhanced-LRC word splitting was quadratic on a hostile line (`rest.find('<')` + `find('>')` over the whole tail, repeated per time tag). Now: each line's text is cut to 2 KiB before scanning, a `<` looks at most 16 characters ahead for its `>`, and the line is split ONCE (not per time tag). Test: 500 KB of `<` and 16 tags x 5000 words parse in < 0.5 s.
+- MEDIUM fixed: syllable/character-timed lyrics (`<t>こん<t>にち<t>は`) no longer get spaces inserted; segments are joined as written. Word timing is trusted only with no text before the first tag, no malformed tag and monotonic times.
+- MEDIUM fixed: a width-only window change now re-renders lyric lines (size tracked as (w, h), 15% rule per axis).
+- MEDIUM fixed: lyric line cache is evicted (kept to cursor +-3 once it exceeds 12 entries); test scrubs a 400-line file and checks the bound.
+- LOW fixed: the previous line is no longer requested/rendered (its already uploaded texture just fades out); `load()` opens once, checks the open file and reads at most the limit (no check-then-read race).
+- Documented limits (not changed): identical timestamps show only the last line; UTF-16 .lrc files are refused (UTF-8 only); a leading non-time `[tag]` in text is treated as a header tag; equal-rank filename matches depend on directory order.

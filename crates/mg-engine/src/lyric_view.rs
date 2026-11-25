@@ -54,7 +54,8 @@ pub struct LyricView {
     slots: [Slot; 3],
     /// Vertical position of the current line as a fraction of the window height (set per scene).
     anchor: f32,
-    for_height: u32,
+    /// Window size the cached line bitmaps were rendered for.
+    for_size: (u32, u32),
 }
 
 /// Pixel size of lyric text for a window height.
@@ -78,7 +79,7 @@ impl LyricView {
             requested: HashSet::new(),
             slots: Default::default(),
             anchor: 0.72,
-            for_height: 0,
+            for_size: (0, 0),
         }
     }
 
@@ -155,7 +156,10 @@ impl LyricView {
             return [None; 3];
         }
         // a resized window needs the lines at a new pixel size
-        if self.for_height != 0 && (h / self.for_height as f32 - 1.0).abs() > 0.15 {
+        let moved = |now: u32, then: u32| (now as f32 / then.max(1) as f32 - 1.0).abs() > 0.15;
+        if self.for_size != (0, 0)
+            && (moved(surface.0, self.for_size.0) || moved(surface.1, self.for_size.1))
+        {
             self.cache.clear();
             self.requested.clear();
             self.serial += 1;
@@ -168,10 +172,15 @@ impl LyricView {
             _ => None,
         };
         let (cur, next) = cursor.map_or((None, None), |c| (c.current, c.next));
-        let prev = cur.and_then(|c| c.checked_sub(1));
+        // keep memory bounded when a long file is played or scrubbed through: only lines near the cursor stay
+        if self.cache.len() > 12 {
+            let c = cur.or(next).unwrap_or(0);
+            self.cache.retain(|&k, _| k.abs_diff(c) <= 3);
+            self.requested.retain(|&k| k.abs_diff(c) <= 3);
+        }
         // request and place the lines that matter right now
         if let (Some(lyr), Some(track)) = (self.lyrics.clone(), self.track) {
-            for idx in [cur, next, prev].into_iter().flatten() {
+            for idx in [cur, next].into_iter().flatten() {
                 if self.cache.contains_key(&idx) || self.requested.contains(&idx) {
                     continue;
                 }
@@ -180,7 +189,7 @@ impl LyricView {
                     self.cache.insert(idx, None); // instrumental gap: nothing to draw
                 } else {
                     self.requested.insert(idx);
-                    self.for_height = surface.1;
+                    self.for_size = surface;
                     jobs.push(Job::Line {
                         track_id: track,
                         serial: self.serial,
@@ -191,7 +200,7 @@ impl LyricView {
                     });
                 }
             }
-            for idx in [cur, next, prev].into_iter().flatten() {
+            for idx in [cur, next].into_iter().flatten() {
                 let s = idx % 3;
                 let slot = &mut self.slots[s];
                 let same = slot.line == Some(idx);
@@ -489,5 +498,75 @@ mod tests {
                 assert!(d.y >= 0.0 && d.y + d.h <= h as f32 + 2.0, "{w}x{h} y {d:?}");
             }
         }
+    }
+
+    #[test]
+    fn a_width_only_change_re_renders_the_lines_at_the_new_size() {
+        let mut r = Rig::new();
+        r.run(13.0, 1.0, false);
+        let serial = r.v.serial;
+        // same height, much narrower window (e.g. a snap): lines must be requested again
+        r.v.set_position(Some(13.0));
+        r.v.update(1.0 / 60.0, (900, 1080), &mut r.ops, &mut r.jobs);
+        assert!(
+            r.v.serial > serial,
+            "width change must invalidate the cached lines"
+        );
+        assert!(
+            r.jobs
+                .iter()
+                .any(|j| matches!(j, Job::Line { max_width, .. } if *max_width <= 720))
+        );
+    }
+
+    #[test]
+    fn scrubbing_a_long_file_keeps_the_cache_bounded() {
+        let long: String = (0..400)
+            .map(|i| format!("[{:02}:{:02}.00]line {i}\n", i / 60, i % 60))
+            .collect();
+        let mut v = LyricView::new(LyricSource::Demo);
+        let mut jobs = Vec::new();
+        v.on_track(Some(1), "T", "A", &mut jobs);
+        v.on_ready(Ready::Lyrics {
+            track_id: 1,
+            lyrics: Some(Arc::new(mg_media::lrc::parse(long.as_bytes()).unwrap())),
+        });
+        let mut ops = Vec::new();
+        for step in 0..400 {
+            v.set_position(Some(step as f64 + 0.5));
+            v.update(1.0 / 60.0, SURF, &mut ops, &mut jobs);
+            for j in std::mem::take(&mut jobs) {
+                if let Job::Line {
+                    track_id,
+                    serial,
+                    idx,
+                    ..
+                } = j
+                {
+                    v.on_ready(Ready::Line {
+                        track_id,
+                        serial,
+                        idx,
+                        bitmap: Some(bmp()),
+                    });
+                }
+            }
+            assert!(v.cache.len() <= 20, "cache grew to {}", v.cache.len());
+        }
+    }
+
+    #[test]
+    fn content_of_the_previous_track_is_never_shown_as_current_after_a_track_change() {
+        let mut r = Rig::new();
+        r.run(6.0, 1.5, false);
+        let mut jobs = Vec::new();
+        r.v.on_track(Some(8), "Other", "A", &mut jobs);
+        r.v.on_ready(Ready::Lyrics {
+            track_id: 8,
+            lyrics: Some(lyrics()),
+        });
+        let o = r.run(6.0, 0.05, false);
+        // right after the change the old line may still be fading, but never at full brightness again
+        assert!(o.iter().flatten().all(|d| d.alpha < 1.0));
     }
 }
