@@ -6,10 +6,13 @@
 //! arrives (capture failed or stalled) the scene decays to silence and shows the NO AUDIO state, and the
 //! window title says so. Samples are never stored or logged (ADR-0003).
 
+use crate::media_feed::MediaFeed;
+use crate::presentation::{GpuOp, Layout, Presentation, Worker, apply_album};
 use crate::scene_map::{Input, MapTuning, SceneMapper};
 use mg_audio::capture::Loopback;
 use mg_dsp::{AnalysisParams, Analyzer, AudioFrame};
 use mg_gfx::context::{BackendChoice, FrameStatus, Gpu};
+use mg_gfx::overlay::Overlay;
 use mg_gfx::scene::{SceneMode, SpectrumScene};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -36,6 +39,16 @@ pub enum Source {
     Synth(String),
 }
 
+/// Where song information comes from.
+#[derive(Debug, PartialEq, Clone, Copy)]
+pub enum MediaChoice {
+    /// Live runs read the Windows media session; synthetic runs show nothing.
+    Auto,
+    Off,
+    /// Original demo tracks with generated artwork (previews and tests).
+    Demo,
+}
+
 #[derive(Debug, PartialEq)]
 pub struct SceneOpts {
     pub backend: Option<BackendChoice>,
@@ -44,6 +57,8 @@ pub struct SceneOpts {
     pub vsync: bool,
     pub scale: f32,
     pub source: Source,
+    pub media: MediaChoice,
+    pub layout: Layout,
 }
 
 pub fn parse(args: &[String], source: Source) -> Result<SceneOpts, String> {
@@ -54,12 +69,24 @@ pub fn parse(args: &[String], source: Source) -> Result<SceneOpts, String> {
         vsync: true,
         scale: 1.0,
         source,
+        media: MediaChoice::Auto,
+        layout: Layout::Corner,
     };
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
             "--windowed" => o.fullscreen = false,
             "--fullscreen" => o.fullscreen = true,
+            "--no-media" => o.media = MediaChoice::Off,
+            "--demo-media" => o.media = MediaChoice::Demo,
+            "--layout" => {
+                o.layout = match it.next().map(String::as_str) {
+                    Some("corner") => Layout::Corner,
+                    Some("center") => Layout::Center,
+                    Some("off") => Layout::Off,
+                    _ => return Err("--layout needs corner|center|off".into()),
+                }
+            }
             "--backend" => {
                 o.backend = match it.next().map(String::as_str) {
                     Some("auto") => None,
@@ -152,6 +179,11 @@ struct App {
     mapper: SceneMapper,
     stale_after: Duration,
     scene: Option<SpectrumScene>,
+    overlay: Option<Overlay>,
+    media: MediaFeed,
+    pres: Presentation,
+    worker: Worker,
+    last_media_poll: Option<Instant>,
     gpu: Option<Gpu>,
     window: Option<Arc<Window>>,
     start: Instant,
@@ -236,6 +268,7 @@ impl ApplicationHandler for App {
                     gpu.config.format,
                     self.opts.scale,
                 ));
+                self.overlay = Some(Overlay::new(&gpu.device, &gpu.queue, gpu.config.format));
                 self.gpu = Some(gpu);
             }
             Err(e) => {
@@ -282,6 +315,23 @@ impl ApplicationHandler for App {
             } if toggle_allowed(self.mods) => {
                 self.opts.fullscreen = !self.opts.fullscreen;
                 self.apply_fullscreen();
+                self.touch_input();
+            }
+            WindowEvent::KeyboardInput {
+                event:
+                    KeyEvent {
+                        physical_key: PhysicalKey::Code(KeyCode::KeyL),
+                        state: ElementState::Pressed,
+                        repeat: false,
+                        ..
+                    },
+                ..
+            } if toggle_allowed(self.mods) => {
+                let surface = self
+                    .gpu
+                    .as_ref()
+                    .map_or((0, 0), |g| (g.config.width, g.config.height));
+                self.pres.set_layout(self.pres.layout().next(), surface);
                 self.touch_input();
             }
             WindowEvent::CursorMoved { .. } | WindowEvent::MouseInput { .. } => self.touch_input(),
@@ -376,7 +426,7 @@ impl App {
             Source::Synth(_) => SceneMode::Synthetic,
         };
         let default_frame = AudioFrame::default();
-        let params = self.mapper.update(
+        let mut params = self.mapper.update(
             &Input {
                 frame: frame.as_ref().unwrap_or(&default_frame),
                 onsets,
@@ -385,6 +435,36 @@ impl App {
                 mode,
             },
             dt as f32,
+        );
+        // Song information: polled a few times a second, decoded off-thread, applied when ready.
+        let surface = self
+            .gpu
+            .as_ref()
+            .map_or((0, 0), |g| (g.config.width, g.config.height));
+        if self
+            .last_media_poll
+            .is_none_or(|t| now.duration_since(t) >= Duration::from_millis(250))
+        {
+            self.last_media_poll = Some(now);
+            let np = self.media.poll(now);
+            self.pres.on_now_playing(np.as_ref(), surface);
+        }
+        for job in self.pres.take_jobs() {
+            self.worker.submit(job);
+        }
+        while let Some(r) = self.worker.try_recv() {
+            self.pres.on_ready(r);
+        }
+        let mut overlay_params = self
+            .pres
+            .update(dt as f32, surface, params.energy, params.swell);
+        overlay_params.time = params.time;
+        let (album, album_w) = self.pres.album();
+        apply_album(
+            &mut params.palette,
+            &album,
+            album_w,
+            0.85 + 0.30 * params.energy,
         );
         let label = self.label(fresh);
         if label != self.title {
@@ -404,7 +484,27 @@ impl App {
             self.result = Err(format!("wgpu error: {e}"));
             return el.exit();
         }
-        match scene.render(g, &params) {
+        if let Some(ov) = self.overlay.as_mut() {
+            for op in self.pres.take_ops() {
+                match op {
+                    GpuOp::SetArt(img) => {
+                        ov.set_art(&g.device, &g.queue, (img.width, img.height), &img.rgba);
+                    }
+                    GpuOp::ClearArt => ov.clear_art(&g.device),
+                    GpuOp::SetText(i, b) => {
+                        ov.set_text(&g.device, &g.queue, i, (b.width, b.height), &b.coverage);
+                    }
+                    GpuOp::ClearText(i) => ov.clear_text(&g.device, i),
+                }
+            }
+        }
+        let queue = g.queue.clone();
+        let overlay = self.overlay.as_ref();
+        match scene.render_with(g, &params, |enc, view| {
+            if let Some(ov) = overlay {
+                ov.draw(&queue, enc, view, &overlay_params);
+            }
+        }) {
             Ok(FrameStatus::Presented) => {
                 if let Some(prev) = self.last_frame {
                     self.intervals_ms
@@ -491,6 +591,15 @@ pub fn run(opts: SceneOpts) -> i32 {
         }
     };
     event_loop.set_control_flow(ControlFlow::Poll);
+    let media = match (opts.media, &opts.source) {
+        (MediaChoice::Demo, _) => MediaFeed::demo(),
+        (MediaChoice::Auto, Source::Live) => MediaFeed::live().unwrap_or_else(|e| {
+            eprintln!("now-playing unavailable: {e}");
+            MediaFeed::Off
+        }),
+        _ => MediaFeed::Off,
+    };
+    let layout = opts.layout;
     let tune = MapTuning::default();
     let stale_after = Duration::from_secs_f32(tune.stale_after_s);
     let mut app = App {
@@ -501,6 +610,11 @@ pub fn run(opts: SceneOpts) -> i32 {
         mapper: SceneMapper::new(tune),
         stale_after,
         scene: None,
+        overlay: None,
+        media,
+        pres: Presentation::new(layout),
+        worker: Worker::start(),
+        last_media_poll: None,
         gpu: None,
         window: None,
         start: Instant::now(),

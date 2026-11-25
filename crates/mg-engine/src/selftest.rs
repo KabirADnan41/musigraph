@@ -78,6 +78,128 @@ fn max_delta_100ms(lum: &[f32]) -> f32 {
         .fold(0.0, f32::max)
 }
 
+/// Composes the real presentation pipeline (demo tracks -> decode -> palette -> text bitmaps -> overlay) over
+/// a rendered scene, headless. Checks that artwork and text appear, that different albums give different
+/// colour themes, and (with `MG_SCENE_DUMP=<dir>`) writes PNGs for visual inspection. Returns whether a GPU
+/// was available.
+fn presentation_previews(failures: &mut Vec<String>) -> bool {
+    use crate::media_feed::demo_tracks;
+    use crate::presentation::{
+        GpuOp, Layout, Presentation, apply_album, process_art, process_text,
+    };
+    use mg_gfx::overlay::Overlay;
+    let Ok(h) = headless() else { return false };
+    let Some((_guard, text)) = mg_text::TextRenderer::new() else {
+        failures.push("presentation: DirectWrite unavailable".into());
+        return true;
+    };
+    let res = (960u32, 540u32);
+    let x = fixture("demo", SR).expect("demo fixture");
+    let ticks = Sim::new(SR, FPS, MapTuning::default()).run(&x[..x.len().min(SR as usize * 12)]);
+    let base_params = ticks.last().expect("ticks").params.clone();
+    let scene = SpectrumScene::new_headless(&h.device);
+    let dump = std::env::var("MG_SCENE_DUMP").ok();
+    let mut themes: Vec<(String, [f32; 3])> = Vec::new();
+    for layout in [Layout::Corner, Layout::Center] {
+        for (i, n) in demo_tracks().iter().enumerate() {
+            let mut ov = Overlay::new_headless(&h.device, &h.queue);
+            let mut pres = Presentation::new(layout);
+            pres.on_now_playing(Some(n), res);
+            for job in pres.take_jobs() {
+                let r = match job {
+                    crate::presentation::Job::Art { track_id, bytes } => {
+                        process_art(track_id, &bytes)
+                    }
+                    crate::presentation::Job::Text(t) => process_text(&text, &t),
+                };
+                pres.on_ready(r);
+            }
+            let mut last = None;
+            for _ in 0..300 {
+                last = Some(pres.update(1.0 / 60.0, res, base_params.energy, base_params.swell));
+                for op in pres.take_ops() {
+                    match op {
+                        GpuOp::SetArt(a) => {
+                            ov.set_art(&h.device, &h.queue, (a.width, a.height), &a.rgba);
+                        }
+                        GpuOp::ClearArt => ov.clear_art(&h.device),
+                        GpuOp::SetText(k, b) => {
+                            ov.set_text(&h.device, &h.queue, k, (b.width, b.height), &b.coverage);
+                        }
+                        GpuOp::ClearText(k) => ov.clear_text(&h.device, k),
+                    }
+                }
+            }
+            let op = last.expect("frames");
+            let mut p = base_params.clone();
+            let (album, w) = pres.album();
+            apply_album(&mut p.palette, &album, w, 0.85 + 0.30 * p.energy);
+            let bare = scene.render_offscreen(&h.device, &h.queue, res, &p);
+            let img = scene.render_offscreen_with(&h.device, &h.queue, res, &p, &|enc, view| {
+                ov.draw(&h.queue, enc, view, &op)
+            });
+            let (Ok(bare), Ok(img)) = (bare, img) else {
+                failures.push(format!("presentation {layout:?}/{i}: render failed"));
+                continue;
+            };
+            let changed = img.iter().zip(&bare).filter(|(a, b)| a != b).count();
+            if n.art.is_some() && op.art.is_none() {
+                failures.push(format!("presentation {layout:?}/{i}: artwork not shown"));
+            }
+            if op.title.is_none() || changed < 300 {
+                failures.push(format!(
+                    "presentation {layout:?}/{i}: title/text not drawn (changed bytes {changed})"
+                ));
+            }
+            // mean colour of the bar band: the album theme as it actually renders
+            let (mut s, mut cnt) = ([0.0f32; 3], 0.0f32);
+            for y in 200..300u32 {
+                for xx in 300..660u32 {
+                    let k = ((y * res.0 + xx) * 4) as usize;
+                    for c in 0..3 {
+                        s[c] += f32::from(bare[k + c]);
+                    }
+                    cnt += 1.0;
+                }
+            }
+            let m = s.map(|v| v / cnt / 255.0);
+            if layout == Layout::Corner {
+                themes.push((format!("track {i}"), m));
+            }
+            println!(
+                "PRESENT {layout:?} track {i}: art={} title={} artist={} changed_bytes={changed} mean_rgb=({:.3},{:.3},{:.3})",
+                op.art.is_some(),
+                op.title.is_some(),
+                op.artist.is_some(),
+                m[0],
+                m[1],
+                m[2]
+            );
+            if let Some(dir) = &dump {
+                let png = mg_media::synth::png_rgba(res.0, res.1, &img);
+                let _ = std::fs::write(
+                    format!("{dir}/present-{layout:?}-{i}.png").to_lowercase(),
+                    png,
+                );
+            }
+        }
+    }
+    for a in 0..4 {
+        for b in a + 1..4 {
+            let d: f32 = (0..3)
+                .map(|c| (themes[a].1[c] - themes[b].1[c]).abs())
+                .sum();
+            if d < 0.02 {
+                failures.push(format!(
+                    "{} and {} render with nearly the same colour theme ({d:.3})",
+                    themes[a].0, themes[b].0
+                ));
+            }
+        }
+    }
+    true
+}
+
 pub fn run(allow_no_gpu: bool) -> i32 {
     let mut failures = Vec::new();
     let mut gpu_seen = false;
@@ -193,6 +315,7 @@ pub fn run(allow_no_gpu: bool) -> i32 {
         }
         let _ = SLOTS;
     }
+    gpu_seen |= presentation_previews(&mut failures);
     if !gpu_seen {
         println!(
             "NOTE: no hardware GPU device available; rendered-pixel checks were NOT run (parameter checks ran)."

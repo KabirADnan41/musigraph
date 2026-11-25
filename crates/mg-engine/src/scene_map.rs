@@ -257,10 +257,13 @@ impl SceneMapper {
         let b = (0.5 - 0.9 * self.song_tilt).clamp(0.0, 1.0); // 0 = bass-heavy endpoint, 1 = bright endpoint
         let k = 0.85 + 0.30 * s;
         let mix3 = |a: [f32; 3], c: [f32; 3]| [0, 1, 2].map(|i| (a[i] + (c[i] - a[i]) * b) * k);
+        let body = mix3([0.114, 0.480, 0.546], [0.275, 0.392, 0.871]);
+        let accent = mix3([0.888, 0.552, 0.266], [0.871, 0.254, 0.323]);
         let palette = [
             mix3([0.020, 0.120, 0.160], [0.030, 0.060, 0.180]),
-            mix3([0.114, 0.480, 0.546], [0.275, 0.392, 0.871]),
-            mix3([0.888, 0.552, 0.266], [0.871, 0.254, 0.323]),
+            body,
+            accent,
+            [0, 1, 2].map(|i| 0.5 * (body[i] + accent[i])),
         ];
 
         // ---- fast: onset impulses (real onsets only; refractory; capped) -------------------------

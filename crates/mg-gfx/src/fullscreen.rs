@@ -189,6 +189,16 @@ impl FullscreenRenderer {
 
     /// Draws one frame with the caller-packed uniform (`uniform.len()` must equal the declared size).
     pub fn render(&mut self, gpu: &mut Gpu, uniform: &[u8]) -> Result<FrameStatus, String> {
+        self.render_with(gpu, uniform, |_, _| {})
+    }
+
+    /// Like `render`, then lets `post` record more passes on the surface view (overlays) in the same submission.
+    pub fn render_with<F: FnOnce(&mut wgpu::CommandEncoder, &wgpu::TextureView)>(
+        &mut self,
+        gpu: &mut Gpu,
+        uniform: &[u8],
+        post: F,
+    ) -> Result<FrameStatus, String> {
         if uniform.len() != self.uniform_len {
             return Err(format!(
                 "uniform is {} bytes, shader expects {}",
@@ -212,6 +222,7 @@ impl FullscreenRenderer {
                 blit.set_bind_group(0, &t.bind_group, &[]);
                 blit.draw(0..3, 0..1);
             }
+            post(enc, surface_view);
         })
     }
 
@@ -224,6 +235,19 @@ impl FullscreenRenderer {
         w: u32,
         h: u32,
         uniform: &[u8],
+    ) -> Result<Vec<u8>, String> {
+        self.render_offscreen_with(device, queue, w, h, uniform, &|_, _| {})
+    }
+
+    /// `render_offscreen` plus a `post` hook that records extra passes (overlays) before the readback.
+    pub fn render_offscreen_with(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        w: u32,
+        h: u32,
+        uniform: &[u8],
+        post: &dyn Fn(&mut wgpu::CommandEncoder, &wgpu::TextureView),
     ) -> Result<Vec<u8>, String> {
         if uniform.len() != self.uniform_len {
             return Err("uniform size mismatch".into());
@@ -260,6 +284,7 @@ impl FullscreenRenderer {
             pass.set_bind_group(0, &self.bind_group, &[]);
             pass.draw(0..3, 0..1);
         }
+        post(&mut enc, &view);
         enc.copy_texture_to_buffer(
             wgpu::TexelCopyTextureInfo {
                 texture: &tex,

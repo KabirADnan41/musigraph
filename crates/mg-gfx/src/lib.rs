@@ -2,6 +2,7 @@
 
 pub mod context;
 pub mod fullscreen;
+pub mod overlay;
 pub mod report;
 pub mod scene;
 pub mod stress;

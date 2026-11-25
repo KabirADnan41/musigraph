@@ -3,7 +3,9 @@
 //! Options: `--backend dx12|vulkan|gl` `--seconds N` `--fullscreen` `--vsync on|off` `--scale F` (bench).
 
 mod levels;
+mod media_feed;
 mod nowplaying;
+mod presentation;
 mod scene_map;
 mod scene_run;
 mod selftest;

@@ -20,6 +20,7 @@ struct U {
     pal0: vec4<f32>, // haze / base (w = dust phase 0..1)
     pal1: vec4<f32>, // bar body
     pal2: vec4<f32>, // accent / tips
+    pal3: vec4<f32>, // secondary (haze tint, curtain)
     bars: array<vec4<f32>, 24>,
     peaks: array<vec4<f32>, 24>,
     bright: array<vec4<f32>, 24>,
@@ -89,7 +90,7 @@ fn spectrum(x: f32, d: f32, glow: f32) -> vec3<f32> {
     var col = vec3<f32>(0.0);
     // light curtain under the envelope: soft fill that brightens toward the horizon
     let curtain = (1.0 - smoothstep(0.0, env_h + 0.03, d)) * step(0.0, d);
-    col += u.pal1.rgb * curtain * (0.05 + 0.10 * glow) * smoothstep(0.0, 0.04, env_h);
+    col += mix(u.pal1.rgb, u.pal3.rgb, 0.5) * curtain * (0.05 + 0.10 * glow) * smoothstep(0.0, 0.04, env_h);
     // envelope line and halo
     col += u.pal2.rgb * (1.0 - smoothstep(0.0012, 0.0045, abs(d - env_h))) * 0.55 * smoothstep(0.004, 0.05, env_h);
     col += u.pal2.rgb * exp(-abs(d - env_h) * 22.0) * 0.20 * glow * smoothstep(0.004, 0.08, env_h);
@@ -161,7 +162,7 @@ fn fs(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
     haze_amt *= 1.0 + 0.25 * swell * exp(-sq((p.y - yh) / 0.15));   // bass bloom near the horizon
     let below = step(yh, p.y);
     haze_amt *= mix(1.0, 0.45, below);
-    col += mix(u.pal0.rgb, u.pal2.rgb, 0.25 + 0.2 * u.b.x) * haze_amt * mix(0.35, 0.95, sky_t);
+    col += mix(u.pal0.rgb, mix(u.pal3.rgb, u.pal2.rgb, 0.3), 0.25 + 0.2 * u.b.x) * haze_amt * mix(0.35, 0.95, sky_t);
     // horizon glow, lifted by the bass swell
     col += u.pal0.rgb * exp(-abs(p.y - yh) * 13.0) * (0.22 + 0.55 * swell);
     // hot horizon line: breathes at idle, brightens a little on real onsets (ring amplitude), never recolours

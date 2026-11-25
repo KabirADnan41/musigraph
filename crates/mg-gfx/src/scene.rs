@@ -11,7 +11,7 @@ use crate::fullscreen::FullscreenRenderer;
 pub const SLOTS: usize = 96;
 const VEC4S: usize = SLOTS / 4;
 /// Bytes of the packed uniform block (must equal the WGSL `U` struct size).
-pub const UNIFORM_BYTES: usize = 16 + 16 + 16 + 16 + 48 + 3 * VEC4S * 16;
+pub const UNIFORM_BYTES: usize = 16 + 16 + 16 + 16 + 64 + 3 * VEC4S * 16;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum SceneMode {
@@ -38,8 +38,8 @@ pub struct SceneParams {
     pub dust: f32,
     /// Two impulse rings: (age in seconds, amplitude).
     pub rings: [[f32; 2]; 2],
-    /// Linear RGB: haze/base, bar body, accent.
-    pub palette: [[f32; 3]; 3],
+    /// Linear RGB roles: haze/base, bar body, accent/tips, secondary (haze tint and curtain).
+    pub palette: [[f32; 3]; 4],
     pub mode: SceneMode,
     pub bars: [f32; SLOTS],
     pub peaks: [f32; SLOTS],
@@ -59,7 +59,12 @@ impl Default for SceneParams {
             scroll: [0.0, 0.0],
             dust: 0.0,
             rings: [[100.0, 0.0]; 2],
-            palette: [[0.08, 0.16, 0.36], [0.10, 0.45, 0.60], [0.55, 0.85, 0.95]],
+            palette: [
+                [0.08, 0.16, 0.36],
+                [0.10, 0.45, 0.60],
+                [0.55, 0.85, 0.95],
+                [0.32, 0.65, 0.78],
+            ],
             mode: SceneMode::NoAudio,
             bars: [0.0; SLOTS],
             peaks: [0.0; SLOTS],
@@ -150,6 +155,30 @@ impl SpectrumScene {
         self.inner.render(gpu, &p.pack(res))
     }
 
+    /// Renders the scene, then `post` records overlay passes on the surface in the same submission.
+    pub fn render_with<F: FnOnce(&mut wgpu::CommandEncoder, &wgpu::TextureView)>(
+        &mut self,
+        gpu: &mut Gpu,
+        p: &SceneParams,
+        post: F,
+    ) -> Result<FrameStatus, String> {
+        let res = self.inner.current_render_size(gpu);
+        self.inner.render_with(gpu, &p.pack(res), post)
+    }
+
+    /// Headless render plus overlay hook (tests, `--scene-selftest`).
+    pub fn render_offscreen_with(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        res: (u32, u32),
+        p: &SceneParams,
+        post: &dyn Fn(&mut wgpu::CommandEncoder, &wgpu::TextureView),
+    ) -> Result<Vec<u8>, String> {
+        self.inner
+            .render_offscreen_with(device, queue, res.0, res.1, &p.pack(res), post)
+    }
+
     /// Headless render for tests and measurements: tightly packed 4-byte pixels (texture format order).
     pub fn render_offscreen(
         &self,
@@ -183,12 +212,12 @@ mod tests {
         p.dust = 0.25;
         let b = p.pack((1280, 720));
         assert_eq!(b.len(), UNIFORM_BYTES);
-        assert_eq!(UNIFORM_BYTES, 1264);
+        assert_eq!(UNIFORM_BYTES, 1280);
         assert_eq!(f32_at(&b, 0), 1280.0);
         assert_eq!(f32_at(&b, 16), 0.7); // glow
         assert_eq!(f32_at(&b, 44), 0.0); // mode live
         assert_eq!(f32_at(&b, 76), 0.25); // dust phase (pal0.w)
-        let bars = 112;
+        let bars = 128;
         assert_eq!(f32_at(&b, bars), 0.5);
         assert_eq!(f32_at(&b, bars + 95 * 4), 0.75);
         assert_eq!(f32_at(&b, bars + SLOTS * 4 + 4), 0.25); // peaks[1]
