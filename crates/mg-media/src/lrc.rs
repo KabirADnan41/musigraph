@@ -66,7 +66,7 @@ fn parse_time(s: &str) -> Option<f64> {
     let rest = rest.trim().replace(':', ".");
     let sec: f64 = rest.parse().ok()?;
     let t = f64::from(m) * 60.0 + sec;
-    (sec.is_finite() && sec >= 0.0 && sec < 60.0 + 1e-9 && (0.0..=MAX_TIME_S).contains(&t))
+    (sec.is_finite() && (0.0..60.0 + 1e-9).contains(&sec) && (0.0..=MAX_TIME_S).contains(&t))
         .then_some(t)
 }
 
@@ -94,23 +94,22 @@ fn split_words(text: &str, offset: f64) -> (String, Vec<LyricWord>) {
     let mut plain = String::new();
     let mut cur_time: Option<f64> = None;
     let mut buf = String::new();
-    let mut flush =
-        |t: Option<f64>, b: &mut String, plain: &mut String, words: &mut Vec<LyricWord>| {
-            let w = sanitize_text(b);
-            if !w.is_empty() {
-                if !plain.is_empty() {
-                    plain.push(' ');
-                }
-                plain.push_str(&w);
-                if let Some(t) = t {
-                    words.push(LyricWord {
-                        start_s: (t + offset).max(0.0),
-                        text: w,
-                    });
-                }
+    let flush = |t: Option<f64>, b: &mut String, plain: &mut String, words: &mut Vec<LyricWord>| {
+        let w = sanitize_text(b);
+        if !w.is_empty() {
+            if !plain.is_empty() {
+                plain.push(' ');
             }
-            b.clear();
-        };
+            plain.push_str(&w);
+            if let Some(t) = t {
+                words.push(LyricWord {
+                    start_s: (t + offset).max(0.0),
+                    text: w,
+                });
+            }
+        }
+        b.clear();
+    };
     let mut rest = text;
     while let Some(i) = rest.find('<') {
         buf.push_str(&rest[..i]);
