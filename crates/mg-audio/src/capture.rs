@@ -47,8 +47,22 @@ pub struct Status {
     pub channels: u16,
     pub opens: u32,
     pub discontinuities: u64,
+    /// Capture-loop iterations that had to synthesise silence (an iteration count, NOT a duration).
     pub synthesized_silence_blocks: u64,
+    /// Total duration of synthesised silence in milliseconds (the meaningful figure).
+    pub synthesized_silence_ms: u64,
+    /// Real packets delivered by the driver and the audio time they carried in milliseconds.
+    pub real_packets: u64,
+    pub real_audio_ms: u64,
     pub last_error: Option<String>,
+}
+
+/// Whole milliseconds spanned by `frames` at `sample_rate` (0 for an invalid rate).
+fn frames_to_ms(frames: u64, sample_rate: u32) -> u64 {
+    if sample_rate == 0 {
+        return 0;
+    }
+    frames.saturating_mul(1000) / u64::from(sample_rate)
 }
 
 /// Handle to a running loopback capture thread; dropping it stops and joins the thread.
@@ -254,8 +268,11 @@ fn run_session(
                             return finish(&client, Err(e.to_string()));
                         }
                     }
-                    if packet.flags & (AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY.0 as u32) != 0 {
-                        if let Ok(mut s) = status.lock() {
+                    if let Ok(mut s) = status.lock() {
+                        s.real_packets += 1;
+                        s.real_audio_ms +=
+                            frames_to_ms(u64::from(packet.frames), format.sample_rate);
+                        if packet.flags & (AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY.0 as u32) != 0 {
                             s.discontinuities += 1;
                         }
                     }
@@ -283,6 +300,7 @@ fn run_session(
             last_emit = Instant::now();
             if let Ok(mut s) = status.lock() {
                 s.synthesized_silence_blocks += 1;
+                s.synthesized_silence_ms += frames_to_ms(n as u64, format.sample_rate);
             }
         }
         // Default device changed (or vanished)? Return so the supervisor re-opens.
@@ -425,6 +443,14 @@ mod tests {
         let ms = Duration::from_millis;
         assert_eq!(silence_block_len(ms(10), ms(10), 48_000), 0);
         assert_eq!(silence_block_len(ms(49), ms(49), 48_000), 0);
+    }
+
+    #[test]
+    fn frames_to_ms_is_exact_and_safe() {
+        assert_eq!(frames_to_ms(48_000, 48_000), 1000);
+        assert_eq!(frames_to_ms(441, 44_100), 10);
+        assert_eq!(frames_to_ms(5, 0), 0);
+        assert_eq!(frames_to_ms(u64::MAX, 48_000), u64::MAX / 48_000);
     }
 
     #[test]

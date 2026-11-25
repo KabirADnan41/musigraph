@@ -265,6 +265,8 @@ pub struct Presentation {
     e_artist: [Eased; 2],
     lyrics: LyricView,
     lyric_draws: [Option<TextDraw>; 3],
+    /// User switch: lyrics are still looked up and tracked, only their drawing is suppressed.
+    lyrics_on: bool,
 }
 
 /// Pixel sizes derived from the surface height and layout (responsive: nothing is tied to one monitor).
@@ -306,6 +308,7 @@ impl Presentation {
             text_dims: [None, None],
             palette: PaletteState::new(),
             lyrics: LyricView::new(LyricSource::None),
+            lyrics_on: true,
             lyric_draws: [None; 3],
             e_art: [Eased::default(); 4],
             e_title: [Eased::default(); 2],
@@ -329,6 +332,12 @@ impl Presentation {
     }
 
     /// Where synchronised lyrics may come from (default: nowhere).
+    /// Shows or hides the lyrics (returns the new state).
+    pub fn toggle_lyrics(&mut self) -> bool {
+        self.lyrics_on = !self.lyrics_on;
+        self.lyrics_on
+    }
+
     pub fn set_lyric_source(&mut self, s: LyricSource) {
         self.lyrics = LyricView::new(s);
     }
@@ -589,7 +598,11 @@ impl Presentation {
             art,
             title,
             artist,
-            lyrics: self.lyric_draws,
+            lyrics: if self.lyrics_on {
+                self.lyric_draws
+            } else {
+                [None, None, None]
+            },
             lyric_glow: energy.clamp(0.0, 1.0),
             shadow: 0.55,
             text_color: lerp3(scene_text, p.text, w),
@@ -871,6 +884,35 @@ mod tests {
     use mg_media::PlaybackState;
 
     const SURF: (u32, u32) = (1920, 1080);
+
+    #[test]
+    fn lyrics_toggle_hides_drawing_without_losing_state() {
+        let mut p = Presentation::new(Layout::Corner);
+        assert!(p.lyrics_on);
+        let d = TextDraw {
+            x: 1.0,
+            y: 2.0,
+            w: 3.0,
+            h: 4.0,
+            alpha: 1.0,
+        };
+        p.lyric_draws = [Some(d), None, None];
+        assert!(p.params(SURF, 0.0, None, None, None).lyrics[0].is_some());
+        assert!(!p.toggle_lyrics());
+        assert!(
+            p.params(SURF, 0.0, None, None, None)
+                .lyrics
+                .iter()
+                .all(Option::is_none)
+        );
+        assert_eq!(
+            p.lyric_draws[0].map(|d| d.w),
+            Some(3.0),
+            "tracking state is kept"
+        );
+        assert!(p.toggle_lyrics());
+        assert!(p.params(SURF, 0.0, None, None, None).lyrics[0].is_some());
+    }
 
     fn np(id: u64, title: &str, art: Option<Arc<[u8]>>) -> NowPlaying {
         NowPlaying {

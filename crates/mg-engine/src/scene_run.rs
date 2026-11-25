@@ -34,6 +34,8 @@ fn toggle_allowed(m: ModifiersState) -> bool {
 
 const CURSOR_HIDE_AFTER: Duration = Duration::from_secs(3);
 const MAX_SKIP_TIME: Duration = Duration::from_secs(30);
+/// Frames longer than this are recorded with a per-section CPU time breakdown.
+const HITCH_MS: f64 = 40.0;
 
 #[derive(Debug, PartialEq)]
 pub enum Source {
@@ -236,6 +238,8 @@ struct App {
     title: String,
     last_frame: Option<Instant>,
     intervals_ms: Vec<f64>,
+    /// Attribution lines for rare long frames (see HITCH_MS); bounded.
+    hitches: Vec<String>,
     presented: u64,
     skipped: u64,
     skip_since: Option<Instant>,
@@ -398,6 +402,19 @@ impl ApplicationHandler for App {
                     },
                 ..
             } if toggle_allowed(self.mods) => {
+                self.pres.toggle_lyrics();
+                self.touch_input();
+            }
+            WindowEvent::KeyboardInput {
+                event:
+                    KeyEvent {
+                        physical_key: PhysicalKey::Code(KeyCode::KeyA),
+                        state: ElementState::Pressed,
+                        repeat: false,
+                        ..
+                    },
+                ..
+            } if toggle_allowed(self.mods) => {
                 let surface = self
                     .gpu
                     .as_ref()
@@ -512,6 +529,7 @@ impl App {
             .gpu
             .as_ref()
             .map_or((0, 0), |g| (g.config.width, g.config.height));
+        let t_poll = Instant::now();
         if self
             .last_media_poll
             .is_none_or(|t| now.duration_since(t) >= Duration::from_millis(250))
@@ -526,6 +544,7 @@ impl App {
         while let Some(r) = self.worker.try_recv() {
             self.pres.on_ready(r);
         }
+        let poll_ms = t_poll.elapsed().as_secs_f64() * 1000.0;
         self.pres
             .set_position(self.last_np.as_ref().and_then(|n| n.position_now(now)));
         self.pres.set_lyric_anchor(match self.switch.target() {
@@ -585,6 +604,7 @@ impl App {
             self.result = Err(format!("wgpu error: {e}"));
             return el.exit();
         }
+        let t_ops = Instant::now();
         if let Some(ov) = self.overlay.as_mut() {
             for op in self.pres.take_ops() {
                 match op {
@@ -599,8 +619,10 @@ impl App {
                 }
             }
         }
+        let ops_ms = t_ops.elapsed().as_secs_f64() * 1000.0;
         let queue = g.queue.clone();
         let overlay = self.overlay.as_ref();
+        let t_render = Instant::now();
         match scene.render_scenes(g, &params, style, xfade, |enc, view| {
             if let Some(ov) = overlay {
                 ov.draw(&queue, enc, view, &overlay_params);
@@ -608,8 +630,17 @@ impl App {
         }) {
             Ok(FrameStatus::Presented) => {
                 if let Some(prev) = self.last_frame {
-                    self.intervals_ms
-                        .push(now.duration_since(prev).as_secs_f64() * 1000.0);
+                    let interval = now.duration_since(prev).as_secs_f64() * 1000.0;
+                    self.intervals_ms.push(interval);
+                    // Attribution of rare long frames (CPU time per section; no track data is recorded).
+                    if interval > HITCH_MS && self.hitches.len() < 24 {
+                        self.hitches.push(format!(
+                            "HITCH t={:.1}s interval={interval:.0}ms poll+jobs={poll_ms:.1} gpu_ops={ops_ms:.1} render={:.1} xfade={}",
+                            self.start.elapsed().as_secs_f64(),
+                            t_render.elapsed().as_secs_f64() * 1000.0,
+                            xfade.is_some()
+                        ));
+                    }
                 }
                 self.last_frame = Some(now);
                 self.presented += 1;
@@ -754,6 +785,7 @@ pub fn run(opts: SceneOpts) -> i32 {
         title: String::new(),
         last_frame: None,
         intervals_ms: Vec::new(),
+        hitches: Vec::new(),
         presented: 0,
         skipped: 0,
         skip_since: None,
@@ -770,12 +802,18 @@ pub fn run(opts: SceneOpts) -> i32 {
         let st = c.status();
         c.stop();
         println!(
-            "audio: opens={} discontinuities={} synthesized_silence_blocks={} last_error={}",
+            "audio: opens={} discontinuities={} real_packets={} real_audio_ms={} synth_blocks={} synth_silence_ms={} last_error={}",
             st.opens,
             st.discontinuities,
+            st.real_packets,
+            st.real_audio_ms,
             st.synthesized_silence_blocks,
+            st.synthesized_silence_ms,
             st.last_error.as_deref().unwrap_or("-")
         );
+    }
+    for h in &app.hitches {
+        println!("{h}");
     }
     let mut s = app.intervals_ms.clone();
     s.sort_by(|a, b| a.total_cmp(b));
