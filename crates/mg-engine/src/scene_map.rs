@@ -71,6 +71,7 @@ pub struct SceneMapper {
     tune: MapTuning,
     t: f32,
     scroll: [f32; 2],
+    dust: f32,
     bars: [f32; SLOTS],
     peaks: [f32; SLOTS],
     hold: [f32; SLOTS],
@@ -125,6 +126,7 @@ impl SceneMapper {
             tune,
             t: 0.0,
             scroll: [0.0, 0.0],
+            dust: 0.0,
             bars: [0.0; SLOTS],
             peaks: [0.0; SLOTS],
             hold: [0.0; SLOTS],
@@ -240,6 +242,8 @@ impl SceneMapper {
         let speed = 0.4 + 0.8 * s;
         self.scroll[0] += 0.02 * speed * dt;
         self.scroll[1] += 0.012 * speed * dt;
+        // dust falls (0.015 + 0.04 s) screen heights per second = that many / 0.022 cells; one phase unit = 128 cells
+        self.dust = (self.dust + (0.015 + 0.04 * s) / 0.022 * dt / 128.0).fract();
 
         // Colour: two fixed palette endpoints, blended by the slow per-song spectral tilt (tau 20 s).
         // Bass-heavy songs sit near teal+amber, bright songs near periwinkle+rose. Music only moves lightness
@@ -280,12 +284,81 @@ impl SceneMapper {
             swell: swell.clamp(0.0, 1.0),
             tilt,
             scroll: self.scroll,
+            dust: self.dust,
             rings: self.rings,
             palette,
             mode: if live { input.mode } else { SceneMode::NoAudio },
             bars: self.bars,
             peaks: self.peaks,
             bright,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Same loud signal, then silence: only the (forced) long-term onset rate differs.
+    fn bar_after_release(onset_rate: f32) -> f32 {
+        let mut m = SceneMapper::new(MapTuning::default());
+        let loud = AudioFrame {
+            silent: false,
+            bands: [1.0; mg_dsp::MAX_BANDS],
+            band_count: mg_dsp::MAX_BANDS,
+            rms_db: -10.0,
+            ..AudioFrame::default()
+        };
+        let input = |frame, fresh| Input {
+            frame,
+            onsets: 0,
+            onset_strength: 0.0,
+            fresh,
+            mode: SceneMode::Live,
+        };
+        for _ in 0..90 {
+            m.update(&input(&loud, true), 1.0 / 60.0);
+        }
+        m.onset_rate = onset_rate; // set after the loud phase so only the release is affected
+        let mut p = m.update(&input(&loud, false), 1.0 / 60.0);
+        for _ in 0..24 {
+            p = m.update(&input(&loud, false), 1.0 / 60.0);
+        }
+        p.bars.iter().cloned().fold(0.0, f32::max)
+    }
+
+    #[test]
+    fn bars_fall_faster_for_rhythmic_songs_with_everything_else_equal() {
+        let slow_song = bar_after_release(0.0);
+        let fast_song = bar_after_release(4.0);
+        assert!(slow_song > 0.4, "liquid songs keep their bars: {slow_song}");
+        assert!(
+            fast_song + 0.25 < slow_song,
+            "rhythmic {fast_song} vs liquid {slow_song}"
+        );
+    }
+
+    #[test]
+    fn dust_phase_wraps_and_never_jumps() {
+        let mut m = SceneMapper::new(MapTuning::default());
+        let f = AudioFrame::default();
+        let mut prev = 0.0f32;
+        for i in 0..200_000 {
+            let p = m.update(
+                &Input {
+                    frame: &f,
+                    onsets: 0,
+                    onset_strength: 0.0,
+                    fresh: true,
+                    mode: SceneMode::Live,
+                },
+                1.0 / 60.0,
+            );
+            assert!((0.0..1.0).contains(&p.dust), "phase {}", p.dust);
+            if i > 0 && p.dust > prev {
+                assert!(p.dust - prev < 0.01, "jump {prev} -> {}", p.dust);
+            }
+            prev = p.dust;
         }
     }
 }

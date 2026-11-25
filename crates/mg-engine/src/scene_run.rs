@@ -269,6 +269,7 @@ impl ApplicationHandler for App {
                 el.exit()
             }
             WindowEvent::ModifiersChanged(m) => self.mods = m.state(),
+            WindowEvent::Focused(false) => self.mods = ModifiersState::empty(),
             WindowEvent::KeyboardInput {
                 event:
                     KeyEvent {
@@ -553,7 +554,12 @@ pub fn run(opts: SceneOpts) -> i32 {
         pct(0.99),
         s.last().copied().unwrap_or(0.0)
     );
-    println!("EXIT reason: {}", app.exit_reason);
+    let reason = if app.result.is_err() {
+        "error (see RESULT: FAILED below)"
+    } else {
+        app.exit_reason
+    };
+    println!("EXIT reason: {reason}");
     match app.result {
         Ok(()) => 0,
         Err(e) => {

@@ -501,27 +501,6 @@ mod tests {
         let dist = |a: &[f32; 3], b: &[f32; 3]| (0..3).map(|i| (a[i] - b[i]).abs()).sum::<f32>();
         let d = dist(&pb.palette[1], &pr.palette[1]) + dist(&pb.palette[2], &pr.palette[2]);
         assert!(d > 0.5, "palettes too similar: {d}");
-        // rhythmic song falls faster than a sustained one: 0.4 s after the sound stops
-        let fall = |mut x: Vec<f32>| {
-            x.extend(vec![0.0; sec(0.5)]);
-            let t = run(&x, 60.0);
-            t.last()
-                .unwrap()
-                .params
-                .bars
-                .iter()
-                .cloned()
-                .fold(0.0, f32::max)
-        };
-        let (kick, _) = synth::kick_train(150.0, 30.0, 0.8, SR);
-        let mut sustained = synth::sine(70.0, 0.8, SR, sec(30.0));
-        let mut rhythmic = kick;
-        rhythmic.truncate(sec(30.0));
-        sustained.truncate(sec(30.0));
-        assert!(
-            fall(rhythmic) + 0.05 < fall(sustained),
-            "rhythmic songs must fall faster"
-        );
     }
 
     #[test]

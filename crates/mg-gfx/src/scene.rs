@@ -33,6 +33,9 @@ pub struct SceneParams {
     pub swell: f32,
     pub tilt: f32,
     pub scroll: [f32; 2],
+    /// Dust fall phase in 0..1 (one full period of the wrapped dust grid), integrated on the CPU so
+    /// changing energy never makes the field jump and the hash input stays small.
+    pub dust: f32,
     /// Two impulse rings: (age in seconds, amplitude).
     pub rings: [[f32; 2]; 2],
     /// Linear RGB: haze/base, bar body, accent.
@@ -54,6 +57,7 @@ impl Default for SceneParams {
             swell: 0.0,
             tilt: 0.0,
             scroll: [0.0, 0.0],
+            dust: 0.0,
             rings: [[100.0, 0.0]; 2],
             palette: [[0.08, 0.16, 0.36], [0.10, 0.45, 0.60], [0.55, 0.85, 0.95]],
             mode: SceneMode::NoAudio,
@@ -96,8 +100,11 @@ impl SceneParams {
                 self.rings[1][1],
             ],
         );
-        for c in &self.palette {
-            put(&mut o, &[c[0], c[1], c[2], 0.0]);
+        for (i, c) in self.palette.iter().enumerate() {
+            put(
+                &mut o,
+                &[c[0], c[1], c[2], if i == 0 { self.dust } else { 0.0 }],
+            );
         }
         for arr in [&self.bars, &self.peaks, &self.bright] {
             put(&mut o, &arr[..]);

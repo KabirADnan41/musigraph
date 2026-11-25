@@ -193,6 +193,11 @@ impl Analyzer {
         if !(p.f_min.is_finite() && p.f_max.is_finite() && p.f_min >= 1.0 && p.f_max > p.f_min) {
             (p.f_min, p.f_max) = (d.f_min, d.f_max);
         }
+        p.tilt_db_per_oct = if p.tilt_db_per_oct.is_finite() {
+            p.tilt_db_per_oct.clamp(-12.0, 12.0)
+        } else {
+            d.tilt_db_per_oct
+        };
         p.band_count = p.band_count.clamp(1, MAX_BANDS);
         p.hop = p.hop.clamp(64, FFT_SIZE);
         let window: Vec<f32> = (0..FFT_SIZE)
@@ -795,6 +800,7 @@ mod tests {
             f_min: -5.0,
             f_max: f32::NAN,
             onset_k: f32::NAN,
+            tilt_db_per_oct: f32::NAN,
             silence_db: f32::NAN,
             ref_min_db: f32::NAN,
             band_count: 10_000,

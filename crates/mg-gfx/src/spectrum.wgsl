@@ -17,7 +17,7 @@ struct U {
     b: vec4<f32>,
     // ring1 (age, amp), ring2 (age, amp)
     c: vec4<f32>,
-    pal0: vec4<f32>, // haze / base
+    pal0: vec4<f32>, // haze / base (w = dust phase 0..1)
     pal1: vec4<f32>, // bar body
     pal2: vec4<f32>, // accent / tips
     bars: array<vec4<f32>, 24>,
@@ -112,15 +112,18 @@ fn spectrum(x: f32, d: f32, glow: f32) -> vec3<f32> {
     return col;
 }
 
-// Falling dust on a hash grid. Density and speed come from the real adaptive energy; this adds depth, not beats.
-fn dust_layer(p: vec2<f32>, aspect: f32, cell: f32, speed: f32, t: f32, dens: f32, seed: f32) -> f32 {
+// Falling dust on a hash grid. Density comes from the real adaptive energy; the fall phase is integrated on
+// the CPU. The grid is periodic in 128 cells, so wrapping the phase is seamless and the hash input stays
+// small for any run length. `lanes` is an integer so layers stay periodic too.
+fn dust_layer(p: vec2<f32>, aspect: f32, cell: f32, phase: f32, lanes: f32, dens: f32, seed: f32) -> f32 {
     var g = vec2<f32>(p.x * aspect, p.y) / cell;
-    g.y -= t * speed / cell;
-    let id = floor(g);
+    g.y -= phase * 128.0 * lanes;
+    var id = floor(g);
     let f = fract(g) - 0.5;
+    id.y = id.y - 128.0 * floor(id.y / 128.0);
     let off = vec2<f32>(hash21(id + seed) - 0.5, hash21(id * 1.7 + seed + 11.0) - 0.5) * 0.6;
     let on = step(1.0 - dens, hash21(id + seed + 5.0));
-    return on * smoothstep(0.10, 0.0, length(f - off)) * (0.5 + 0.5 * hash21(id + seed + 2.0));
+    return on * (1.0 - smoothstep(0.0, 0.10, length(f - off))) * (0.5 + 0.5 * hash21(id + seed + 2.0));
 }
 
 fn aces(x: vec3<f32>) -> vec3<f32> {
@@ -167,8 +170,8 @@ fn fs(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
     // ---- spectrum above the horizon -----------------------------------------------------------
     let d_up = yh - p.y;
     let dens = 0.012 + 0.05 * u.energy;
-    let dust = dust_layer(p, aspect, 0.022, 0.015 + 0.04 * u.energy, t, dens, 3.0)
-             + 0.6 * dust_layer(p, aspect, 0.040, 0.008 + 0.02 * u.energy, t, dens * 0.8, 9.0);
+    let dust = dust_layer(p, aspect, 0.022, u.pal0.w, 1.0, dens, 3.0)
+             + 0.6 * dust_layer(p, aspect, 0.040, u.pal0.w, 0.25, dens * 0.8, 9.0);
     col += mix(u.pal2.rgb, vec3<f32>(1.0), 0.5) * dust * (0.12 + 0.55 * glow) * mix(1.0, 0.3, below);
     col += spectrum(p.x, d_up, glow);
 
