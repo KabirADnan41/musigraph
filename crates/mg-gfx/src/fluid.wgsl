@@ -1,7 +1,8 @@
 // Scene "Fluid" (F1, Experimental): dye-only liquid. Concatenated after common.wgsl (vs, U, hash21, aces,
-// mode_marker). Two entry points share this file:
-//   fs_sim - one fixed 1/60 s simulation step: ping-pong RGBA16Float, x/y/z = dye for pal1/pal2/pal3, w = heat.
-//   fs     - the scene: glossy render of the dye over a dark palette base.
+// mode_marker). Three entry points share this file:
+//   fs_sim  - one fixed 1/60 s simulation step: ping-pong RGBA16Float, x/y/z = dye for pal1/pal2/pal3, w = heat.
+//   fs_copy - resamples the field into a new grid (aspect change): the picture is kept, never cleared.
+//   fs      - the scene: glossy render of the dye over a dark palette base.
 // Velocity is ANALYTIC and divergence-free by construction (the curl of a stream function: 2-octave value
 // noise + emitter swirl and push + onset vortices), so there is no pressure solve. All music mapping and
 // smoothing happens on the CPU (mg-engine scene_map.rs); this file only integrates what it is given.
@@ -11,9 +12,9 @@ struct FU {
     swirl: vec4<f32>,          // swirl per emitter (1/s, signed), bass push (upward jet, screen heights/s)
     vort: array<vec4<f32>, 2>, // onset vortex: uv x, uv y, peak swirl speed (sh/s, signed), age (s; >= 100 none)
     flow: vec4<f32>,           // noise flow speed (sh/s), noise frequency (1/sh), evolution phase (lattice units, 0..256), buoyancy (upward drift, sh/s)
-    look: vec4<f32>,           // dye memory tau (s), heat rate (1/s), exposure, unused
-    misc: vec4<f32>,           // vortex dye hue (0 dark .. 1 bright onset: pal3 towards pal2) for slots 0 and 1, unused x2
-    sim: vec4<f32>,            // MacCormack on (1) / RK2 semi-Lagrangian only (0), unused x3
+    look: vec4<f32>,           // dye memory tau (s), heat rate (1/s), exposure, jet width (sh; <= 0.03: twice the bass splat)
+    misc: vec4<f32>,           // vortex dye hue (0 dark .. 1 bright onset: pal3 towards pal2) for slots 0 and 1, flow detail (0 laminar .. 1 turbulent), treble spread (0..1)
+    sim: vec4<f32>,            // round-trip correction on (1) / plain RK2 semi-Lagrangian (0), grid width, grid height, unused
 };
 @group(1) @binding(0) var<uniform> fu: FU;
 @group(1) @binding(1) var dye: texture_2d<f32>;
@@ -101,8 +102,9 @@ fn fl_vel(p: vec2<f32>, aspect: f32) -> vec2<f32> {
     // two rotated octaves; the second moves with twice the phase so both wrap seamlessly at 256
     let g1 = fl_noise_grad(FL_ROT1 * p * fq + vec2<f32>(ph, 0.0));
     let g2 = fl_noise_grad(FL_ROT2 * p * fq * 2.03 + vec2<f32>(31.0, 17.0 + 2.0 * ph));
-    // psi = (speed / fq) (n1 + 0.35 n2)  ->  grad_p psi = speed (R1^T grad_q n1 + 0.35 * 2.03 R2^T grad_q n2)
-    let gp = g1.yz * FL_ROT1 + 0.7105 * (g2.yz * FL_ROT2); // row-vector product = R^T g
+    // psi = (speed / fq) (n1 + 0.35 d n2)  ->  grad_p psi = speed (R1^T grad_q n1 + 0.35 * 2.03 d R2^T grad_q n2);
+    // d = flow detail: sustained sound flows laminar (the fine octave nearly off), impulsive sound churns
+    let gp = g1.yz * FL_ROT1 + 0.7105 * clamp(fu.misc.z, 0.0, 1.0) * (g2.yz * FL_ROT2); // row-vector product = R^T g
     var v = fl_curl(fu.flow.x * 1.5 * gp);
     for (var i = 0; i < 3; i++) {
         let e = fu.emit[i];
@@ -110,7 +112,9 @@ fn fl_vel(p: vec2<f32>, aspect: f32) -> vec2<f32> {
         v += fl_swirl(p, c, max(e.w, 0.03) * 1.6, fu.swirl[i]);
     }
     let b = fu.emit[0];
-    v += fl_jet(p, vec2<f32>(b.x * aspect, b.y), max(b.w, 0.03) * 2.0, fu.swirl.w);
+    // jet width: narrow for bass impacts, broad for a sustained low end (look.w; 0 = twice the bass splat)
+    let jw = select(max(b.w, 0.03) * 2.0, fu.look.w, fu.look.w > 0.03);
+    v += fl_jet(p, vec2<f32>(b.x * aspect, b.y), jw, fu.swirl.w);
     for (var j = 0; j < 2; j++) {
         let o = fu.vort[j];
         if (o.w < 50.0) {
@@ -147,7 +151,10 @@ fn fs_sim(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
     let uvb = pb * to_uv;
     var s = textureSampleLevel(dye, dye_smp, uvb, 0.0);
     if (fu.sim.x > 0.5) {
-        // single-pass MacCormack: correct by the round-trip error, then clamp to the departure cell (no overshoot)
+        // Single-pass round-trip correction, MacCormack-INSPIRED but not MacCormack: true MacCormack/BFECC would
+        // advect the back-traced result forward again (a second pass over the advected field). Here the forward
+        // trace from the departure point samples the PREVIOUS field, so the correction 0.5 (here - back) only
+        // compensates part of the interpolation smearing. Clamped to the departure cell's range (no overshoot).
         let w1 = fl_vel(pb, aspect);
         let pf = pb + FL_DT * fl_vel(pb + 0.5 * FL_DT * w1, aspect);
         let back = textureSampleLevel(dye, dye_smp, pf * to_uv, 0.0);
@@ -163,9 +170,11 @@ fn fs_sim(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
     // injection: three palette-role emitters, heat from the bass, a little onset-coloured dye in each vortex
     let tau = max(fu.look.x, 0.5);
     var add = vec4<f32>(0.0);
+    // high, airy sound spreads as a thin, wide veil: the treble splat widens horizontally (up to 3x)
+    let spread = vec3<f32>(1.0, 1.0, 1.0 + 2.0 * clamp(fu.misc.w, 0.0, 1.0));
     for (var i = 0; i < 3; i++) {
         let e = fu.emit[i];
-        let d = p - vec2<f32>(e.x * aspect, e.y);
+        let d = (p - vec2<f32>(e.x * aspect, e.y)) / vec2<f32>(spread[i], 1.0);
         let sg = max(e.w, 0.03);
         let g = exp(-dot(d, d) / (2.0 * sg * sg));
         // normalised by memory: the steady-state peak is set by strength, not by tau
@@ -199,6 +208,12 @@ fn fs_sim(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
     s = select(s, vec4<f32>(0.0), s < vec4<f32>(1.0e-4));
     s = select(s, 2.0 + tanh(s - 2.0), s > vec4<f32>(2.0));
     return fl_finite(s);
+}
+
+// The field resampled into a new grid (fu.sim.yz = the new grid size); bilinear, so the mean dye is kept.
+@fragment
+fn fs_copy(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
+    return fl_finite(textureSampleLevel(dye, dye_smp, frag.xy / max(fu.sim.yz, vec2<f32>(1.0)), 0.0));
 }
 
 // Smooth upsampling of the low-resolution dye: cubic B-spline from four bilinear taps.

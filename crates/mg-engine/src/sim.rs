@@ -8,8 +8,9 @@ use mg_dsp::{AnalysisParams, Analyzer, AudioFrame};
 use mg_gfx::scene::{SceneMode, SceneParams};
 
 /// Names of the built-in SYNTHETIC fixtures (tests and labelled previews only).
-pub const FIXTURES: [&str; 8] = [
-    "silence", "bass", "mid", "treble", "sweep", "kick", "buildup", "demo",
+pub const FIXTURES: [&str; 12] = [
+    "silence", "bass", "mid", "treble", "sweep", "kick", "buildup", "demo", "pad", "drone", "hats",
+    "noise",
 ];
 
 /// Generates a looping synthetic fixture (a few seconds up to 16 s) at `sr`. Never used in live mode.
@@ -51,6 +52,35 @@ pub fn fixture(name: &str, sr: u32) -> Option<Vec<f32>> {
             }
             out
         }
+        // sustained C-major pad (no attack transient: 1.5 s fade-in)
+        "pad" => {
+            let notes: Vec<Vec<f32>> = [262.0f32, 330.0, 392.0]
+                .iter()
+                .map(|&f| synth::sine(f, 0.15, sr, n(12.0)))
+                .collect();
+            (0..n(12.0))
+                .map(|i| {
+                    let fade = (i as f32 / n(1.5) as f32).min(1.0);
+                    fade * fade * (notes[0][i] + notes[1][i] + notes[2][i])
+                })
+                .collect()
+        }
+        // sub-bass drone (below the 60 Hz group edge)
+        "drone" => synth::sine(45.0, 0.5, sr, n(8.0)),
+        // hi-hats only: 30 ms noise bursts every 0.25 s
+        "hats" => synth::noise(9, 0.12, n(8.0))
+            .iter()
+            .enumerate()
+            .map(|(i, w)| {
+                if (i as f32 / sr as f32 / 0.25).fract() < 0.12 {
+                    *w
+                } else {
+                    0.0
+                }
+            })
+            .collect(),
+        // steady broadband (white) noise
+        "noise" => synth::noise(5, 0.3, n(8.0)),
         _ => return None,
     })
 }

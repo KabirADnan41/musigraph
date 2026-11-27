@@ -70,33 +70,42 @@ fn render_all(ticks: &[Tick]) -> Option<Measured> {
     })
 }
 
-/// Orb: largest mean-luminance change within any 100 ms over the same tick series (flash/flicker guard; `None` without a GPU).
+/// Orb: largest mean-luminance change within any 100 ms over the same tick series (flash/flicker guard).
+/// `None` only without a GPU; a render error on a working GPU gives `Some(NaN)`, which fails the check.
 fn orb_flicker(ticks: &[Tick]) -> Option<f32> {
     let h = headless().ok()?;
     let scene = SceneSet::new_headless(&h.device);
     let mut lum = Vec::with_capacity(ticks.len());
     for t in ticks {
-        let img = scene
-            .render_offscreen_scenes(
-                &h.device,
-                &h.queue,
-                RES,
-                &t.params,
-                SceneKind::Orb,
-                None,
-                &|_, _| {},
-            )
-            .ok()?;
+        let Ok(img) = scene.render_offscreen_scenes(
+            &h.device,
+            &h.queue,
+            RES,
+            &t.params,
+            SceneKind::Orb,
+            None,
+            &|_, _| {},
+        ) else {
+            return Some(f32::NAN);
+        };
         lum.push(region_lum(&img, 0, RES.0, 0, RES.1));
     }
     Some(max_delta_100ms(&lum))
 }
 
-/// Largest absolute change of mean frame luminance within any 100 ms window.
+/// Largest change (max - min) of mean frame luminance within any 100 ms window: a flash that rises and falls
+/// back inside the window counts, not only the difference between its endpoints.
 fn max_delta_100ms(lum: &[f32]) -> f32 {
     let w = (FPS * 0.1).round() as usize;
     lum.windows(w + 1)
-        .map(|s| (s[w] - s[0]).abs())
+        .map(|s| {
+            let (lo, hi) = s
+                .iter()
+                .fold((f32::INFINITY, f32::NEG_INFINITY), |(lo, hi), &v| {
+                    (lo.min(v), hi.max(v))
+                });
+            hi - lo
+        })
         .fold(0.0, f32::max)
 }
 
@@ -539,7 +548,7 @@ fn fluid_checks(failures: &mut Vec<String>) -> bool {
     };
     let dump = std::env::var("MG_SCENE_DUMP").ok();
     let mut frames = Vec::new();
-    for name in ["silence", "bass", "treble", "kick", "demo"] {
+    for name in ["silence", "bass", "treble", "kick", "demo", "pad"] {
         let x = fixture(name, SR).expect("fixture");
         let ticks = Sim::new(SR, FPS, MapTuning::default()).run(&x[..x.len().min(SR as usize * 8)]);
         scene.fluid_release(); // every fixture starts from a clear field, like a scene entry
@@ -599,11 +608,15 @@ fn fluid_checks(failures: &mut Vec<String>) -> bool {
         }
         frames.push((name, last));
     }
-    if let [(_, s), (_, b), (_, t), ..] = &frames[..] {
+    if let [(_, s), (_, b), (_, t), (_, k), _, (_, p)] = &frames[..] {
         for (what, d, min) in [
             ("silence vs bass", mad(s, b), 1.0),
             ("silence vs treble", mad(s, t), 0.5),
             ("bass vs treble", mad(b, t), 0.5),
+            // FL1: impulsive kick, sustained pad and a steady bass must not look alike
+            ("kick vs bass", mad(k, b), 0.5),
+            ("kick vs pad", mad(k, p), 0.5),
+            ("pad vs bass", mad(p, b), 0.5),
         ] {
             println!("FLUID {what}: mad={d:.3} (min {min})");
             if d < min {
@@ -711,7 +724,7 @@ pub fn run(allow_no_gpu: bool) -> i32 {
         );
         expect(
             orb_ld.is_none_or(|d| d.is_finite() && d < 0.10),
-            "orb: luminance changed by >= 0.10 within 100 ms",
+            "orb: render failed or luminance changed by >= 0.10 within 100 ms",
         );
         match name {
             "silence" => {
@@ -780,5 +793,22 @@ pub fn run(allow_no_gpu: bool) -> i32 {
         }
         eprintln!("SELFTEST RESULT: FAILED");
         1
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::max_delta_100ms;
+
+    #[test]
+    fn flicker_counts_a_flash_inside_the_window_not_only_its_endpoints() {
+        // a 0.2 flash that rises and falls back between two samples 100 ms apart
+        let mut lum = vec![0.1f32; 20];
+        lum[9] = 0.3;
+        assert!((max_delta_100ms(&lum) - 0.2).abs() < 1e-6);
+        assert_eq!(max_delta_100ms(&[0.1; 20]), 0.0);
+        // a steady ramp of 0.01 per frame: 6 frames = 0.06 per 100 ms
+        let ramp: Vec<f32> = (0..30).map(|i| i as f32 * 0.01).collect();
+        assert!((max_delta_100ms(&ramp) - 0.06).abs() < 1e-5);
     }
 }

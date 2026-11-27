@@ -129,6 +129,18 @@ struct FluidMap {
     /// Orbit reach 0..1 from the rhythm (onset density), slow.
     spread: f32,
     spawns: u32,
+    /// Impulsiveness 0..1 (crest factor and onset density): fast attack, slow release. Impulsive music churns
+    /// (fine curl, strong swirl, compact splats, short dye memory); sustained music drifts laminar and remembers.
+    imp: f32,
+    /// Sustained low-frequency lift (sh/s): a steady bass or drone pushes a broad plume up from the bass emitter.
+    lift: f32,
+    /// Treble spread 0..1: how far the treble splat widens into a thin veil.
+    tspread: f32,
+    /// Seconds an unconfirmed onset may still spawn a vortex, and its strength (0..1).
+    onset_wait: f32,
+    onset_str: f32,
+    /// Seconds since the last real onset.
+    onset_age: f32,
 }
 
 /// Lissajous periods (s) and phase offsets per emitter (bass, mid, treble), y/x frequency ratios (irrational).
@@ -147,6 +159,8 @@ const FL_GAIN: [f32; 3] = [1.0, 0.9, 0.65];
 /// Minimum time between two onset vortices and how long one lives (its envelope is ~0 by then).
 pub const FLUID_VORTEX_GAP_S: f32 = 0.25;
 const FL_VORTEX_LIFE_S: f32 = 2.0;
+/// How long an onset may wait for its accent to confirm it (the features trail the onset by a frame or two).
+const FL_ONSET_WAIT_S: f32 = 0.1;
 /// Everything the sim injects stays in this uv box (y down): above artwork, lyrics and the control bar.
 pub const FLUID_SAFE_X: (f32, f32) = (0.15, 0.85);
 pub const FLUID_SAFE_Y: (f32, f32) = (0.12, 0.58);
@@ -154,6 +168,9 @@ pub const FLUID_SAFE_Y: (f32, f32) = (0.12, 0.58);
 pub const FLUID_SPEED_FLOOR: f32 = 0.008;
 /// Slowest flow while music plays (sh/s): a calm pad still drifts.
 const FL_MUSIC_SPEED_MIN: f32 = 0.03;
+/// Sustained low-end lift: peak upward speed (sh/s) and jet width (sh): a broad, slow, large-scale plume.
+const FL_LIFT: f32 = 0.1;
+const FL_LIFT_WIDTH: f32 = 0.3;
 
 fn ema(y: f32, x: f32, dt: f32, tau: f32) -> f32 {
     y + (x - y) * (1.0 - (-dt / tau).exp())
@@ -177,6 +194,12 @@ impl FluidMap {
             since_vort: 10.0,
             spread: 0.0,
             spawns: 0,
+            imp: 0.0,
+            lift: 0.0,
+            tspread: 0.0,
+            onset_wait: 0.0,
+            onset_str: 0.0,
+            onset_age: 100.0,
         }
     }
 
@@ -195,13 +218,38 @@ impl FluidMap {
         let band = |a: &[f32; mg_dsp::GROUPS], i: usize| c(a[2 * i]).max(c(a[2 * i + 1]));
         // AGC normalises every band to its own recent range, so it cannot tell a bass-heavy song from a bright
         // one; the absolute band level gates each emitter (presence) and AGC shapes it within that.
-        let presence = |i: usize| (2.0 * band(absolute, i)).min(1.0);
+        // The analyzer's 60-250 Hz group also catches the skirt of a strong 250-500 Hz group (a 262 Hz chord
+        // reads ~0.65 there): the bass presence discounts half of the group above, so a pad does not drive the
+        // bass emitter. Sub-bass (< 60 Hz) always counts in full.
+        let low_abs = c(absolute[0]).max(c(absolute[1]) - 0.5 * c(absolute[2]));
+        let presence = |i: usize| (2.0 * if i == 0 { low_abs } else { band(absolute, i) }).min(1.0);
         let drive = |i: usize| 0.4 * band(&m.long, i) + 0.6 * band(&m.short, i);
         let level = if silent { 0.0 } else { c(m.level) };
         let ceiling = 0.5 + 0.5 * level; // quiet songs stay quiet even with full AGC
         // sustained sound (pads) flows slowly; rhythm (onsets per second) lets it move
         let rhythm = (fin(m.onset_density) / 3.0).clamp(0.0, 1.0);
         let calm = c(m.calm);
+        // impulsiveness: a peaky signal (crest ~1 s), a dense rhythm, or a real onset just now (the averages
+        // above need seconds to notice hats); reacts within ~0.3 s, settles over ~2 s
+        self.onset_age = (self.onset_age + dt).min(100.0);
+        if !silent && onsets > 0 {
+            self.onset_age = 0.0;
+        }
+        let imp_t = if silent {
+            0.0
+        } else {
+            // a steady chord's beating reaches ~8 dB, a 2 Hz kick ~14 dB; two onsets per second already count fully
+            smoothstep(9.0, 15.0, fin(m.crest_db))
+                .max((fin(m.onset_density) / 2.0).clamp(0.0, 1.0))
+                .max(if self.onset_age < 0.15 { 0.7 } else { 0.0 })
+        };
+        self.imp = ema(
+            self.imp,
+            imp_t,
+            dt,
+            if imp_t > self.imp { 0.3 } else { 2.0 },
+        );
+        let sustain = 1.0 - self.imp;
         // build: gentle intensification, slew-limited to 0.1 per second so a riser never jumps
         let b_t = if silent { 0.0 } else { c(m.build) };
         self.build += (b_t - self.build).clamp(-0.1 * dt, 0.1 * dt);
@@ -226,11 +274,28 @@ impl FluidMap {
         };
         self.speed = ema(self.speed, speed_t.max(FLUID_SPEED_FLOOR), dt, 1.0);
         if !silent {
-            self.freq = ema(self.freq, 2.4 + 1.6 * c(m.centroid), dt, 2.0);
+            // structure scale: bright sound -> fine curl, low sound -> large, slow structures (sqrt: a pad's
+            // centroid of ~0.1 already reads as finer than a pure bass)
+            let fq = 2.4 + 1.6 * c(m.centroid).sqrt() * (1.0 - 0.5 * presence(0));
+            self.freq = ema(self.freq, fq, dt, 2.0);
+            // a sustained high tone spreads; hats (impulsive) stay compact
+            self.tspread = ema(self.tspread, presence(2) * sustain, dt, 1.0);
         }
         self.phase = (self.phase + dt * (0.03 + 0.12 * band(&m.long, 2))).rem_euclid(256.0);
-        let tau_t = if silent { 3.0 } else { 3.5 + 5.5 * calm };
+        // dye memory: impulsive music forgets fast (separate puffs), sustained calm music keeps long trails
+        let tau_t = if silent {
+            3.0
+        } else {
+            3.0 + 6.0 * sustain * (0.3 + 0.7 * calm)
+        };
         self.tau = ema(self.tau, tau_t, dt, if silent { 0.3 } else { 1.5 });
+        // a steady low end lifts a broad plume (slow ease in and out); impacts are the push below
+        let lift_t = if silent {
+            0.0
+        } else {
+            FL_LIFT * presence(0) * sustain * ceiling
+        };
+        self.lift = ema(self.lift, lift_t, dt, 1.5);
         // exposure: one-pole (1.5 s) and slew-limited (0.3/s): never a flash
         let e_t = 0.85 + 0.3 * level;
         let step = ema(self.exposure, e_t, dt, 1.5) - self.exposure;
@@ -270,10 +335,20 @@ impl FluidMap {
             // calm music gathers near the middle, rhythmic music spreads; heavier bands sit lower
             let reach = 0.55 + 0.45 * self.spread;
             let x = 0.5 + 0.33 * reach * (tau2 * (o[0] + FL_OFFSET[i])).sin();
-            let y = FL_HEIGHT[i] + 0.14 * reach * (tau2 * (o[1] + 1.7 * FL_OFFSET[i])).sin();
-            let sigma = FL_SIGMA[i] + if i == 0 { 0.2 * self.push } else { 0.0 }; // kicks splash wider
+            // impulsive bass strikes from lower down (the jet throws it up); a sustained low end hangs higher
+            let strike = if i == 0 { 0.07 * self.imp } else { 0.0 };
+            let y =
+                FL_HEIGHT[i] + strike + 0.14 * reach * (tau2 * (o[1] + 1.7 * FL_OFFSET[i])).sin();
+            // sustained sound spreads a broad soft veil, impulsive sound compact dense puffs; kicks splash wider
+            let broad = 1.0 + 0.6 * sustain;
+            let sigma = FL_SIGMA[i] * broad + if i == 0 { 0.2 * self.push } else { 0.0 };
             // a bass impact (push) splashes extra dye: kicks paint, a steady bass line only flows
-            let splash = if i == 0 { 1.0 + 4.0 * self.push } else { 1.0 };
+            // the treble veil thins as it spreads (up to 3x wider, half the peak): airy, never a slab
+            let splash = match i {
+                0 => 1.0 + 4.0 * self.push,
+                2 => 1.0 / (1.0 + self.tspread),
+                _ => 1.0,
+            };
             let s =
                 (self.strength[i] * splash * self.gate * (1.0 + 0.3 * self.build)).clamp(0.0, 1.3);
             // defensive: the orbit already lies inside the safe zone; a clamp keeps it there whatever the inputs
@@ -281,10 +356,15 @@ impl FluidMap {
                 x.clamp(FLUID_SAFE_X.0, FLUID_SAFE_X.1),
                 y.clamp(FLUID_SAFE_Y.0, FLUID_SAFE_Y.1),
             );
-            emit[i] = [x, y, s, sigma];
-            swirl[i] = FL_SWIRL[i] * (0.3 + 0.7 * self.strength[i]);
+            // the splat never reaches the lyrics line (0.62)
+            emit[i] = [x, y, s, sigma.min(0.6 - y)];
+            // impulsive music spins its emitters, sustained music barely stirs them (laminar drift)
+            swirl[i] = FL_SWIRL[i] * (0.3 + 0.7 * self.strength[i]) * (0.4 + 0.6 * self.imp);
         }
-        swirl[3] = self.push * self.gate;
+        swirl[3] = (self.push + self.lift) * self.gate;
+        // the jet is as narrow as the bass splat for impacts and broad (large-scale) for a sustained low end
+        let jet_w = (self.push * 2.0 * emit[0][3] + self.lift * FL_LIFT_WIDTH)
+            / (self.push + self.lift).max(1e-4);
         let heat = 1.5 * bs * ceiling * self.gate;
 
         // onset + accent -> one smooth vortex (alpha envelope in the shader), >= 250 ms apart, two slots
@@ -295,12 +375,20 @@ impl FluidMap {
             }
         }
         self.since_vort += dt;
+        // the features trail the onset by a frame or two (the short envelope has not risen yet on the onset's
+        // own tick), so an onset waits up to FL_ONSET_WAIT_S for its accent to confirm it
+        self.onset_wait = (self.onset_wait - dt).max(0.0);
+        if !silent && onsets > 0 {
+            self.onset_wait = FL_ONSET_WAIT_S;
+            self.onset_str = c(onset_strength);
+        }
         let accent = (0..3).map(|i| band(&m.accent, i)).fold(0.0f32, f32::max);
         if !silent
-            && onsets > 0
+            && self.onset_wait > 0.0
             && self.since_vort >= FLUID_VORTEX_GAP_S
             && accent > 0.04 + 0.12 * calm
         {
+            self.onset_wait = 0.0;
             self.since_vort = 0.0;
             self.spawns = self.spawns.wrapping_add(1);
             let dom = (0..3)
@@ -314,7 +402,7 @@ impl FluidMap {
             } else {
                 -1.0
             };
-            let amp = sign * 0.3 * (0.4 + 0.6 * c(onset_strength)) * ceiling * (1.0 - 0.5 * calm);
+            let amp = sign * 0.3 * (0.4 + 0.6 * self.onset_str) * ceiling * (1.0 - 0.5 * calm);
             let slot = usize::from(self.vort[1][3] > self.vort[0][3]); // the older one
             self.vort[slot] = [x, y, amp, 0.0];
             self.vhue[slot] = c(m.centroid);
@@ -324,8 +412,13 @@ impl FluidMap {
             swirl,
             vort: self.vort,
             flow: [self.speed, self.freq, self.phase, 0.012],
-            look: [self.tau, heat, self.exposure, 0.0],
-            misc: [self.vhue[0], self.vhue[1], 0.0, 0.0],
+            look: [self.tau, heat, self.exposure, jet_w],
+            misc: [
+                self.vhue[0],
+                self.vhue[1],
+                0.2 + 0.8 * self.imp,
+                self.tspread,
+            ],
         }
     }
 }
@@ -986,34 +1079,22 @@ pub(crate) mod fluid_tests {
         synth::kick_train(120.0, secs, 0.8, SR).0
     }
 
+    /// The first `secs` of a built-in fixture.
+    pub(crate) fn fx(name: &str, secs: f32) -> Vec<f32> {
+        let mut x = crate::sim::fixture(name, SR).expect("fixture");
+        assert!(x.len() >= n(secs), "{name} is shorter than {secs} s");
+        x.truncate(n(secs));
+        x
+    }
+
     /// Hi-hats: short noise bursts every 0.25 s at the demo fixture's hat level (broadband, treble-heavy).
     pub(crate) fn hats(secs: f32) -> Vec<f32> {
-        synth::noise(9, 0.12, n(secs))
-            .iter()
-            .enumerate()
-            .map(|(i, w)| {
-                if (i as f32 / SR as f32 / 0.25).fract() < 0.12 {
-                    *w
-                } else {
-                    0.0
-                }
-            })
-            .collect()
+        fx("hats", secs)
     }
 
     /// Steady three-note pad with a 1.5 s fade-in (no attack transient).
     pub(crate) fn pad(secs: f32) -> Vec<f32> {
-        let len = n(secs);
-        let notes: Vec<Vec<f32>> = [262.0f32, 330.0, 392.0]
-            .iter()
-            .map(|&f| synth::sine(f, 0.15, SR, len))
-            .collect();
-        (0..len)
-            .map(|i| {
-                let fade = (i as f32 / n(1.5) as f32).min(1.0);
-                fade * fade * (notes[0][i] + notes[1][i] + notes[2][i])
-            })
-            .collect()
+        fx("pad", secs)
     }
 
     pub(crate) fn run(x: &[f32], fps: f32) -> Vec<Tick> {
@@ -1065,6 +1146,113 @@ pub(crate) mod fluid_tests {
             .fold(0.0, f32::max);
         assert!(best > 0.6, "bass emitter strength {best}");
         assert!(t.iter().all(|k| in_safe_zone(&k.params.fluid)));
+    }
+
+    /// Means of the mapper outputs over the last 4 s of 8 s of a fixture, plus the vortex spawns in that window.
+    struct Char {
+        tau: f32,
+        detail: f32,
+        lift: f32,
+        jet_w: f32,
+        freq: f32,
+        spread: f32,
+        bass_emit: f32,
+        spawns: usize,
+    }
+
+    fn character(name: &str) -> Char {
+        // the looping 9 kHz fixture is 4 s long; the same tone for 8 s
+        let x = match name {
+            "treble" => synth::sine(9000.0, 0.4, SR, n(8.0)),
+            _ => fx(name, 8.0),
+        };
+        let t = run(&x, 60.0);
+        let tail = &t[t.len() - 240..];
+        let avg = |f: &dyn Fn(&FluidParams) -> f32| {
+            tail.iter().map(|k| f(&k.params.fluid)).sum::<f32>() / tail.len() as f32
+        };
+        Char {
+            tau: avg(&|f| f.look[0]),
+            detail: avg(&|f| f.misc[2]),
+            lift: avg(&|f| f.swirl[3]),
+            jet_w: avg(&|f| f.look[3]),
+            freq: avg(&|f| f.flow[1]),
+            spread: avg(&|f| f.misc[3]),
+            bass_emit: avg(&|f| f.emit[0][2]),
+            spawns: spawn_times(tail).len(),
+        }
+    }
+
+    /// FL1: kick, pad, sub-bass drone, hats and a 9 kHz tone move differently because their spectral and temporal
+    /// features differ (crest, onsets, low end, centroid), not because of noise or a louder global intensity.
+    #[test]
+    fn fluid_motion_character_follows_the_music_features() {
+        let [kick, pad, drone, hats, treble] =
+            ["kick", "pad", "drone", "hats", "treble"].map(character);
+        for (n, c) in [
+            ("kick", &kick),
+            ("pad", &pad),
+            ("drone", &drone),
+            ("hats", &hats),
+            ("treble", &treble),
+        ] {
+            eprintln!(
+                "FLUID char {n:6} tau={:.2} detail={:.2} lift={:.3} jet_w={:.3} freq={:.2} spread={:.2} bass_emit={:.2} spawns={}",
+                c.tau, c.detail, c.lift, c.jet_w, c.freq, c.spread, c.bass_emit, c.spawns
+            );
+        }
+        // impulsive (kick, hats): vortices, churning fine curl, short dye memory
+        assert!(kick.spawns >= 4 && hats.spawns >= 4, "onsets spin vortices");
+        assert!(pad.spawns == 0 && drone.spawns == 0 && treble.spawns == 0);
+        for (c, s) in [(&kick, "kick"), (&hats, "hats")] {
+            assert!(c.detail > 0.6, "{s} churns: detail {}", c.detail);
+            assert!(c.tau < 5.0, "{s} forgets fast: tau {}", c.tau);
+        }
+        // sustained (pad, drone, tone): laminar, long memory
+        for (c, s) in [(&pad, "pad"), (&drone, "drone"), (&treble, "treble")] {
+            assert!(c.detail < 0.35, "{s} is laminar: detail {}", c.detail);
+            assert!(
+                c.tau > kick.tau + 1.5,
+                "{s} remembers: tau {} vs kick {}",
+                c.tau,
+                kick.tau
+            );
+        }
+        // a steady low end lifts a broad, large-scale plume; kick impacts are narrow jets; a pad lifts little
+        assert!(
+            drone.lift > 0.06 && drone.jet_w > 0.25,
+            "drone plume {} {}",
+            drone.lift,
+            drone.jet_w
+        );
+        assert!(
+            kick.jet_w < drone.jet_w - 0.05,
+            "kick jet {} vs drone {}",
+            kick.jet_w,
+            drone.jet_w
+        );
+        assert!(
+            pad.lift < 0.5 * drone.lift,
+            "pad lift {} vs drone {}",
+            pad.lift,
+            drone.lift
+        );
+        // the pad's 262 Hz spill does not drive the bass emitter like a real low end does
+        assert!(
+            pad.bass_emit < 0.5 * drone.bass_emit,
+            "pad bass {} vs drone {}",
+            pad.bass_emit,
+            drone.bass_emit
+        );
+        // structure scale follows the centroid: drone largest, pad finer, highs finest
+        assert!(drone.freq + 0.3 < pad.freq && pad.freq + 0.5 < treble.freq.min(hats.freq));
+        // a sustained high tone spreads into a wide veil; hats stay compact
+        assert!(
+            treble.spread > 0.8 && hats.spread < 0.5 * treble.spread,
+            "spread {} {}",
+            treble.spread,
+            hats.spread
+        );
     }
 
     #[test]
@@ -1452,7 +1640,7 @@ mod fluid_gpu_tests {
             ("treble", sine(9000.0, 0.4)),
             ("demo", demo[..SR as usize * 8].to_vec()),
         ];
-        let mut finals = Vec::new();
+        let mut finals: Vec<(&str, Vec<f32>, f32)> = Vec::new();
         for (name, x) in &fixtures {
             let mut s = scene(&h, 1);
             let (mut worst_mean, mut worst_p95) = (0.0f32, 0.0f32);
@@ -1488,8 +1676,20 @@ mod fluid_gpu_tests {
                     mg_media::synth::png_rgba(RES.0, RES.1, &last),
                 );
             }
-            finals.push((*name, thumb(&last)));
+            // mean luminance above the lyrics line (rows with uv y < 0.62)
+            let rows = (SPLIT * RES.1 as f32) as usize;
+            let upper = lum(&last[..rows * RES.0 as usize * 4]).iter().sum::<f32>()
+                / (rows * RES.0 as usize) as f32;
+            finals.push((*name, thumb(&last), upper));
         }
+        // FL2: a 9 kHz tone is genuinely visible above the lyrics line, not only by the thumbnail distance
+        let up = |n: &str| finals.iter().find(|f| f.0 == n).expect("fixture").2;
+        let (u_sil, u_tre) = (up("silence"), up("treble"));
+        eprintln!("FLUID upper-region luminance silence={u_sil:.4} treble={u_tre:.4}");
+        assert!(
+            u_tre >= u_sil + 0.02,
+            "treble barely visible: {u_tre:.4} vs silence {u_sil:.4}"
+        );
         let mut alike = Vec::new();
         for a in 0..finals.len() {
             for b in a + 1..finals.len() {
@@ -1540,6 +1740,87 @@ mod fluid_gpu_tests {
                 e[1]
             );
         }
+    }
+
+    /// Dye field shape after 8 s of a fixture from a clear field: (energy, fine structure = sum |grad| / energy in
+    /// 1/texel, horizontal spread = energy-weighted std of x in widths, mean height in uv y).
+    fn shape(h: &Headless, x: &[f32]) -> (f64, f64, f64, f64) {
+        let mut s = scene(h, 1);
+        drive(&mut s, h, &run(x, 60.0), |_, _| {});
+        let (w, hh, d) = s.fluid_dye(&h.device, &h.queue).expect("dye");
+        let e = |x: u32, y: u32| {
+            let i = ((y * w + x) * 4) as usize;
+            f64::from(d[i] + d[i + 1] + d[i + 2])
+        };
+        let (mut sum, mut grad, mut mx, mut mx2, mut my) = (0.0, 0.0, 0.0, 0.0, 0.0);
+        for y in 0..hh - 1 {
+            for x in 0..w - 1 {
+                let v = e(x, y);
+                let (fx, fy) = (f64::from(x) / f64::from(w), f64::from(y) / f64::from(hh));
+                sum += v;
+                grad += (e(x + 1, y) - v).abs() + (e(x, y + 1) - v).abs();
+                mx += v * fx;
+                mx2 += v * fx * fx;
+                my += v * fy;
+            }
+        }
+        let n = sum.max(1e-9);
+        (
+            sum,
+            grad / n,
+            (mx2 / n - (mx / n).powi(2)).max(0.0).sqrt(),
+            my / n,
+        )
+    }
+
+    /// FL1 / FL2 on the GPU: the fixtures leave differently SHAPED fields (not just more or less dye): a kick
+    /// churns finer structure than a sustained drone, the drone's plume rises higher than the kick's strikes, and
+    /// a 9 kHz tone spreads a wide veil where silence leaves nothing.
+    #[test]
+    fn fluid_fixtures_leave_differently_shaped_fields_headless() {
+        let Some(h) = device() else { return };
+        let sine = |f: f32, a: f32| mg_dsp::synth::sine(f, a, SR, SR as usize * 8);
+        let [silence, kick, pad, drone, treble] = [
+            vec![0.0; SR as usize * 8],
+            kick(8.0),
+            pad(8.0),
+            super::fluid_tests::fx("drone", 8.0),
+            sine(9000.0, 0.4),
+        ]
+        .map(|x| shape(&h, &x));
+        for (n, s) in [
+            ("silence", silence),
+            ("kick", kick),
+            ("pad", pad),
+            ("drone", drone),
+            ("treble", treble),
+        ] {
+            eprintln!(
+                "FLUID shape {n:7} energy={:.1} fine={:.4} x_spread={:.3} mean_y={:.3}",
+                s.0, s.1, s.2, s.3
+            );
+        }
+        assert_eq!(silence.0, 0.0, "silence paints nothing");
+        assert!(treble.0 > 500.0, "a 9 kHz tone paints: {}", treble.0);
+        assert!(
+            treble.2 > 1.15 * drone.2.max(pad.2),
+            "the treble veil is the widest: {} vs drone {} / pad {}",
+            treble.2,
+            drone.2,
+            pad.2
+        );
+        assert!(
+            kick.1 > 1.15 * drone.1,
+            "a kick churns finer structure than a drone: {} vs {}",
+            kick.1,
+            drone.1
+        );
+        assert!(
+            drone.3 + 0.02 < kick.3,
+            "the drone plume rides higher than the kick strikes: {} vs {}",
+            drone.3,
+            kick.3
+        );
     }
 
     /// Ten simulated minutes of extreme, then hostile, input on T0 (no rendering): the field stays finite and bounded.

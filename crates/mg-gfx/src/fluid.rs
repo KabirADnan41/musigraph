@@ -8,7 +8,9 @@
 //!   frame; an over-budget remainder is dropped so a slow frame never snowballs).
 //! * Lifetime: textures exist only while Fluid is shown or crossfading (`release` drops them, so a re-entry
 //!   starts from a clear field); while released the scene reads a 1x1 zero texture. Nothing is allocated per
-//!   frame: textures are recreated only on first use, grid change (tier or aspect) or re-entry.
+//!   frame: textures are recreated only on first use, tier change or re-entry, and for an aspect change only
+//!   once it exceeds `REGRID_TOLERANCE` and has settled (`RegridPolicy`); the field is then resampled into the
+//!   new grid (`fs_copy`), never cleared, so a fullscreen toggle or a window drag keeps the picture.
 //! * Must not: read audio, invent activity, or inject anything into the bottom 38% of the screen (shader).
 
 /// Grid heights of the quality tiers T0..T3 (width follows the render aspect).
@@ -21,6 +23,11 @@ pub const MAX_STEPS_PER_FRAME: u32 = 3;
 /// Bytes of the packed `FU` block in `fluid.wgsl` (10 x vec4).
 pub const FLUID_UNIFORM_BYTES: usize = 160;
 const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
+/// Relative grid-width change ignored (window chrome, odd sizes): the sim keeps its grid, the render stretches
+/// it by at most this much.
+pub const REGRID_TOLERANCE: f32 = 0.03;
+/// Calls (frames) a new grid must hold before the field is resampled into it: a window drag never reallocates.
+pub const REGRID_SETTLE: u32 = 12;
 
 /// What the CPU mapper hands the Fluid simulation each frame (see `fluid.wgsl` `FU` for units).
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -33,9 +40,10 @@ pub struct FluidParams {
     pub vort: [[f32; 4]; 2],
     /// Noise flow speed (sh/s), noise frequency (1/sh), evolution phase (lattice units, 0..256), buoyancy (sh/s).
     pub flow: [f32; 4],
-    /// Dye memory tau (s), heat rate (1/s), exposure, unused.
+    /// Dye memory tau (s), heat rate (1/s), exposure, jet width (sh; <= 0.03 means twice the bass splat).
     pub look: [f32; 4],
-    /// Vortex dye hue (0 bass .. 1 treble) for slots 0 and 1, unused, unused.
+    /// Vortex dye hue (0 bass .. 1 treble) for slots 0 and 1, flow detail (0 laminar .. 1 turbulent: weight of
+    /// the fine noise octave), treble spread (0..1: the treble splat widens up to 3x horizontally).
     pub misc: [f32; 4],
 }
 
@@ -51,32 +59,65 @@ impl Default for FluidParams {
             vort: [[0.5, 0.3, 0.0, 100.0]; 2],
             flow: [0.008, 3.0, 0.0, 0.012],
             look: [3.0, 0.0, 1.0, 0.0],
-            misc: [0.0; 4],
+            misc: [0.0, 0.0, 1.0, 0.0],
         }
     }
 }
 
 impl FluidParams {
-    /// Packs the WGSL `FU` block (non-finite values become 0).
-    pub fn pack(&self, maccormack: bool) -> Vec<u8> {
-        let mut v: Vec<f32> = Vec::with_capacity(FLUID_UNIFORM_BYTES / 4);
-        for e in &self.emit {
-            v.extend_from_slice(e);
-        }
-        v.extend_from_slice(&self.swirl);
-        for o in &self.vort {
-            v.extend_from_slice(o);
-        }
-        v.extend_from_slice(&self.flow);
-        v.extend_from_slice(&self.look);
-        v.extend_from_slice(&self.misc);
-        v.extend_from_slice(&[if maccormack { 1.0 } else { 0.0 }, 0.0, 0.0, 0.0]);
-        let out: Vec<u8> = v
+    /// Packs the WGSL `FU` block (non-finite values become 0). `round_trip` enables the step's round-trip
+    /// error correction; `grid` is the simulation grid (the resample pass reads it).
+    pub fn pack(&self, round_trip: bool, grid: (u32, u32)) -> [u8; FLUID_UNIFORM_BYTES] {
+        let sim = [
+            if round_trip { 1.0 } else { 0.0 },
+            grid.0 as f32,
+            grid.1 as f32,
+            0.0,
+        ];
+        let mut out = [0u8; FLUID_UNIFORM_BYTES];
+        let vals = self
+            .emit
             .iter()
-            .flat_map(|x| (if x.is_finite() { *x } else { 0.0 }).to_ne_bytes())
-            .collect();
-        debug_assert_eq!(out.len(), FLUID_UNIFORM_BYTES);
+            .chain([&self.swirl])
+            .chain(&self.vort)
+            .chain([&self.flow, &self.look, &self.misc, &sim])
+            .flatten();
+        for (dst, x) in out.chunks_exact_mut(4).zip(vals) {
+            dst.copy_from_slice(&(if x.is_finite() { *x } else { 0.0 }).to_ne_bytes());
+        }
         out
+    }
+}
+
+/// Whether a grid change from `cur` to `want` is worth a reallocation (tier change or a width change beyond
+/// `REGRID_TOLERANCE`).
+fn beyond_tolerance(cur: (u32, u32), want: (u32, u32)) -> bool {
+    cur.1 != want.1 || (want.0 as f32 - cur.0 as f32).abs() > REGRID_TOLERANCE * cur.0 as f32
+}
+
+/// Debounces grid changes: a new grid is adopted only after the same target held for `REGRID_SETTLE` calls.
+#[derive(Default, Clone, Debug)]
+struct RegridPolicy {
+    pending: Option<((u32, u32), u32)>,
+}
+
+impl RegridPolicy {
+    /// True when the sim should move from `cur` to `want` now.
+    fn update(&mut self, cur: (u32, u32), want: (u32, u32)) -> bool {
+        if !beyond_tolerance(cur, want) {
+            self.pending = None;
+            return false;
+        }
+        let held = match self.pending {
+            Some((g, n)) if g == want => n + 1,
+            _ => 1,
+        };
+        self.pending = Some((want, held));
+        if held >= REGRID_SETTLE {
+            self.pending = None;
+            return true;
+        }
+        false
     }
 }
 
@@ -123,6 +164,9 @@ struct Buffers {
 
 pub struct FluidSim {
     pipeline: wgpu::RenderPipeline,
+    /// `fs_copy`: resamples the current field into a new grid.
+    copy: wgpu::RenderPipeline,
+    regrid: RegridPolicy,
     bgl: wgpu::BindGroupLayout,
     empty_group: wgpu::BindGroup,
     uniform: wgpu::Buffer,
@@ -190,6 +234,14 @@ impl FluidSim {
             FORMAT,
             "fs_sim",
         );
+        let copy = crate::fullscreen::make_pipeline(
+            device,
+            &shader,
+            &[Some(&empty_bgl), Some(&bgl)],
+            "fluid-copy",
+            FORMAT,
+            "fs_copy",
+        );
         let uniform = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("fluid-uniform"),
             size: FLUID_UNIFORM_BYTES as u64,
@@ -206,6 +258,8 @@ impl FluidSim {
         let idle_group = make_group(device, &bgl, &uniform, &idle_view, &sampler);
         Self {
             pipeline,
+            copy,
+            regrid: RegridPolicy::default(),
             bgl,
             empty_group,
             uniform,
@@ -243,6 +297,7 @@ impl FluidSim {
     pub fn release(&mut self) {
         self.bufs = None;
         self.clock = StepClock::default();
+        self.regrid = RegridPolicy::default();
     }
 
     /// The bind group the scene shader reads (current dye, or the idle 1x1 zero texture).
@@ -276,18 +331,38 @@ impl FluidSim {
         p: &FluidParams,
         n: u32,
     ) {
-        let grid = grid_for(self.tier, res);
-        if self.bufs.as_ref().is_none_or(|b| b.grid != grid) {
-            self.bufs = Some(self.make_buffers(device, grid));
-        }
-        queue.write_buffer(&self.uniform, 0, &p.pack(self.tier > 0));
-        if n == 0 {
+        let want = grid_for(self.tier, res);
+        let old = match self.bufs.take() {
+            None => None,
+            Some(b) if self.regrid.update(b.grid, want) => Some(b),
+            keep => {
+                self.bufs = keep;
+                None
+            }
+        };
+        let b = self.bufs.get_or_insert_with(|| {
+            make_buffers(device, &self.bgl, &self.uniform, &self.sampler, want)
+        });
+        // written before the commands below run: the copy pass reads the new grid from it
+        queue.write_buffer(&self.uniform, 0, &p.pack(self.tier > 0, b.grid));
+        if old.is_none() && n == 0 {
             return;
         }
-        let Some(b) = self.bufs.as_mut() else { return };
         let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("fluid-steps"),
         });
+        if let Some(o) = &old {
+            // the new pair starts as the old field resampled (cur = 0), never as a clear field
+            let mut pass = begin_pass(
+                &mut enc,
+                &b.views[0],
+                wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+            );
+            pass.set_pipeline(&self.copy);
+            pass.set_bind_group(0, &self.empty_group, &[]);
+            pass.set_bind_group(1, &o.groups[o.cur], &[]);
+            pass.draw(0..3, 0..1);
+        }
         for _ in 0..n {
             let mut pass = begin_pass(&mut enc, &b.views[1 - b.cur], wgpu::LoadOp::Load);
             pass.set_pipeline(&self.pipeline);
@@ -298,22 +373,6 @@ impl FluidSim {
             b.cur = 1 - b.cur;
         }
         queue.submit(Some(enc.finish()));
-    }
-
-    fn make_buffers(&self, device: &wgpu::Device, grid: (u32, u32)) -> Buffers {
-        let (t0, v0) = dye_texture(device, grid);
-        let (t1, v1) = dye_texture(device, grid);
-        let groups = [
-            make_group(device, &self.bgl, &self.uniform, &v0, &self.sampler),
-            make_group(device, &self.bgl, &self.uniform, &v1, &self.sampler),
-        ];
-        Buffers {
-            textures: [t0, t1],
-            views: [v0, v1],
-            groups,
-            cur: 0,
-            grid,
-        }
     }
 
     /// Reads the current dye texture back as RGBA f32 (tests and diagnostics; waits for the GPU).
@@ -385,6 +444,28 @@ impl FluidSim {
         drop(data);
         buf.unmap();
         Ok((w, h, out))
+    }
+}
+
+fn make_buffers(
+    device: &wgpu::Device,
+    bgl: &wgpu::BindGroupLayout,
+    uniform: &wgpu::Buffer,
+    sampler: &wgpu::Sampler,
+    grid: (u32, u32),
+) -> Buffers {
+    let (t0, v0) = dye_texture(device, grid);
+    let (t1, v1) = dye_texture(device, grid);
+    let groups = [
+        make_group(device, bgl, uniform, &v0, sampler),
+        make_group(device, bgl, uniform, &v1, sampler),
+    ];
+    Buffers {
+        textures: [t0, t1],
+        views: [v0, v1],
+        groups,
+        cur: 0,
+        grid,
     }
 }
 
@@ -532,7 +613,7 @@ mod tests {
             look: [13.0; 4],
             misc: [14.0, 0.0, 0.0, 15.0],
         };
-        let b = p.pack(true);
+        let b = p.pack(true, (384, 216));
         let at = |i: usize| f32::from_ne_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]]);
         assert_eq!(b.len(), FLUID_UNIFORM_BYTES);
         assert_eq!((at(0), at(12), at(48), at(60)), (1.0, 4.0, 7.0, 8.0));
@@ -546,12 +627,80 @@ mod tests {
             (at(112), at(128), at(140), at(144)),
             (13.0, 14.0, 15.0, 1.0)
         );
-        assert_eq!(at(144), 1.0, "MacCormack flag");
+        assert_eq!(at(144), 1.0, "round-trip correction flag");
+        assert_eq!((at(148), at(152), at(156)), (384.0, 216.0, 0.0), "grid");
         assert_eq!(
-            FluidParams::default().pack(false)[144..148],
+            FluidParams::default().pack(false, (1, 1))[144..148],
             0f32.to_ne_bytes()
         );
         let src = include_str!("fluid.wgsl");
         assert!(src.contains("emit: array<vec4<f32>, 3>") && src.contains("sim: vec4<f32>"));
+    }
+
+    #[test]
+    fn small_aspect_changes_never_regrid_and_large_ones_wait_to_settle() {
+        let mut r = RegridPolicy::default();
+        let cur = grid_for(1, (1920, 1080));
+        // window chrome / odd sizes within the tolerance: never a reallocation
+        for res in [(1920, 1050), (1900, 1080), (1960, 1080)] {
+            for _ in 0..100 {
+                assert!(!r.update(cur, grid_for(1, res)), "{res:?}");
+            }
+        }
+        // a window drag: the target changes every frame, so nothing is reallocated while it moves
+        for w in 0..200u32 {
+            assert!(!r.update(cur, grid_for(1, (1400 + 2 * w, 1080))));
+        }
+        // once it holds, exactly one regrid after REGRID_SETTLE frames
+        let want = grid_for(1, (1440, 1080));
+        let fired: Vec<bool> = (0..REGRID_SETTLE + 5)
+            .map(|_| r.update(cur, want))
+            .collect();
+        assert_eq!(fired.iter().filter(|&&f| f).count(), 1);
+        assert!(fired[REGRID_SETTLE as usize - 1]);
+    }
+
+    #[test]
+    fn a_grid_change_resamples_the_field_instead_of_clearing_it_headless() {
+        let Ok(h) = crate::context::init_headless() else {
+            eprintln!("SKIPPED (no hardware GPU in this environment)");
+            return;
+        };
+        let wgsl = concat!(include_str!("common.wgsl"), include_str!("fluid.wgsl"));
+        let mut sim = FluidSim::new(&h.device, wgsl);
+        let mut p = FluidParams::default();
+        for e in &mut p.emit {
+            e[2] = 0.8;
+        }
+        let mean = |sim: &FluidSim| {
+            let (w, hh, d) = sim.read_dye(&h.device, &h.queue).expect("dye");
+            (
+                (w, hh),
+                d.chunks_exact(4)
+                    .map(|c| f64::from(c[0] + c[1] + c[2]))
+                    .sum::<f64>()
+                    / f64::from(w * hh),
+            )
+        };
+        sim.step(&h.device, &h.queue, (1920, 1080), &p, 120);
+        let (g0, m0) = mean(&sim);
+        assert!(m0 > 0.01, "the emitters painted: {m0}");
+        // small aspect change: same textures, untouched field
+        let q = FluidParams {
+            emit: p.emit.map(|e| [e[0], e[1], 0.0, e[3]]),
+            ..p
+        };
+        for _ in 0..30 {
+            sim.step(&h.device, &h.queue, (1920, 1050), &q, 0);
+        }
+        assert_eq!(mean(&sim), (g0, m0), "no reallocation within the tolerance");
+        // fullscreen-like toggle to 4:3: after it settles, a new grid with the same field resampled
+        for _ in 0..REGRID_SETTLE {
+            sim.step(&h.device, &h.queue, (1440, 1080), &q, 0);
+        }
+        let (g1, m1) = mean(&sim);
+        assert_eq!(g1, grid_for(DEFAULT_TIER, (1440, 1080)));
+        eprintln!("FLUID regrid {g0:?} -> {g1:?}: mean dye {m0:.4} -> {m1:.4}");
+        assert!((m1 - m0).abs() <= 0.05 * m0, "mean dye {m0} -> {m1}");
     }
 }
