@@ -447,3 +447,80 @@ The mg-media test count there should read 33 for commit 3eb9341 (36 included 3 u
   - (2) `same_artist`: whole credit, or the main credit with featured guests removed, or the first-artist shortcut only when the RECORD credits several artists. "Earth, Wind & Fire" no longer matches "Earth".
 - **Consequence:** the existing case ("Test Artist, Guest" sent vs "Test Artist" record) moved from accepted to rejected. It has exactly the shape of the band-name case, so this is a stricter expectation, made explicit in its own test (owner question Q-005c).
 - **Checks:** mg-media 81 tests pass; clippy clean; rustfmt on the two files.
+
+## 2026-11-27 - Album Focus part 1: composition, typography wiring, track-change choreography, lyric column (implementation agent)
+- **Branch:** feature/poc-audio-fullscreen; started on 3c0574b; the main session committed 228c6ff..7935d50 meanwhile (scene_map.rs, mg-media, log.md only; no overlap). Uncommitted.
+- **Files:**
+  - `crates/mg-engine/src/presentation.rs`: easing (`Curve`, `Tween`), type `Role`s, `album_geom` / `album_block_top` / `album_lyric_column`, `role_colors`, `render_fit`, and the reworked state machine.
+  - `crates/mg-engine/src/lyric_view.rs`: Album Focus `Column` mode (`column_phase`, `slide_secs`); the classic view is unchanged. A corrupted doc comment on `lift` is fixed.
+  - `crates/mg-engine/src/scene_run.rs`: `--reduced-motion` flag, `set_bar` / `set_album_scene` wiring, the new GPU ops, focus rect from the current or previous cover, control-bar fg/tint from the new fields.
+  - `crates/mg-engine/src/selftest.rs`: new ops; new `album_previews`.
+  - `crates/mg-gfx/src/overlay.rs` + `overlay.wgsl`: art plate, previous-cover slot, meta slot, per-role colours, lyric emphasis and column mask; the halo is removed.
+- **What was built and why (rule that drove it):**
+  1. **Composition.** Album Focus = Focus scene + Center layout (A still cycles Corner/Center/Off).
+     - Landscape stage min(W, 1.9H). Cover 0.56H at (0.31Sw, 0.46H). 16:10/4:3: min(0.52H, 0.40W) at 0.29W. Portrait under 1.15, or when the column would be under 0.30W.
+     - The cover shrinks (never clips) to stay above the control-bar zone and inside the 0.04H margin.
+     - Text column = cover right + 0.06H. The title block's last baseline sits on the cover's bottom edge (lyrics). Without lyrics it is centred on the cover.
+     - Lyric column: from 0.18H down to the block top - 0.05H; current line at 0.42H.
+     - Text-led (no cover): the column starts on the cover slot's left edge. better-layout "Align to shared edges": the lyric column, title block and cover share edges.
+     - Group gap 0.05H vs in-group 0.012H. better-layout "between groups >= 2x within".
+     - Portrait without lyrics: cover + title centred vertically (iteration 2, after the preview showed a dead bottom third).
+     - The column width does not depend on the cover, so a late cover never re-wraps the text.
+  2. **Art plate** (overlay.wgsl): radius 0.02S, 1 px inner stroke white 8 %, contact shadow (y 0.0107S, blur 0.0214S, a 0.55) + ambient (0.054S, 0.16S, a 0.45, bg hue at L 0.05).
+     - The spec's 0.006/0.012/0.03/0.09H are these at S = 0.56H. Scaled by S so the 0.20H corner cover gets proportional depth.
+     - Removed: the music-reactive halo (`halo`/`spread`) and the inner edge darkening. The picture is sampled 1:1.
+     - Not changed here: stars, the pink glow and the dark gap ring come from focus.wgsl (part 2).
+  3. **Typography.** Roles per the spec table: lyric 0.044 Display 600 -0.012em lh 1.15; title 0.036/0.058 Display 600 -0.015em lh 1.10; artist 0.022/0.028 Text 400; meta 0.017.
+     - Display cut only at >= 24 px (better-typography: Display/Text optical cuts; tracking only on headings >= 24 px).
+     - Floor of 12 px (better-typography "rarely below 12px", iteration 2: the 540p meta line was 9 px).
+     - Title and current lyric: 2 lines, word wrap, one size step (0.85 / 0.88) before the word ellipsis. Balanced by bisecting the width, at most 6 layouts on the worker (better-typography "balance short headings").
+     - Artist and meta: single line.
+     - Bangla x1.08, lh 1.35; CJK lh 1.3 (mg-text drops tracking outside Latin/Greek/Cyrillic).
+     - RTL lines align to their start edge within the block (better-layout logical start).
+     - Colours: one hue (the most chromatic of highlight/accent/main), chroma 0.025, fixed OKLab L per role: 0.93/0.80/0.62/0.95/0.66. better-colors "hold the hue, perceived lightness is L"; never plain grey.
+     - Text shadow 0.25 in Album Focus (spec <= 0.25); 0.55 elsewhere until the part-2 pocket exists.
+     - Drawn strings come from `display_meta`; the meta line is "album · version". Raw strings still go to the lyric lookup.
+     - Corner restyle: cover 0.20H at 0.055H, title 0.030H, artist 0.019H. It rises over the bar zone by the overlap times the bar's visibility (follows the bar's 180 ms fade). The legacy Center layout of the other scenes keeps its geometry.
+  4. **Choreography** (all named constants: `TEXT_OUT_S` 0.22, `TEXT_OUT_DY` -0.008, `TEXT_ENTER_AT` 0.30/0.36/0.42, `TEXT_STAGGER_S` 0.06, `TEXT_IN_S` 0.36, `TEXT_IN_DY` +0.010, `ART_XFADE_S` 0.70, `ART_OUT_S` 0.28, `PALETTE_SECS` 2.5 -> 3.0 per spec).
+     - `Tween::retarget` always starts from the current value. animate: "transitions, not keyframes, for anything triggered rapidly".
+     - Curves: animate `--ease-out` (0.23,1,0.32,1) for enter/exit, `--ease-in-out` (0.77,0,0.175,1) for the lyric slide.
+     - New bitmaps upload only after the old text has left. A late text request for an obsolete track is dropped by track id + serial.
+     - Cover crossfade: two textures (current/previous). The new cover fades in OVER the held previous one, so there is no dip to the background (emil: crossfade as one object). The previous one is released when the new one is opaque.
+     - Rapid skips keep the texture that contributes more and drop the obsolete one, so there are at most 2 cover textures.
+     - A stale cover with no successor leaves in 0.28 s, before the new title enters.
+     - Late cover: the text-led composition first, then the text glides to the column while the cover fades in (no blank frame).
+     - Blur bridge hook for part 2: `presentation::art_blur_lod(t)` (returns 0) -> `ArtDraw::lod` -> `art_p.w` -> `textureSampleLevel(..., lod)`.
+     - Keyboard-initiated recomposition (A, L, scene switch) swaps at once. animate: "keyboard-initiated actions: no animation".
+  5. **Lyric column** (Album Focus only; the classic view is untouched).
+     - The state is a pure function of the position. The slide into line n runs over [t_n - d, t_n] with d = min(600 ms, 45 % of the time since line n-1 started), so it never exceeds the gap, never overlaps the previous slide and the current line is never late.
+     - A position jump (> 0.35 s) is a seek: a slide in progress there is skipped, with no queued motion.
+     - The next line waits below at context scale (the current bitmap at 0.028/0.044 = 0.64, 4-tap supersampled in the shader) and grows into place from its start edge. emil: origin-aware, never from scale 0.
+     - Colour: `lyr_e` blends from context to current colour.
+     - A feathered mask (0.03H) bounds the column; a line that arrives late fades in over 150 ms.
+  6. **Reduced motion:** PLACEHOLDER `--reduced-motion` flag (see owner questions). No y moves; covers 300 ms; text 200 ms; lyrics a 200 ms crossfade that changes position only at alpha 0. animate: "fewer and gentler, keep opacity".
+  7. **Bar coexistence.** Album Focus lays out above the bar zone `H - 128 * ui_scale`, so the landscape layout needs no lift. Portrait reserves the zone as well, so the computed lift is 0 there.
+- **Tests (all new or adapted in my files; RED observed for the matrix and the column on the first implementation: 2 failures, fixed in code; nothing weakened):**
+  - presentation: curve/tween retargeting; choreography timing (old out by 0.22 s; title/artist/meta in at 0.30/0.36/0.42 s +-3 frames; +0.010H entry); rapid text skips (only track 3's title is ever uploaded); rapid cover skips (<= 2 textures, ends on the newest).
+  - presentation: crossfade held without a dip; late cover with no blank frame; reduced motion moves nothing; per-track lyric decision (waits for the lookup <= 0.28 s, no mid-track re-layout); roles/cut/scripts; role colours (L order, tint, finite for hostile palettes); spec grid.
+  - **Overlap matrix:** 6 aspects x 4 heights (720..2160) x bar x lyrics x cover = 192 cases. Cover, block, lyric column and bar zone are pairwise >= 0.02H apart and inside the 0.04H margin. The cover's area exceeds the block's. The current lyric lies fully inside its column; every visible line starts inside it.
+  - **Text-fit corpus via real DirectWrite:** 60+ chars, Arabic, Bangla, CJK, Thai, emoji, an unbreakable 60-char word, 4 artists. Checks: <= 2 lines, ink within the column, the size step only when needed, balance.
+  - lyric_view `column_tests`: the gap rule, ordering/no overlap while playing, the current line in place at its timestamp, seek resolution forward and back, reduced motion without movement, view-kind switch.
+  - overlay: crossfade without a dip + meta slot (GPU, headless).
+  - Replaced (the spec changed the contract): "old content fades out before new content is uploaded" is now the crossfade test. "a track without artwork clears the previous cover" is stricter (gone by 0.3 s, was 1.5 s).
+- **Checks run:**
+  - `cargo fmt --all --check`: clean (rustfmt on my files only).
+  - `cargo clippy --workspace --all-targets -- -D warnings`: clean.
+  - `cargo test --workspace`: all pass (mg-engine 154). One run showed mg-media 79/1 while the main session was editing lrclib tests; reruns pass with 81.
+  - Release `mg-engine --scene-selftest` with `MG_SELFTEST_BACKEND=vulkan`: ok.
+- **Measurements (release, this machine; worker thread, CPU wall time):** title-block text job 1.1-4.3 ms. That is up to 6 DirectWrite layouts per wrapped item, never on the render thread. Fonts: Segoe UI Variable present. Overlay uniform 192 -> 336 B per frame, plus 2 texture bindings. GPU cost of the plate/text pass was NOT measured (no timestamps in this slice); per-frame CPU cost of the tweens was not timed.
+- **Previews** in `F:\musigraph\temp\previews\album-focus`: `album-<w>x<h>-<lyrics>-<art>.png` (960x540, 1260x540, 720x540, 540x960); mid-slide frames in `slide\` (MG_LYRIC_FROM=8.7).
+- **Limitations / owner questions:**
+  - (Q1) Reduced motion is a dev flag. SPI_GETCLIENTAREAANIMATION needs the `windows` feature `Win32_UI_WindowsAndMessaging` on mg-engine, or one `extern "system"` user32 declaration (unsafe in mg-engine). Not added.
+  - (Q2) A and L recompose at once mid-track (user-initiated). Automatic changes (late lyrics) never re-lay out a track.
+  - (Q3) Context lyric lines are the Display 600 bitmap scaled to 0.64, not a separate Text 400 rendering, for continuity of the grow-into-place motion.
+  - (Q4) The slide ends at the line's timestamp (up to 600 ms pre-roll). Short slides exceed 0.15H/s by design (the gap rule wins).
+  - Portrait multi-line titles and lyrics are left-aligned inside their centred bitmap: mg-text has no paragraph alignment option.
+  - Text-led previews show focus.wgsl's default centre slot behind the text (part 2).
+  - Contrast readback (check 1) not done; it needs the part-2 pocket.
+- **Deferred to part 2:** focus.wgsl environment (stars, glow, gap ring, no-cover look), art-colour binding, CPU mips and the blur bridge (hook wired, LOD 0), contrast pocket, GPU timing.
+- **Remains:** independent Sonnet High review (§27) of this diff; commit by the main session.

@@ -5,17 +5,20 @@
 //! dropped immediately when the content goes away. Nothing is allocated or uploaded per frame; a frame
 //! only rewrites one 128-byte uniform and records one draw.
 
-const UNIFORM_BYTES: usize = 12 * 16;
+const UNIFORM_BYTES: usize = 21 * 16;
 const CONTROLS_BYTES: usize = 34 * 16;
-/// Text slots: 0 title, 1 artist, 2..=4 lyric lines, 5 elapsed time, 6 duration (control bar).
-pub const TEXT_SLOTS: usize = 7;
+/// Text slots: 0 title, 1 artist, 2..=4 lyric lines, 5 elapsed time, 6 duration (control bar), 7 meta line.
+pub const TEXT_SLOTS: usize = 8;
 /// First text slot of the control bar: `CLOCK_SLOT` is the elapsed time, `CLOCK_SLOT + 1` the duration.
 pub const CLOCK_SLOT: usize = 5;
+/// Text slot of the meta line (version / remaster note under the artist).
+pub const META_SLOT: usize = 7;
 /// Largest texture side accepted (defence in depth; callers already bound their content).
 const MAX_TEXTURE_SIDE: u32 = 4096;
 
 /// Artwork placement in surface pixels. `(cx, cy)` is the centre; `hw`/`hh` the half extents (the caller
-/// preserves the image aspect ratio when computing them).
+/// preserves the image aspect ratio when computing them). The plate (rounded corners, 1 px inner stroke, contact
+/// and ambient shadow) is drawn by the shader; nothing about it reacts to the music.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ArtDraw {
     pub cx: f32,
@@ -24,9 +27,24 @@ pub struct ArtDraw {
     pub hh: f32,
     pub alpha: f32,
     pub radius: f32,
-    /// Halo strength (0..1) and spread in pixels: the music-reactive glow that leaves the artwork.
-    pub halo: f32,
-    pub spread: f32,
+    /// Shadow strength 0..1 (1 = the spec's contact 0.55 + ambient 0.45 alphas).
+    pub shadow: f32,
+    /// Sampling LOD (blur bridge hook for the crossfade; 0 = sharp; needs a mip chain to have an effect).
+    pub lod: f32,
+}
+
+/// Linear-RGB colour per text role (album-tinted on the CPU) plus the ambient shadow tint.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct TextColors {
+    pub title: [f32; 3],
+    pub artist: [f32; 3],
+    pub meta: [f32; 3],
+    /// Current lyric line.
+    pub lyric: [f32; 3],
+    /// Context lyric lines (next / previous).
+    pub context: [f32; 3],
+    /// Ambient artwork shadow.
+    pub shade: [f32; 3],
 }
 
 /// Text placement: top-left corner and size in surface pixels, plus opacity.
@@ -216,22 +234,29 @@ impl ControlsDraw {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct OverlayParams {
     pub res: (u32, u32),
     pub time: f32,
     pub energy: f32,
+    /// Current artwork, and the previous one while the track-change crossfade runs.
     pub art: Option<ArtDraw>,
+    pub art_prev: Option<ArtDraw>,
     pub title: Option<TextDraw>,
     pub artist: Option<TextDraw>,
+    pub meta: Option<TextDraw>,
     /// Lyric lines (slot 2, 3, 4 of the text textures) and their slow glow boost (0..1).
     pub lyrics: [Option<TextDraw>; 3],
+    /// Per lyric slot: 0 = context colour, 1 = current-line colour.
+    pub lyric_emph: [f32; 3],
+    /// Lyric column mask: top, bottom, feather (px). Ink outside fades to nothing.
+    pub lyric_clip: Option<[f32; 3]>,
     pub lyric_glow: f32,
     /// Shadow strength under the text (0..1).
     pub shadow: f32,
-    /// Linear RGB.
-    pub text_color: [f32; 3],
-    pub halo_color: [f32; 3],
+    pub colors: TextColors,
+    /// Album accent (linear RGB) for the control bar.
+    pub accent: [f32; 3],
     /// The control bar when visible (None or alpha 0 = nothing drawn, zero cost).
     pub controls: Option<ControlsDraw>,
 }
@@ -251,55 +276,50 @@ impl OverlayParams {
             &mut o,
             &[self.res.0 as f32, self.res.1 as f32, self.time, self.energy],
         );
-        match &self.art {
-            Some(a) => {
-                put(&mut o, &[a.cx, a.cy, a.hw.max(0.0), a.hh.max(0.0)]);
-                put(
-                    &mut o,
-                    &[
-                        a.alpha.clamp(0.0, 1.0),
-                        a.radius.max(0.0),
-                        a.halo.clamp(0.0, 1.0),
-                        a.spread.max(1.0),
-                    ],
-                );
+        for art in [&self.art, &self.art_prev] {
+            match art {
+                Some(a) => {
+                    put(&mut o, &[a.cx, a.cy, a.hw.max(0.0), a.hh.max(0.0)]);
+                    put(
+                        &mut o,
+                        &[
+                            a.alpha.clamp(0.0, 1.0),
+                            a.radius.max(0.0),
+                            a.shadow.clamp(0.0, 1.0),
+                            a.lod.clamp(0.0, 8.0),
+                        ],
+                    );
+                }
+                None => put(&mut o, &[0.0; 8]),
             }
-            None => put(&mut o, &[0.0; 8]),
         }
+        let rgb = |c: [f32; 3], w: f32| [c[0], c[1], c[2], w];
+        put(&mut o, &rgb(self.colors.shade, 0.0));
         let text = |t: &Option<TextDraw>| match t {
             Some(t) => [t.x, t.y, t.w.max(0.0), t.h.max(0.0)],
             None => [0.0; 4],
         };
         put(&mut o, &text(&self.title));
         put(&mut o, &text(&self.artist));
+        put(&mut o, &text(&self.meta));
         let al = |t: &Option<TextDraw>| t.map_or(0.0, |t| t.alpha.clamp(0.0, 1.0));
         put(
             &mut o,
             &[
                 al(&self.title),
                 al(&self.artist),
+                al(&self.meta),
                 self.shadow.clamp(0.0, 1.0),
-                0.0,
             ],
         );
+        put(&mut o, &rgb(self.colors.title, 0.0));
+        put(&mut o, &rgb(self.colors.artist, 0.0));
+        put(&mut o, &rgb(self.colors.meta, 0.0));
         put(
             &mut o,
-            &[
-                self.text_color[0],
-                self.text_color[1],
-                self.text_color[2],
-                0.0,
-            ],
+            &rgb(self.colors.lyric, self.lyric_glow.clamp(0.0, 1.0)),
         );
-        put(
-            &mut o,
-            &[
-                self.halo_color[0],
-                self.halo_color[1],
-                self.halo_color[2],
-                0.0,
-            ],
-        );
+        put(&mut o, &rgb(self.colors.context, 0.0));
         for l in &self.lyrics {
             put(&mut o, &text(l));
         }
@@ -309,9 +329,15 @@ impl OverlayParams {
                 al(&self.lyrics[0]),
                 al(&self.lyrics[1]),
                 al(&self.lyrics[2]),
-                self.lyric_glow.clamp(0.0, 1.0),
+                0.0,
             ],
         );
+        let e = self.lyric_emph.map(|v| v.clamp(0.0, 1.0));
+        put(&mut o, &[e[0], e[1], e[2], 0.0]);
+        match self.lyric_clip {
+            Some([y0, y1, f]) => put(&mut o, &[y0, y1, f.max(0.0), 1.0]),
+            None => put(&mut o, &[0.0; 4]),
+        }
         debug_assert_eq!(o.len(), UNIFORM_BYTES);
         o
     }
@@ -324,10 +350,13 @@ impl OverlayParams {
     /// True when the artwork/text part would change no pixel (nothing present or fully transparent).
     pub fn is_empty(&self) -> bool {
         let vis = |a: f32| a > 0.002;
-        !(self.art.is_some_and(|a| vis(a.alpha))
-            || self.title.is_some_and(|t| vis(t.alpha))
-            || self.artist.is_some_and(|t| vis(t.alpha))
-            || self.lyrics.iter().any(|l| l.is_some_and(|t| vis(t.alpha))))
+        !([self.art, self.art_prev]
+            .iter()
+            .any(|a| a.is_some_and(|a| vis(a.alpha)))
+            || [self.title, self.artist, self.meta]
+                .iter()
+                .chain(&self.lyrics)
+                .any(|l| l.is_some_and(|t| vis(t.alpha))))
     }
 }
 
@@ -338,7 +367,9 @@ pub struct Overlay {
     sampler: wgpu::Sampler,
     uniform: wgpu::Buffer,
     controls_uniform: wgpu::Buffer,
+    /// Current artwork and the previous one (crossfade source), see `shift_art`.
     art: Option<wgpu::TextureView>,
+    art_prev: Option<wgpu::TextureView>,
     texts: [Option<wgpu::TextureView>; TEXT_SLOTS],
     /// 1x1 stand-ins so the bind group is always complete.
     blank_rgba: wgpu::TextureView,
@@ -441,6 +472,8 @@ impl Overlay {
                 tex_entry(7),
                 tex_entry(8),
                 tex_entry(9),
+                tex_entry(11),
+                tex_entry(12),
                 wgpu::BindGroupLayoutEntry {
                     binding: 10,
                     visibility: wgpu::ShaderStages::FRAGMENT,
@@ -550,7 +583,7 @@ impl Overlay {
                 device,
                 &bgl,
                 [&uniform, &controls_uniform],
-                &blank_rgba,
+                [&blank_rgba, &blank_rgba],
                 [&blank_r8; TEXT_SLOTS],
                 &sampler,
             ),
@@ -561,6 +594,7 @@ impl Overlay {
             uniform,
             controls_uniform,
             art: None,
+            art_prev: None,
             texts: Default::default(),
             blank_rgba,
             blank_r8,
@@ -573,7 +607,7 @@ impl Overlay {
         device: &wgpu::Device,
         bgl: &wgpu::BindGroupLayout,
         uniforms: [&wgpu::Buffer; 2],
-        art: &wgpu::TextureView,
+        art: [&wgpu::TextureView; 2],
         texts: [&wgpu::TextureView; TEXT_SLOTS],
         sampler: &wgpu::Sampler,
     ) -> wgpu::BindGroup {
@@ -581,6 +615,14 @@ impl Overlay {
             label: Some("overlay"),
             layout: bgl,
             entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 11,
+                    resource: wgpu::BindingResource::TextureView(texts[META_SLOT]),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 12,
+                    resource: wgpu::BindingResource::TextureView(art[1]),
+                },
                 wgpu::BindGroupEntry {
                     binding: 0,
                     resource: uniforms[0].as_entire_binding(),
@@ -599,7 +641,7 @@ impl Overlay {
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: wgpu::BindingResource::TextureView(art),
+                    resource: wgpu::BindingResource::TextureView(art[0]),
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
@@ -634,13 +676,29 @@ impl Overlay {
             device,
             &self.bgl,
             [&self.uniform, &self.controls_uniform],
-            self.art.as_ref().unwrap_or(&self.blank_rgba),
+            [
+                self.art.as_ref().unwrap_or(&self.blank_rgba),
+                self.art_prev.as_ref().unwrap_or(&self.blank_rgba),
+            ],
             std::array::from_fn(|i| self.texts[i].as_ref().unwrap_or(&self.blank_r8)),
             &self.sampler,
         );
     }
 
-    /// Replaces the artwork (straight RGBA8, `w x h`). Returns false (and clears the artwork) when the data
+    /// Crossfade bookkeeping: the current artwork becomes the previous one (the old previous one is dropped) and
+    /// the current slot is empty until `set_art`.
+    pub fn shift_art(&mut self, device: &wgpu::Device) {
+        self.art_prev = self.art.take();
+        self.rebuild(device);
+    }
+
+    /// Drops the previous artwork (the crossfade finished).
+    pub fn clear_prev_art(&mut self, device: &wgpu::Device) {
+        self.art_prev = None;
+        self.rebuild(device);
+    }
+
+    /// Replaces the current artwork (straight RGBA8, `w x h`). Returns false (and clears it) when the data
     /// is malformed or too large.
     pub fn set_art(
         &mut self,
@@ -667,7 +725,7 @@ impl Overlay {
         self.rebuild(device);
     }
 
-    /// Replaces text slot `which` (0 title, 1 artist, 2..=4 lyric lines) with a coverage bitmap (8-bit, `w x h`).
+    /// Replaces text slot `which` (see `TEXT_SLOTS`) with a coverage bitmap (8-bit, `w x h`).
     pub fn set_text(
         &mut self,
         device: &wgpu::Device,
@@ -769,17 +827,21 @@ mod tests {
                 hh: 20.0,
                 alpha: 1.0,
                 radius: 4.0,
-                halo: 0.0,
-                spread: 10.0,
+                shadow: 0.0,
+                lod: 0.0,
             }),
-            title: None,
-            artist: None,
-            lyrics: [None; 3],
-            lyric_glow: 0.0,
+            lyric_emph: [1.0; 3],
             shadow: 0.5,
-            text_color: [1.0, 1.0, 1.0],
-            halo_color: [0.2, 0.4, 1.0],
-            controls: None,
+            colors: TextColors {
+                title: [1.0; 3],
+                artist: [1.0; 3],
+                meta: [1.0; 3],
+                lyric: [1.0; 3],
+                context: [0.5; 3],
+                shade: [0.0; 3],
+            },
+            accent: [0.2, 0.4, 1.0],
+            ..Default::default()
         }
     }
 
@@ -970,7 +1032,10 @@ mod tests {
                 .all(|c| f32::from_ne_bytes([c[0], c[1], c[2], c[3]]).is_finite())
         );
         let src = include_str!("overlay.wgsl");
-        assert!(src.contains("col_halo: vec4<f32>") && src.contains("text_p: vec4<f32>"));
+        // the WGSL struct O: first and last field, and no halo left anywhere in the shader
+        assert!(src.contains("res: vec4<f32>,       // surface w, h, time, energy"));
+        assert!(src.contains("lyr_clip: vec4<f32>,") && src.contains("text_a: vec4<f32>"));
+        assert!(!src.contains("halo"));
         assert!(
             OverlayParams {
                 art: None,
@@ -1067,6 +1132,51 @@ mod tests {
             px(&img2, res.0, 140, 90)[0] < 100,
             "cleared artwork leaves the scene"
         );
+    }
+
+    #[test]
+    fn crossfade_draws_the_new_cover_over_the_held_previous_one_and_meta_has_its_slot_headless() {
+        let Ok(h) = init_headless() else {
+            eprintln!("SKIPPED (no hardware GPU)");
+            return;
+        };
+        let res = (320u32, 180u32);
+        let scene = SceneSet::new_headless(&h.device);
+        let mut ov = Overlay::new_headless(&h.device, &h.queue);
+        let solid = |c: [u8; 4]| (0..16).flat_map(|_| c).collect::<Vec<u8>>();
+        assert!(ov.set_art(&h.device, &h.queue, (4, 4), &solid([255, 0, 0, 255])));
+        ov.shift_art(&h.device); // red becomes the previous cover
+        assert!(ov.set_art(&h.device, &h.queue, (4, 4), &solid([0, 0, 255, 255])));
+        assert!(ov.set_text(&h.device, &h.queue, META_SLOT, (40, 10), &[255u8; 400]));
+        let sp = SceneParams::default();
+        let render = |ov: &Overlay, p: &OverlayParams| {
+            scene
+                .render_offscreen_with(&h.device, &h.queue, res, &sp, &|enc, view| {
+                    ov.draw(&h.queue, enc, view, p)
+                })
+                .unwrap()
+        };
+        let mut p = params(res);
+        p.art.as_mut().unwrap().hh = 40.0;
+        p.art.as_mut().unwrap().alpha = 0.5;
+        p.art_prev = p.art.map(|a| ArtDraw { alpha: 1.0, ..a });
+        p.meta = Some(TextDraw {
+            x: 10.0,
+            y: 10.0,
+            w: 40.0,
+            h: 10.0,
+            alpha: 1.0,
+        });
+        let img = render(&ov, &p);
+        let mid = px(&img, res.0, 160, 90);
+        assert!(
+            mid[0] > 90 && mid[2] > 90 && mid[1] < 40,
+            "half blue over full red, no dip to the scene: {mid:?}"
+        );
+        assert!(px(&img, res.0, 30, 15)[0] > 230, "meta line drawn");
+        ov.clear_prev_art(&h.device);
+        let img = render(&ov, &p);
+        assert!(px(&img, res.0, 160, 90)[0] < 60, "previous cover dropped");
     }
 
     #[test]

@@ -140,6 +140,11 @@ fn presentation_previews(failures: &mut Vec<String>) -> bool {
             let mut ov = Overlay::new_headless(&h.device, &h.queue);
             let mut pres = Presentation::new(layout);
             pres.set_lyric_source(crate::lyric_view::LyricSource::Demo);
+            pres.set_album_scene(kind == SceneKind::Focus, res);
+            pres.set_bar(
+                res.1 as f32 - 128.0 * crate::controls::ui_scale(res, 1.0),
+                0.0,
+            );
             pres.set_lyric_anchor(match kind {
                 SceneKind::Spectrum => 0.70,
                 SceneKind::Aurora => 0.72,
@@ -169,6 +174,8 @@ fn presentation_previews(failures: &mut Vec<String>) -> bool {
                         GpuOp::SetArt(a) => {
                             ov.set_art(&h.device, &h.queue, (a.width, a.height), &a.rgba);
                         }
+                        GpuOp::ShiftArt => ov.shift_art(&h.device),
+                        GpuOp::ClearPrevArt => ov.clear_prev_art(&h.device),
                         GpuOp::ClearArt => ov.clear_art(&h.device),
                         GpuOp::SetText(k, b) => {
                             ov.set_text(&h.device, &h.queue, k, (b.width, b.height), &b.coverage);
@@ -274,6 +281,142 @@ fn presentation_previews(failures: &mut Vec<String>) -> bool {
     true
 }
 
+/// Album Focus composition previews (the Focus scene with the Center layout) across window shapes, with and
+/// without lyrics and cover, through the real pipeline (decode, palette, DirectWrite text, overlay). Checks that
+/// the cover, title block and lyrics appear where expected; prints the text-job worker time; with
+/// `MG_SCENE_DUMP=<dir>` writes `album-<w>x<h>-<lyrics>-<art>.png`. `MG_LYRIC_FROM=<s>` plays the lyrics from that
+/// position (to catch a slide) instead of holding 10.5 s.
+fn album_previews(failures: &mut Vec<String>) -> bool {
+    use crate::lyric_view::LyricSource;
+    use crate::media_feed::demo_tracks;
+    use crate::presentation::{GpuOp, Job, Layout, Presentation, apply_album, process_job};
+    use mg_gfx::overlay::Overlay;
+    let Ok(h) = headless() else { return false };
+    let Some(text) = mg_text::TextRenderer::new() else {
+        failures.push("album: DirectWrite unavailable".into());
+        return true;
+    };
+    println!(
+        "ALBUM fonts: {}",
+        if text.has_variable_cuts() {
+            "Segoe UI Variable Display/Text"
+        } else {
+            "Segoe UI (fallback)"
+        }
+    );
+    let x = fixture("demo", SR).expect("demo fixture");
+    let ticks = Sim::new(SR, FPS, MapTuning::default()).run(&x[..x.len().min(SR as usize * 12)]);
+    let base_params = ticks.last().expect("ticks").params.clone();
+    let scene = SceneSet::new_headless(&h.device);
+    let dump = std::env::var("MG_SCENE_DUMP").ok();
+    let lyric_from: Option<f64> = std::env::var("MG_LYRIC_FROM")
+        .ok()
+        .and_then(|v| v.parse().ok());
+    let tracks = demo_tracks();
+    for res in [(960u32, 540u32), (1260, 540), (720, 540), (540, 960)] {
+        for (lyrics, art) in [(true, true), (false, true), (true, false), (false, false)] {
+            let mut n = tracks[0].clone();
+            n.album = "Harbour Lights".into();
+            if !art {
+                n.art = None;
+            }
+            let mut ov = Overlay::new_headless(&h.device, &h.queue);
+            let mut pres = Presentation::new(Layout::Center);
+            pres.set_album_scene(true, res);
+            pres.set_bar(
+                res.1 as f32 - 128.0 * crate::controls::ui_scale(res, 1.0),
+                0.0,
+            );
+            if lyrics {
+                pres.set_lyric_source(LyricSource::Demo);
+            }
+            pres.on_now_playing(Some(&n), res);
+            let (mut text_ms, mut last) = (0.0f64, None);
+            for frame in 0..300 {
+                pres.set_position(Some(
+                    lyric_from.map_or(10.5, |f| f + f64::from(frame) / 60.0),
+                ));
+                for job in pres.take_jobs() {
+                    let is_text = matches!(job, Job::Text(_));
+                    let t0 = std::time::Instant::now();
+                    let r = process_job(Some(&text), job);
+                    if is_text {
+                        text_ms += t0.elapsed().as_secs_f64() * 1000.0;
+                    }
+                    pres.on_ready(r);
+                }
+                last = Some(pres.update(1.0 / 60.0, res, base_params.energy, base_params.swell));
+                for op in pres.take_ops() {
+                    match op {
+                        GpuOp::ShiftArt => ov.shift_art(&h.device),
+                        GpuOp::SetArt(a) => {
+                            ov.set_art(&h.device, &h.queue, (a.width, a.height), &a.rgba);
+                        }
+                        GpuOp::ClearArt => ov.clear_art(&h.device),
+                        GpuOp::ClearPrevArt => ov.clear_prev_art(&h.device),
+                        GpuOp::SetText(k, b) => {
+                            ov.set_text(&h.device, &h.queue, k, (b.width, b.height), &b.coverage);
+                        }
+                        GpuOp::ClearText(k) => ov.clear_text(&h.device, k),
+                    }
+                }
+            }
+            let op = last.expect("frames");
+            let mut p = base_params.clone();
+            let (album, w) = pres.album();
+            apply_album(&mut p.palette, &album, w, 0.85 + 0.30 * p.energy);
+            if let Some(a) = op.art {
+                let (w, hh) = (res.0 as f32, res.1 as f32);
+                p.focus = [a.cx / w, a.cy / hh, a.hw / hh, a.hh / hh];
+                p.focus_active = a.alpha;
+            }
+            let tag = format!(
+                "album-{}x{}-{}-{}",
+                res.0,
+                res.1,
+                if lyrics { "lyrics" } else { "nolyrics" },
+                if art { "art" } else { "noart" }
+            );
+            let Ok(img) = scene.render_offscreen_scenes(
+                &h.device,
+                &h.queue,
+                res,
+                &p,
+                SceneKind::Focus,
+                None,
+                &|enc, view| ov.draw(&h.queue, enc, view, &op),
+            ) else {
+                failures.push(format!("{tag}: render failed"));
+                continue;
+            };
+            let drawn_lyrics = op.lyrics.iter().flatten().filter(|d| d.alpha > 0.5).count();
+            if art != op.art.is_some_and(|a| a.alpha > 0.99) {
+                failures.push(format!("{tag}: cover shown = {}", op.art.is_some()));
+            }
+            if op.title.is_none_or(|t| t.alpha < 0.99) || op.artist.is_none() || op.meta.is_none() {
+                failures.push(format!("{tag}: title block incomplete"));
+            }
+            if lyrics != (drawn_lyrics > 0) {
+                failures.push(format!("{tag}: {drawn_lyrics} lyric lines drawn"));
+            }
+            println!(
+                "ALBUM {tag}: art={} title={:?} lyric_lines={drawn_lyrics} clip={:?} text_job_ms={text_ms:.1}",
+                op.art
+                    .map(|a| (a.cx as i32, a.cy as i32, (2.0 * a.hh) as i32))
+                    .is_some(),
+                op.title
+                    .map(|t| (t.x as i32, t.y as i32, t.w as i32, t.h as i32)),
+                op.lyric_clip.map(|c| (c[0] as i32, c[1] as i32))
+            );
+            if let Some(dir) = &dump {
+                let png = mg_media::synth::png_rgba(res.0, res.1, &img);
+                let _ = std::fs::write(format!("{dir}/{tag}.png"), png);
+            }
+        }
+    }
+    true
+}
+
 /// Control bar: enabled (demo caps, hover, lyrics toggled on), disabled (no media source) and keyboard-focus
 /// states rendered headless over a real scene with DirectWrite time texts. Checks that the bar is drawn, that the
 /// states differ where they should and that nothing is black/NaN; with `MG_SCENE_DUMP=<dir>` writes PNGs.
@@ -367,17 +510,10 @@ fn controls_previews(failures: &mut Vec<String>) -> bool {
         };
         let p = OverlayParams {
             res,
-            time: 0.0,
-            energy: 0.0,
-            art: None,
-            title: None,
-            artist: None,
-            lyrics: [None; 3],
-            lyric_glow: 0.0,
             shadow: 0.5,
-            text_color: [0.9, 0.9, 0.92],
-            halo_color: [0.18, 0.38, 0.85],
+            accent: [0.18, 0.38, 0.85],
             controls: Some(draw.clone()),
+            ..Default::default()
         };
         let Ok(img) = scene.render_offscreen_scenes(
             &h.device,
@@ -770,6 +906,7 @@ pub fn run(allow_no_gpu: bool) -> i32 {
         let _ = SLOTS;
     }
     gpu_seen |= presentation_previews(&mut failures);
+    gpu_seen |= album_previews(&mut failures);
     gpu_seen |= controls_previews(&mut failures);
     gpu_seen |= orb_checks(&mut failures);
     gpu_seen |= fluid_checks(&mut failures);

@@ -1,26 +1,38 @@
-// Overlay pass drawn AFTER the scene, at native surface resolution: album artwork (soft rounded edge,
-// music-reactive halo, no border or panel) and song title/artist text (coverage bitmaps tinted with the
-// palette, soft shadow for readability on any background). Output is premultiplied alpha.
+// Overlay pass drawn AFTER the scene, at native surface resolution: album artwork on a plate (rounded corners,
+// 1 px inner stroke, contact + ambient shadow; never scaled, pulsed or distorted by the music), an optional
+// previous artwork for the track-change crossfade, and the song text (coverage bitmaps tinted per role from the
+// album palette, light shadow). Output is premultiplied alpha.
 // All placement is computed on the CPU in pixels; this shader only draws what it is given.
 
 struct O {
     res: vec4<f32>,       // surface w, h, time, energy
-    art_rect: vec4<f32>,  // centre x, centre y, half w, half h (pixels)
-    art_p: vec4<f32>,     // alpha, corner radius (px), halo strength, halo spread (px)
+    art: vec4<f32>,       // current artwork: centre x, centre y, half w, half h (px); half w 0 = absent
+    art_p: vec4<f32>,     // alpha, corner radius (px), shadow strength (0..1), sampling lod (blur bridge)
+    prev: vec4<f32>,      // previous artwork (crossfade source), same layout
+    prev_p: vec4<f32>,
+    shade: vec4<f32>,     // ambient shadow rgb (linear, album bg at L 0.05), unused
     title: vec4<f32>,     // left, top, width, height (px); width 0 = absent
     artist: vec4<f32>,
-    text_p: vec4<f32>,    // title alpha, artist alpha, shadow strength, unused
-    col_text: vec4<f32>,  // linear rgb
-    col_halo: vec4<f32>,  // linear rgb
+    meta_r: vec4<f32>,
+    text_a: vec4<f32>,    // title alpha, artist alpha, meta alpha, text shadow strength
+    col_title: vec4<f32>, // linear rgb per role
+    col_artist: vec4<f32>,
+    col_meta: vec4<f32>,
+    col_lyr: vec4<f32>,   // current lyric rgb, slow glow boost (0..1, never per beat)
+    col_ctx: vec4<f32>,   // context lyric rgb
     lyr0: vec4<f32>,      // lyric slot rects: left, top, width, height (px); width 0 = absent
     lyr1: vec4<f32>,
     lyr2: vec4<f32>,
-    lyr_p: vec4<f32>,     // slot alphas 0..2, slow glow boost (0..1, never per beat)
+    lyr_p: vec4<f32>,     // slot alphas 0..2, unused
+    lyr_e: vec4<f32>,     // slot emphasis 0..2 (0 = context colour, 1 = current colour), unused
+    lyr_clip: vec4<f32>,  // lyric column mask: top, bottom, feather (px), on (> 0.5)
 };
 @group(0) @binding(0) var<uniform> o: O;
 @group(0) @binding(1) var art_tex: texture_2d<f32>;
+@group(0) @binding(12) var prev_tex: texture_2d<f32>;
 @group(0) @binding(2) var title_tex: texture_2d<f32>;
 @group(0) @binding(3) var artist_tex: texture_2d<f32>;
+@group(0) @binding(11) var meta_tex: texture_2d<f32>;
 @group(0) @binding(5) var lyr_tex0: texture_2d<f32>;
 @group(0) @binding(6) var lyr_tex1: texture_2d<f32>;
 @group(0) @binding(7) var lyr_tex2: texture_2d<f32>;
@@ -61,83 +73,99 @@ fn sd_round_box(p: vec2<f32>, half: vec2<f32>, r: f32) -> f32 {
     return length(max(q, vec2<f32>(0.0))) + min(max(q.x, q.y), 0.0) - r;
 }
 
-// Text coverage at pixel p inside quad `rect` (0 outside). `shift` displaces the lookup (for the shadow).
+// Text coverage at pixel p inside quad `rect` (0 outside). A quad drawn smaller than its bitmap (a context lyric
+// line shown at reduced scale) is supersampled with 4 taps, so the downscaled glyphs do not shimmer.
 fn text_cov(tex: texture_2d<f32>, rect: vec4<f32>, p: vec2<f32>) -> f32 {
     if (rect.z <= 0.0) { return 0.0; }
     let uv = (p - rect.xy) / rect.zw;
     if (uv.x < 0.0 || uv.y < 0.0 || uv.x > 1.0 || uv.y > 1.0) { return 0.0; }
-    return textureSampleLevel(tex, smp, uv, 0.0).r;
+    let tw = f32(textureDimensions(tex).x);
+    if (rect.z >= tw * 0.95) { return textureSampleLevel(tex, smp, uv, 0.0).r; }
+    let q = 0.25 / rect.zw;   // a quarter of an output pixel in uv
+    return 0.25 * (textureSampleLevel(tex, smp, uv + vec2<f32>(-q.x, -q.y), 0.0).r
+        + textureSampleLevel(tex, smp, uv + vec2<f32>(q.x, -q.y), 0.0).r
+        + textureSampleLevel(tex, smp, uv + vec2<f32>(-q.x, q.y), 0.0).r
+        + textureSampleLevel(tex, smp, uv + vec2<f32>(q.x, q.y), 0.0).r);
+}
+
+// Soft shadow of a rounded box: 1 inside, falling to 0 over `blur` px outside.
+fn box_shadow(p: vec2<f32>, c: vec2<f32>, hs: vec2<f32>, r: f32, blur: f32) -> f32 {
+    let d = sd_round_box(p - c, hs, r);
+    return 1.0 - smoothstep(-0.35 * blur, blur, d);
+}
+
+// Contact + ambient shadow of an artwork plate (sizes scale with the plate side S: y +0.0107S / blur 0.0214S,
+// alpha 0.55, and y +0.054S / blur 0.16S, alpha 0.45; at S = 0.56H these are the spec's 0.006/0.012/0.03/0.09H).
+fn plate_shadow(dst: vec4<f32>, p: vec2<f32>, rect: vec4<f32>, pp: vec4<f32>) -> vec4<f32> {
+    if (pp.x <= 0.001 || rect.z <= 0.0) { return dst; }
+    let side = 2.0 * max(rect.z, rect.w);
+    let k = pp.x * clamp(pp.z, 0.0, 1.0);
+    let amb = box_shadow(p, rect.xy + vec2<f32>(0.0, 0.054 * side), rect.zw, pp.y, 0.16 * side);
+    var o2 = over(dst, o.shade.rgb, 0.45 * k * amb);
+    let con = box_shadow(p, rect.xy + vec2<f32>(0.0, 0.0107 * side), rect.zw, pp.y, 0.0214 * side);
+    return over(o2, vec3<f32>(0.0), 0.55 * k * con);
+}
+
+// Artwork pixels with an anti-aliased rounded edge and a 1 px inner stroke (white 8 %). The image is sampled
+// 1:1 into its rect: no scaling, tinting or edge shading of the picture itself.
+fn plate_art(dst: vec4<f32>, p: vec2<f32>, tex: texture_2d<f32>, rect: vec4<f32>, pp: vec4<f32>) -> vec4<f32> {
+    if (pp.x <= 0.001 || rect.z <= 0.0) { return dst; }
+    let d = sd_round_box(p - rect.xy, rect.zw, pp.y);
+    let cover = (1.0 - smoothstep(-0.75, 0.75, d)) * pp.x;
+    if (cover <= 0.0) { return dst; }
+    let uv = clamp((p - rect.xy) / (rect.zw * 2.0) + vec2<f32>(0.5), vec2<f32>(0.0), vec2<f32>(1.0));
+    let t = textureSampleLevel(tex, smp, uv, pp.w).rgb;
+    let ring = 1.0 - smoothstep(0.0, 1.0, abs(d + 0.5) - 0.5);
+    return over(dst, mix(t, vec3<f32>(1.0), 0.08 * ring), cover);
+}
+
+// Light text shadow (strength from the CPU; at most 0.25 in Album Focus).
+fn text_shadow(tex: texture_2d<f32>, rect: vec4<f32>, p: vec2<f32>, off: vec2<f32>) -> f32 {
+    return max(text_cov(tex, rect, p - off), 0.5 * text_cov(tex, rect, p - 2.0 * off));
 }
 
 @fragment
 fn fs(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
     let p = frag.xy;
-    var rgb = vec3<f32>(0.0);   // premultiplied
-    var a = 0.0;
+    var c = vec4<f32>(0.0);   // premultiplied
 
-    // ---- artwork halo + artwork -------------------------------------------------------------------
-    let art_a = o.art_p.x;
-    if (art_a > 0.001 && o.art_rect.z > 0.0) {
-        let c = o.art_rect.xy;
-        let hs = o.art_rect.zw;
-        let d = sd_round_box(p - c, hs, o.art_p.y);
-        // halo: a soft glow that leaves the artwork like light, reacting to the music (strength from the CPU)
-        let spread = max(o.art_p.w, 1.0);
-        let halo = exp(-max(d, 0.0) / spread) * o.art_p.z * art_a;
-        let halo_a = clamp(halo * 0.55, 0.0, 0.85);
-        rgb = o.col_halo.rgb * halo_a;
-        a = halo_a;
-        // artwork pixels with an anti-aliased rounded edge
-        let cover = (1.0 - smoothstep(-1.0, 1.0, d)) * art_a;
-        if (cover > 0.0) {
-            let uv = (p - c) / (hs * 2.0) + vec2<f32>(0.5);
-            let t = textureSampleLevel(art_tex, smp, clamp(uv, vec2<f32>(0.0), vec2<f32>(1.0)), 0.0);
-            // soft inner edge shading keeps the picture from looking like a pasted rectangle
-            let edge = 1.0 - 0.18 * smoothstep(-14.0, 0.0, d);
-            rgb = t.rgb * edge * cover + rgb * (1.0 - cover);
-            a = cover + a * (1.0 - cover);
-        }
-    }
+    // ---- artwork: both shadows first, then the previous cover, then the current one over it ----------------
+    c = plate_shadow(c, p, o.prev, o.prev_p);
+    c = plate_shadow(c, p, o.art, o.art_p);
+    c = plate_art(c, p, prev_tex, o.prev, o.prev_p);
+    c = plate_art(c, p, art_tex, o.art, o.art_p);
 
-    // ---- text: shadow first (underneath), then coverage tinted with the palette text colour ---------
-    let sh = o.text_p.z;
+    // ---- title block: shadows underneath, then coverage tinted per role ---------------------------------------
+    let sh = o.text_a.w;
     let off = vec2<f32>(0.0, max(1.0, o.res.y * 0.0014));
-    var cov_t = text_cov(title_tex, o.title, p);
-    var cov_a = text_cov(artist_tex, o.artist, p);
-    let sh_t = max(text_cov(title_tex, o.title, p - off), 0.5 * text_cov(title_tex, o.title, p - 2.0 * off)) * sh * o.text_p.x;
-    let sh_a = max(text_cov(artist_tex, o.artist, p - off), 0.5 * text_cov(artist_tex, o.artist, p - 2.0 * off)) * sh * o.text_p.y;
-    let shadow = clamp(max(sh_t, sh_a), 0.0, 0.85);
-    // shadow darkens what is already there (black, premultiplied)
-    rgb = rgb * (1.0 - shadow);
-    a = shadow + a * (1.0 - shadow);
-    let ta = clamp(cov_t * o.text_p.x, 0.0, 1.0);
-    let aa = clamp(cov_a * o.text_p.y, 0.0, 1.0);
-    let tcol = o.col_text.rgb;
-    rgb = tcol * ta + rgb * (1.0 - ta);
-    a = ta + a * (1.0 - ta);
-    rgb = tcol * 0.86 * aa + rgb * (1.0 - aa);   // artist line a touch dimmer than the title
-    a = aa + a * (1.0 - aa);
+    let shadow = max(max(text_shadow(title_tex, o.title, p, off) * o.text_a.x,
+        text_shadow(artist_tex, o.artist, p, off) * o.text_a.y),
+        text_shadow(meta_tex, o.meta_r, p, off) * o.text_a.z) * sh;
+    c = over(c, vec3<f32>(0.0), clamp(shadow, 0.0, 0.85));
+    c = over(c, o.col_title.rgb, clamp(text_cov(title_tex, o.title, p) * o.text_a.x, 0.0, 1.0));
+    c = over(c, o.col_artist.rgb, clamp(text_cov(artist_tex, o.artist, p) * o.text_a.y, 0.0, 1.0));
+    c = over(c, o.col_meta.rgb, clamp(text_cov(meta_tex, o.meta_r, p) * o.text_a.z, 0.0, 1.0));
 
-    // ---- lyrics: up to three lines (previous fading out, current, next), same soft shadow as the title ----
-    let boost = 1.0 + 0.10 * clamp(o.lyr_p.w, 0.0, 1.0);
-    let lcol = min(tcol * boost, vec3<f32>(1.0));
-    let sh0 = max(text_cov(lyr_tex0, o.lyr0, p - off), 0.5 * text_cov(lyr_tex0, o.lyr0, p - 2.0 * off)) * o.lyr_p.x;
-    let sh1 = max(text_cov(lyr_tex1, o.lyr1, p - off), 0.5 * text_cov(lyr_tex1, o.lyr1, p - 2.0 * off)) * o.lyr_p.y;
-    let sh2 = max(text_cov(lyr_tex2, o.lyr2, p - off), 0.5 * text_cov(lyr_tex2, o.lyr2, p - 2.0 * off)) * o.lyr_p.z;
-    let lshadow = clamp(max(sh0, max(sh1, sh2)) * sh, 0.0, 0.85);
-    rgb = rgb * (1.0 - lshadow);
-    a = lshadow + a * (1.0 - lshadow);
-    let l0 = clamp(text_cov(lyr_tex0, o.lyr0, p) * o.lyr_p.x, 0.0, 1.0);
-    let l1 = clamp(text_cov(lyr_tex1, o.lyr1, p) * o.lyr_p.y, 0.0, 1.0);
-    let l2 = clamp(text_cov(lyr_tex2, o.lyr2, p) * o.lyr_p.z, 0.0, 1.0);
-    rgb = lcol * l0 + rgb * (1.0 - l0);
-    a = l0 + a * (1.0 - l0);
-    rgb = lcol * l1 + rgb * (1.0 - l1);
-    a = l1 + a * (1.0 - l1);
-    rgb = lcol * l2 + rgb * (1.0 - l2);
-    a = l2 + a * (1.0 - l2);
-
-    return vec4<f32>(rgb, a);
+    // ---- lyrics: up to three lines, colour from the slot's emphasis, optional feathered column mask ----------
+    var m = 1.0;
+    if (o.lyr_clip.w > 0.5) {
+        let f = max(o.lyr_clip.z, 1.0);
+        m = smoothstep(o.lyr_clip.x, o.lyr_clip.x + f, p.y) * (1.0 - smoothstep(o.lyr_clip.y - f, o.lyr_clip.y, p.y));
+    }
+    if (m > 0.0) {
+        let boost = 1.0 + 0.10 * clamp(o.col_lyr.w, 0.0, 1.0);
+        let a0 = o.lyr_p.x * m;
+        let a1 = o.lyr_p.y * m;
+        let a2 = o.lyr_p.z * m;
+        let lshadow = max(max(text_shadow(lyr_tex0, o.lyr0, p, off) * a0, text_shadow(lyr_tex1, o.lyr1, p, off) * a1),
+            text_shadow(lyr_tex2, o.lyr2, p, off) * a2) * sh;
+        c = over(c, vec3<f32>(0.0), clamp(lshadow, 0.0, 0.85));
+        let lc = min(o.col_lyr.rgb * boost, vec3<f32>(1.0));
+        c = over(c, mix(o.col_ctx.rgb, lc, clamp(o.lyr_e.x, 0.0, 1.0)), clamp(text_cov(lyr_tex0, o.lyr0, p) * a0, 0.0, 1.0));
+        c = over(c, mix(o.col_ctx.rgb, lc, clamp(o.lyr_e.y, 0.0, 1.0)), clamp(text_cov(lyr_tex1, o.lyr1, p) * a1, 0.0, 1.0));
+        c = over(c, mix(o.col_ctx.rgb, lc, clamp(o.lyr_e.z, 0.0, 1.0)), clamp(text_cov(lyr_tex2, o.lyr2, p) * a2, 0.0, 1.0));
+    }
+    return c;
 }
 
 // ---- control bar ----------------------------------------------------------------------------------------------

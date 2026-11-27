@@ -1,16 +1,26 @@
 //! On-screen synchronised lyrics (pure state machine; the text bitmaps come from the worker thread).
 //!
 //! Lyrics exist only when the user supplied a `.lrc` file for the playing track (or in the explicitly
-//! labelled demo mode): nothing is fetched, guessed or invented. Up to three lines are visible: the line
-//! being sung, the next one (dim) and the one just finished (fading out). Line index `i` always uses slot
-//! `i % 3`, so when the song advances the textures do not move: the old current line becomes "previous" and
-//! fades, the next line becomes current and brightens, and only an invisible slot is ever re-uploaded.
-//! Motion is a slow slide and fade; nothing pulses with the beat (the only music link is a slow glow boost).
+//! labelled demo mode): nothing is fetched, guessed or invented. Line index `i` always uses slot `i % 3`, so the
+//! textures never move between slots and only an invisible slot is ever re-uploaded.
+//!
+//! Two presentations:
+//! * Classic (every scene except Album Focus): the line being sung, the next one (dim) and the one just finished
+//!   (fading out), centred at a per-scene anchor; a slow slide and fade with its own fade state.
+//! * Column (Album Focus, `set_column`): a start-aligned column where the current line sits at the anchor and the
+//!   next line waits below at context scale. The whole state is a pure function of the playback position: the
+//!   slide into a line ENDS at that line's timestamp and lasts min(600 ms, 45 % of the time since the previous
+//!   line started), so slides never overlap and the current line is never late; a seek or track change resolves
+//!   directly to the position (no queued or replayed motion). Lines are drawn inside a feathered mask.
+//!
+//! Nothing pulses with the beat (the only music link is a slow glow boost).
 
-use crate::presentation::{Eased, GpuOp, Job, Ready};
+use crate::presentation::{
+    EASE_IN_OUT, Eased, GpuOp, Job, LYRIC_CONTEXT_SCALE, LYRIC_CURRENT, Ready,
+};
 use mg_gfx::overlay::TextDraw;
 use mg_media::lrc::Lyrics;
-use mg_text::TextBitmap;
+use mg_text::{LineStyle, TextBitmap};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -38,6 +48,32 @@ const BITMAP_H: f32 = 1.6;
 /// First text-texture slot used by lyrics (0 and 1 are title and artist).
 pub const FIRST_TEXT_SLOT: usize = 2;
 
+/// Column: longest slide, its share of the previous line's duration, the reduced-motion crossfade (s).
+pub const SLIDE_MAX_S: f64 = 0.6;
+pub const SLIDE_GAP_FRAC: f64 = 0.45;
+pub const RM_FADE_S: f64 = 0.2;
+/// A position jump larger than this (beyond the frame time) is a seek.
+const SEEK_JUMP_S: f64 = 0.35;
+/// Gap between column lines and the mask feather (fractions of the window height).
+const COL_GAP: f32 = 0.016;
+const COL_FEATHER: f32 = 0.03;
+/// A line whose bitmap lands while it is on screen fades in this fast instead of popping.
+const SHOWN_S: f32 = 0.15;
+
+/// Album Focus lyric column (surface pixels).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Column {
+    pub x: f32,
+    pub w: f32,
+    /// Vertical centre of the current line.
+    pub anchor: f32,
+    /// Visible band: ink outside `top..bottom` is masked with a feathered edge.
+    pub top: f32,
+    pub bottom: f32,
+    /// Centre lines in the column (portrait) instead of aligning them to their start edge.
+    pub centered: bool,
+}
+
 #[derive(Default)]
 struct Slot {
     line: Option<usize>,
@@ -49,12 +85,16 @@ struct Slot {
     below: bool,
     y: Eased,
     x: Eased,
+    /// Column mode: 0..1 fade-in after the slot received a new line.
+    shown: f32,
 }
 
 pub struct LyricView {
     source: LyricSource,
     track: Option<u64>,
     lyrics: Option<Arc<Lyrics>>,
+    /// The lookup for the current track has answered (or there is nothing to look up).
+    resolved: bool,
     position: Option<f64>,
     serial: u64,
     cache: HashMap<usize, Option<TextBitmap>>,
@@ -62,11 +102,18 @@ pub struct LyricView {
     slots: [Slot; 3],
     /// Vertical position of the current line as a fraction of the window height (set per scene).
     anchor: f32,
-    /// Extra rise (fraction of the window height) while the control                         let step = |bar shows. Applied after the position
+    /// Extra rise (fraction of the window height) while the control bar shows. Applied after the position
     /// easing, so the lines follow the bar's alpha exactly instead of lagging behind it.
     lift: f32,
     /// Window size the cached line bitmaps were rendered for.
     for_size: (u32, u32),
+    column: Option<Column>,
+    reduced: bool,
+    /// Column mode: previous position (seek detection) and the line a seek resolved to (its slide is skipped).
+    last_pos: Option<f64>,
+    settled: Option<i64>,
+    emph: [f32; 3],
+    clip: Option<[f32; 3]>,
 }
 
 /// Pixel size of lyric text for a window height.
@@ -85,9 +132,45 @@ fn lyric_max_width(w: f32) -> u32 {
     (0.80 * w).max(64.0) as u32
 }
 
+/// Duration (s) of the column slide into line `n`: at most `SLIDE_MAX_S` (`RM_FADE_S` with reduced motion) and
+/// at most `SLIDE_GAP_FRAC` of the time since line `n - 1` started, so it always fits inside that line.
+pub fn slide_secs(l: &Lyrics, n: usize, reduced: bool) -> f64 {
+    let max = if reduced { RM_FADE_S } else { SLIDE_MAX_S };
+    let gap = match n.checked_sub(1) {
+        Some(p) if n < l.lines.len() => l.lines[n].start_s - l.lines[p].start_s,
+        _ => f64::INFINITY,
+    };
+    max.min(SLIDE_GAP_FRAC * gap).max(1e-3)
+}
+
+/// Column state at `pos`: `(a, b, s)` = sliding from line `a` to line `b = a + 1` with raw progress `s` (0..1),
+/// or resting on `a` (`a == b`, `s = 1`). Line -1 means "before the first line". A pure function of the position.
+pub fn column_phase(l: &Lyrics, pos: f64, reduced: bool) -> (i64, i64, f32) {
+    let c = l.at(pos);
+    let a = c.current.map_or(-1, |v| v as i64);
+    if let Some(n) = c.next {
+        let d = slide_secs(l, n, reduced);
+        let start = l.lines[n].start_s - d;
+        if pos >= start {
+            return (a, n as i64, ((pos - start) / d).clamp(0.0, 1.0) as f32);
+        }
+    }
+    (a, a, 1.0)
+}
+
+/// One line's placement in a resting column state: top (px), scale, alpha, emphasis.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Rest {
+    top: f32,
+    scale: f32,
+    alpha: f32,
+    emph: f32,
+}
+
 impl LyricView {
     pub fn new(source: LyricSource) -> Self {
         Self {
+            resolved: source == LyricSource::None,
             source,
             track: None,
             lyrics: None,
@@ -99,6 +182,12 @@ impl LyricView {
             anchor: 0.72,
             lift: 0.0,
             for_size: (0, 0),
+            column: None,
+            reduced: false,
+            last_pos: None,
+            settled: None,
+            emph: [1.0; 3],
+            clip: None,
         }
     }
 
@@ -117,14 +206,57 @@ impl LyricView {
         };
     }
 
+    pub fn set_reduced_motion(&mut self, on: bool) {
+        self.reduced = on;
+    }
+
+    /// Switches between the classic view (`None`) and the Album Focus column. Changing the kind drops the
+    /// rendered lines (they differ in style); a moved or resized column keeps them.
+    pub fn set_column(&mut self, c: Option<Column>) {
+        let c = c.filter(|c| {
+            [c.x, c.w, c.anchor, c.top, c.bottom]
+                .iter()
+                .all(|v| v.is_finite())
+        });
+        if c.is_some() != self.column.is_some() {
+            self.cache.clear();
+            self.requested.clear();
+            self.serial += 1;
+            self.slots = Default::default();
+            self.last_pos = None;
+            self.settled = None;
+        }
+        self.column = c;
+    }
+
+    /// The Album Focus column in use (`None` = classic view).
+    #[cfg(test)]
+    pub fn column(&self) -> Option<Column> {
+        self.column
+    }
+
+    /// Per slot: 0 = context colour, 1 = current-line colour (classic: always 1).
+    pub fn emphasis(&self) -> [f32; 3] {
+        self.emph
+    }
+
+    /// Column mask (top, bottom, feather) in pixels; `None` in the classic view.
+    pub fn clip(&self) -> Option<[f32; 3]> {
+        self.clip
+    }
+
     /// Latest playback position in seconds (`None` when the session reports no timeline: no lyrics shown).
     pub fn set_position(&mut self, pos: Option<f64>) {
         self.position = pos.filter(|p| p.is_finite());
     }
 
-    #[cfg(test)]
     pub fn has_lyrics(&self) -> bool {
         self.lyrics.is_some()
+    }
+
+    /// The lyric lookup for the current track has answered (always true without a source).
+    pub fn resolved(&self) -> bool {
+        self.resolved
     }
 
     /// A new track (or none): drop everything of the old one and, if a source is configured, ask the worker
@@ -135,6 +267,9 @@ impl LyricView {
         self.cache.clear();
         self.requested.clear();
         self.serial += 1;
+        self.last_pos = None;
+        self.settled = None;
+        self.resolved = self.source == LyricSource::None || track.is_none();
         for s in &mut self.slots {
             s.line = s.line.filter(|_| s.dims.is_some()).map(|_| usize::MAX); // stale content, never "current"
         }
@@ -152,6 +287,7 @@ impl LyricView {
         match r {
             Ready::Lyrics { track_id, lyrics } if Some(track_id) == self.track => {
                 self.lyrics = lyrics;
+                self.resolved = true;
             }
             Ready::Line {
                 track_id,
@@ -162,6 +298,64 @@ impl LyricView {
                 self.cache.insert(idx, bitmap);
             }
             _ => {}
+        }
+    }
+
+    /// Asks the worker for line `idx` unless it is cached or on its way (an empty line is cached as nothing).
+    fn request(
+        &mut self,
+        lyr: &Lyrics,
+        track: u64,
+        idx: usize,
+        surface: (u32, u32),
+        jobs: &mut Vec<Job>,
+    ) {
+        if idx >= lyr.lines.len() || self.cache.contains_key(&idx) || self.requested.contains(&idx)
+        {
+            return;
+        }
+        let text = &lyr.lines[idx].text;
+        if text.is_empty() {
+            self.cache.insert(idx, None); // instrumental gap: nothing to draw
+            return;
+        }
+        let (w, h) = (surface.0 as f32, surface.1 as f32);
+        let (style, step) = match self.column {
+            Some(c) => (LYRIC_CURRENT.style(text, h, c.w), LYRIC_CURRENT.step),
+            None => (
+                LineStyle {
+                    px: lyric_px(h),
+                    weight: 500,
+                    max_width: lyric_max_width(w),
+                    ..Default::default()
+                },
+                1.0,
+            ),
+        };
+        self.requested.insert(idx);
+        self.for_size = surface;
+        jobs.push(Job::Line {
+            track_id: track,
+            serial: self.serial,
+            idx,
+            text: text.clone(),
+            style,
+            step,
+        });
+    }
+
+    /// A resized window needs the lines at a new pixel size.
+    fn check_resize(&mut self, surface: (u32, u32)) {
+        let moved = |now: u32, then: u32| (now as f32 / then.max(1) as f32 - 1.0).abs() > 0.15;
+        if self.for_size != (0, 0)
+            && (moved(surface.0, self.for_size.0) || moved(surface.1, self.for_size.1))
+        {
+            self.cache.clear();
+            self.requested.clear();
+            self.serial += 1;
+            for s in &mut self.slots {
+                s.size_stale = true;
+            }
         }
     }
 
@@ -179,22 +373,16 @@ impl LyricView {
         } else {
             0.0
         };
-        let (w, h) = (surface.0 as f32, surface.1 as f32);
         if surface.0 == 0 || surface.1 == 0 {
             return [None; 3];
         }
-        // a resized window needs the lines at a new pixel size
-        let moved = |now: u32, then: u32| (now as f32 / then.max(1) as f32 - 1.0).abs() > 0.15;
-        if self.for_size != (0, 0)
-            && (moved(surface.0, self.for_size.0) || moved(surface.1, self.for_size.1))
-        {
-            self.cache.clear();
-            self.requested.clear();
-            self.serial += 1;
-            for s in &mut self.slots {
-                s.size_stale = true;
-            }
+        self.check_resize(surface);
+        if let Some(col) = self.column {
+            return self.update_column(col, dt, surface, ops, jobs);
         }
+        self.emph = [1.0; 3];
+        self.clip = None;
+        let (w, h) = (surface.0 as f32, surface.1 as f32);
         let cursor = match (&self.lyrics, self.position) {
             (Some(l), Some(p)) => Some(l.at(p)),
             _ => None,
@@ -209,24 +397,7 @@ impl LyricView {
         // request and place the lines that matter right now
         if let (Some(lyr), Some(track)) = (self.lyrics.clone(), self.track) {
             for idx in [cur, next].into_iter().flatten() {
-                if self.cache.contains_key(&idx) || self.requested.contains(&idx) {
-                    continue;
-                }
-                let text = &lyr.lines[idx].text;
-                if text.is_empty() {
-                    self.cache.insert(idx, None); // instrumental gap: nothing to draw
-                } else {
-                    self.requested.insert(idx);
-                    self.for_size = surface;
-                    jobs.push(Job::Line {
-                        track_id: track,
-                        serial: self.serial,
-                        idx,
-                        text: text.clone(),
-                        px: lyric_px(h),
-                        max_width: lyric_max_width(w),
-                    });
-                }
+                self.request(&lyr, track, idx, surface, jobs);
             }
             for idx in [cur, next].into_iter().flatten() {
                 let s = idx % 3;
@@ -304,6 +475,184 @@ impl LyricView {
                     alpha: slot.alpha,
                 });
             }
+        }
+        out
+    }
+
+    /// Ink height (px, scale 1) of line `i`: the rendered bitmap, an estimate while it is on its way, a short
+    /// gap for an instrumental line and nothing outside the file.
+    fn line_h(&self, i: i64, est: f32) -> f32 {
+        let Some(l) = self.lyrics.as_ref() else {
+            return 0.0;
+        };
+        if i < 0 || i as usize >= l.lines.len() {
+            return 0.0;
+        }
+        match self.cache.get(&(i as usize)) {
+            Some(Some(b)) => b.height.saturating_sub(2 * b.pad) as f32,
+            Some(None) => 0.5 * est,
+            None => est,
+        }
+    }
+
+    /// Where line `i` rests while line `c` is current: the current line centred on the anchor at full size,
+    /// the next one below at context scale, the one after it (hidden) further down, the previous one (hidden)
+    /// above. Every state is a stack with `gap` between ink boxes, so interpolating two states never overlaps.
+    fn rest(&self, c: i64, i: i64, col: &Column, est: f32, gap: f32) -> Option<Rest> {
+        let k = LYRIC_CONTEXT_SCALE;
+        let hc = self.line_h(c, est);
+        let cur_top = col.anchor - 0.5 * hc;
+        let next_top = cur_top + hc + gap;
+        Some(match i - c {
+            0 => Rest {
+                top: cur_top,
+                scale: 1.0,
+                alpha: 1.0,
+                emph: 1.0,
+            },
+            1 => Rest {
+                top: next_top,
+                scale: k,
+                alpha: 1.0,
+                emph: 0.0,
+            },
+            2 => Rest {
+                top: next_top + self.line_h(c + 1, est) * k + gap,
+                scale: k,
+                alpha: 0.0,
+                emph: 0.0,
+            },
+            -1 => Rest {
+                top: cur_top - gap - self.line_h(i, est),
+                scale: 1.0,
+                alpha: 0.0,
+                emph: 1.0,
+            },
+            _ => return None,
+        })
+    }
+
+    /// Album Focus column: see the module docs. Everything on screen follows from the position.
+    fn update_column(
+        &mut self,
+        col: Column,
+        dt: f32,
+        surface: (u32, u32),
+        ops: &mut Vec<GpuOp>,
+        jobs: &mut Vec<Job>,
+    ) -> [Option<TextDraw>; 3] {
+        let h = surface.1 as f32;
+        self.clip = Some([col.top, col.bottom, COL_FEATHER * h]);
+        self.emph = [0.0; 3];
+        let (Some(lyr), Some(pos), Some(track)) = (self.lyrics.clone(), self.position, self.track)
+        else {
+            self.last_pos = None;
+            return [None; 3];
+        };
+        // a jump of the timeline (seek, first frame) resolves at once: a slide in progress there is skipped
+        let jumped = self
+            .last_pos
+            .is_none_or(|p| (pos - p).abs() > SEEK_JUMP_S + f64::from(dt));
+        self.last_pos = Some(pos);
+        let (a, b, s) = column_phase(&lyr, pos, self.reduced);
+        if jumped && a != b {
+            self.settled = Some(b);
+        }
+        if self.settled.is_some_and(|t| t != b) {
+            self.settled = None;
+        }
+        let (a, s) = if self.settled == Some(b) {
+            (b, 1.0)
+        } else {
+            (a, s)
+        };
+        // bounded memory and the lines that matter: the window a..=a+2 plus one prefetched line
+        let first = a.max(0) as usize;
+        if self.cache.len() > 12 {
+            self.cache.retain(|&k, _| k.abs_diff(first) <= 4);
+            self.requested.retain(|&k| k.abs_diff(first) <= 4);
+        }
+        for idx in first..first + 4 {
+            self.request(&lyr, track, idx, surface, jobs);
+        }
+        let last = (a + 2).min(lyr.lines.len() as i64 - 1);
+        for i in a.max(0)..=last {
+            let idx = i as usize;
+            let slot = &mut self.slots[idx % 3];
+            if slot.line == Some(idx) && !slot.size_stale {
+                continue;
+            }
+            if let Some(entry) = self.cache.get(&idx) {
+                match entry {
+                    Some(b) => {
+                        slot.dims = Some((b.width, b.height, b.pad));
+                        ops.push(GpuOp::SetText(FIRST_TEXT_SLOT + idx % 3, b.clone()));
+                    }
+                    None => {
+                        if slot.dims.take().is_some() {
+                            ops.push(GpuOp::ClearText(FIRST_TEXT_SLOT + idx % 3));
+                        }
+                    }
+                }
+                if slot.line != Some(idx) {
+                    slot.shown = 0.0;
+                }
+                slot.line = Some(idx);
+                slot.size_stale = false;
+            }
+        }
+        for slot in &mut self.slots {
+            slot.shown = (slot.shown + dt / SHOWN_S).min(1.0);
+        }
+        // reduced motion: no movement; the column switches state at the midpoint of a 200 ms crossfade
+        let (sp, fade) = if self.reduced {
+            (if s >= 0.5 { 1.0 } else { 0.0 }, (2.0 * s - 1.0).abs())
+        } else {
+            (EASE_IN_OUT.at(s), 1.0)
+        };
+        let est = LYRIC_CURRENT.size * h * 1.15;
+        let gap = COL_GAP * h;
+        let mut out = [None; 3];
+        for i in a.max(0)..=last {
+            let (Some(r0), Some(r1)) = (
+                self.rest(a, i, &col, est, gap),
+                self.rest(b, i, &col, est, gap),
+            ) else {
+                continue;
+            };
+            let lerp = |x: f32, y: f32| x + (y - x) * sp;
+            let (top, scale, emph) = (
+                lerp(r0.top, r1.top),
+                lerp(r0.scale, r1.scale),
+                lerp(r0.emph, r1.emph),
+            );
+            let idx = i as usize;
+            let slot = &self.slots[idx % 3];
+            let Some((tw, th, pad)) = slot.dims.filter(|_| slot.line == Some(idx)) else {
+                continue;
+            };
+            let alpha = lerp(r0.alpha, r1.alpha) * fade * slot.shown;
+            if alpha <= 0.002 {
+                continue;
+            }
+            let ink = tw.saturating_sub(2 * pad) as f32 * scale;
+            let rtl = mg_text::is_rtl(&lyr.lines[idx].text);
+            let x_ink = if col.centered {
+                col.x + 0.5 * (col.w - ink)
+            } else if rtl {
+                col.x + col.w - ink
+            } else {
+                col.x
+            };
+            let p = pad as f32 * scale;
+            out[idx % 3] = Some(TextDraw {
+                x: x_ink - p,
+                y: top - p,
+                w: tw as f32 * scale,
+                h: th as f32 * scale,
+                alpha,
+            });
+            self.emph[idx % 3] = emph;
         }
         out
     }
@@ -562,7 +911,7 @@ mod tests {
         assert!(
             r.jobs
                 .iter()
-                .any(|j| matches!(j, Job::Line { max_width, .. } if *max_width <= 720))
+                .any(|j| matches!(j, Job::Line { style, .. } if style.max_width <= 720))
         );
     }
 
@@ -875,5 +1224,228 @@ mod overlap_tests {
             let ov = worst_overlap(&o, 2.0);
             assert!(ov <= 2.0, "track change: overlap {ov:.1}px {o:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod column_tests {
+    use super::*;
+
+    const S: (u32, u32) = (1920, 1080);
+    const COL: Column = Column {
+        x: 960.0,
+        w: 700.0,
+        anchor: 453.6,
+        top: 194.4,
+        bottom: 590.0,
+        centered: false,
+    };
+
+    /// Lines at 1, 5, 6.2 (a rapid line), 6.5, 12 s; an instrumental gap at 9 s.
+    fn sample() -> Arc<Lyrics> {
+        Arc::new(
+            mg_media::lrc::parse(
+                b"[00:01.00]one\n[00:05.00]two\n[00:06.20]three\n[00:06.50]four\n[00:09.00]\n[00:12.00]six\n",
+            )
+            .unwrap(),
+        )
+    }
+
+    fn view(l: Arc<Lyrics>, reduced: bool) -> LyricView {
+        let mut v = LyricView::new(LyricSource::Demo);
+        v.set_reduced_motion(reduced);
+        v.set_column(Some(COL));
+        v.on_track(Some(1), "T", "A", &mut Vec::new());
+        v.on_ready(Ready::Lyrics {
+            track_id: 1,
+            lyrics: Some(l),
+        });
+        v
+    }
+
+    /// One frame at `pos`; line jobs answered at once with a one-line bitmap of the requested size.
+    fn frame(v: &mut LyricView, pos: f64) -> [Option<TextDraw>; 3] {
+        let (mut ops, mut jobs) = (Vec::new(), Vec::new());
+        v.set_position(Some(pos));
+        let out = v.update(1.0 / 60.0, S, &mut ops, &mut jobs);
+        for j in jobs {
+            if let Job::Line {
+                track_id,
+                serial,
+                idx,
+                style,
+                ..
+            } = j
+            {
+                let (w, h) = ((style.px * 8.0) as u32, (style.px * 1.15) as u32 + 4);
+                v.on_ready(Ready::Line {
+                    track_id,
+                    serial,
+                    idx,
+                    bitmap: Some(TextBitmap {
+                        width: w,
+                        height: h,
+                        pad: 2,
+                        coverage: vec![1; (w * h) as usize],
+                    }),
+                });
+            }
+        }
+        out
+    }
+
+    fn settle(v: &mut LyricView, pos: f64) -> [Option<TextDraw>; 3] {
+        let mut o = [None; 3];
+        for _ in 0..30 {
+            o = frame(v, pos);
+        }
+        o
+    }
+
+    fn mid(d: &TextDraw) -> f32 {
+        d.y + 0.5 * d.h
+    }
+
+    #[test]
+    fn the_slide_adapts_to_the_gap_and_ends_on_the_line_timestamp() {
+        let l = sample();
+        for n in 1..l.lines.len() {
+            let gap = l.lines[n].start_s - l.lines[n - 1].start_s;
+            let d = slide_secs(&l, n, false);
+            assert!(
+                d <= SLIDE_MAX_S + 1e-9 && d <= SLIDE_GAP_FRAC * gap + 1e-9,
+                "line {n}: {d} for gap {gap}"
+            );
+            assert!(d < gap, "a slide never exceeds the gap");
+            assert!(slide_secs(&l, n, true) <= RM_FADE_S + 1e-9);
+            // the slide into n runs over [t_n - d, t_n]: at t_n it is complete and n is current
+            let t = l.lines[n].start_s;
+            assert_eq!(column_phase(&l, t, false), (n as i64, n as i64, 1.0));
+            let (a, b, s) = column_phase(&l, t - 0.5 * d, false);
+            assert_eq!((a, b), (n as i64 - 1, n as i64));
+            assert!((s - 0.5).abs() < 1e-3);
+            assert_eq!(
+                column_phase(&l, t - d - 0.01, false).2,
+                1.0,
+                "rest before the slide"
+            );
+        }
+        // the rapid line (0.3 s gap) slides in 135 ms, a regular one takes the full 600 ms
+        assert!((slide_secs(&l, 3, false) - 0.135).abs() < 1e-6);
+        assert!((slide_secs(&l, 1, false) - 0.6).abs() < 1e-9);
+    }
+
+    #[test]
+    fn playing_through_line_changes_keeps_lines_ordered_apart_and_in_the_column() {
+        let l = sample();
+        let mut v = view(l.clone(), false);
+        let mut t = 0.0f64;
+        settle(&mut v, t);
+        while t < 13.0 {
+            let o = frame(&mut v, t);
+            let vis: Vec<_> = o.iter().flatten().filter(|d| d.alpha > 0.02).collect();
+            for (i, a) in vis.iter().enumerate() {
+                assert!(a.x + 2.0 >= COL.x - 0.5 && a.x + a.w - 2.0 <= COL.x + COL.w + 0.5);
+                for b in &vis[i + 1..] {
+                    let ov = (a.y + a.h - 2.0).min(b.y + b.h - 2.0) - (a.y + 2.0).max(b.y + 2.0);
+                    assert!(ov <= 0.5, "t {t:.2}: lines overlap by {ov:.1}px {o:?}");
+                }
+            }
+            // the line being sung is the emphasised one, in place, from its timestamp until the next line's slide
+            // starts (never late: the slide into a line ends at its timestamp)
+            let (a, b, _) = column_phase(&l, t, false);
+            if let Some(c) = l
+                .at(t)
+                .current
+                .filter(|&c| a == b && !l.lines[c].text.is_empty())
+            {
+                let d = o[c % 3].expect("current line drawn");
+                assert!(
+                    v.emphasis()[c % 3] > 0.99,
+                    "t {t:.2}: line {c} not current yet"
+                );
+                assert!(
+                    (mid(&d) - COL.anchor).abs() < 1.0,
+                    "t {t:.2}: current line at {}",
+                    mid(&d)
+                );
+            }
+            t += 1.0 / 60.0;
+        }
+        assert_eq!(v.clip(), Some([COL.top, COL.bottom, COL_FEATHER * 1080.0]));
+    }
+
+    #[test]
+    fn a_seek_resolves_straight_to_the_position_without_replaying_a_slide() {
+        let l = sample();
+        let mut v = view(l.clone(), false);
+        settle(&mut v, 2.0);
+        // seek into the slide towards line 1 (window 4.4..5.0 s): its end state shows on the first frame
+        let o = frame(&mut v, 4.7);
+        let o = if o[1].is_some() {
+            o
+        } else {
+            frame(&mut v, 4.7)
+        }; // the bitmap may need one frame
+        let d = o[1].expect("line 1 drawn");
+        assert!(v.emphasis()[1] > 0.99 && (mid(&d) - COL.anchor).abs() < 1.0);
+        // and it stays there (no queued motion) until the next slide starts
+        let mut t = 4.72;
+        while t < 5.5 {
+            let o = frame(&mut v, t);
+            let d = o[1].expect("line 1");
+            assert!((mid(&d) - COL.anchor).abs() < 1.0, "t {t:.2} moved");
+            t += 1.0 / 60.0;
+        }
+        // a backwards seek: the first frame already shows the earlier state, nothing of the later one
+        let o = frame(&mut v, 1.5);
+        let d = o[0].expect("line 0 current");
+        assert!(v.emphasis()[0] > 0.99 && (mid(&d) - COL.anchor).abs() < 1.0);
+        assert!(o[2].is_none(), "no line from the old position");
+    }
+
+    #[test]
+    fn reduced_motion_crossfades_lines_without_moving_them() {
+        let mut v = view(sample(), true);
+        settle(&mut v, 3.0);
+        let mut seen: [Option<f32>; 3] = [None; 3];
+        let mut t = 4.5f64;
+        while t < 5.5 {
+            let o = frame(&mut v, t);
+            for (k, d) in o.iter().enumerate() {
+                if let Some(d) = d.filter(|d| d.alpha > 0.05) {
+                    // a line only changes place while invisible (the crossfade dips through zero)
+                    if let Some(y) = seen[k] {
+                        assert!((d.y - y).abs() < 0.5, "t {t:.2}: slot {k} moved");
+                    }
+                    seen[k] = Some(d.y);
+                } else {
+                    seen[k] = None;
+                }
+            }
+            t += 1.0 / 60.0;
+        }
+    }
+
+    #[test]
+    fn switching_view_kind_drops_the_old_lines_and_classic_is_unchanged() {
+        let mut v = view(sample(), false);
+        settle(&mut v, 2.0);
+        assert!(v.clip().is_some());
+        v.set_column(None);
+        let (mut ops, mut jobs) = (Vec::new(), Vec::new());
+        v.set_position(Some(2.0));
+        let o = v.update(1.0 / 60.0, S, &mut ops, &mut jobs);
+        assert!(
+            o.iter().all(Option::is_none),
+            "column bitmaps are not reused by the classic view"
+        );
+        assert!(v.clip().is_none() && v.emphasis() == [1.0; 3]);
+        assert!(
+            !jobs.is_empty()
+                && jobs
+                    .iter()
+                    .all(|j| matches!(j, Job::Line { style, .. } if style.max_lines == 1))
+        );
     }
 }

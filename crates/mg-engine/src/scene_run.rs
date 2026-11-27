@@ -167,6 +167,9 @@ pub struct SceneOpts {
     pub controls: ControlsMode,
     /// Fluid quality tier 0..=3 (developer flag `--fluid-tier`; auto-tier is a TODO).
     pub fluid_tier: u8,
+    /// PLACEHOLDER (owner question): reduced motion for the overlay (`--reduced-motion`). The Windows setting
+    /// (SPI_GETCLIENTAREAANIMATION) is not reachable with the dependencies and `windows` features enabled today.
+    pub reduced_motion: bool,
 }
 
 #[derive(Debug, PartialEq, Clone, Copy)]
@@ -190,6 +193,7 @@ pub fn parse(args: &[String], source: Source) -> Result<SceneOpts, String> {
         lyrics_dir: None,
         controls: ControlsMode::Auto,
         fluid_tier: mg_gfx::fluid::DEFAULT_TIER,
+        reduced_motion: false,
     };
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -225,6 +229,7 @@ pub fn parse(args: &[String], source: Source) -> Result<SceneOpts, String> {
                     _ => return Err("--controls needs auto|always".into()),
                 }
             }
+            "--reduced-motion" => o.reduced_motion = true,
             "--no-media" => o.media = MediaChoice::Off,
             "--demo-media" => o.media = MediaChoice::Demo,
             "--layout" => {
@@ -765,6 +770,19 @@ impl App {
         self.ctl.advance(dt as f32);
         self.pres.set_lyric_anchor(anchor);
         self.pres.set_lyric_lift(self.ctl.lyric_lift(anchor));
+        // Album Focus lays out above the bar zone; the Corner block rises over it while the bar shows. The bar's
+        // visibility (0..1) is the ratio of its current lift to the full lift (always > 0).
+        let dpi = self
+            .window
+            .as_ref()
+            .map_or(1.0, |w| w.scale_factor() as f32);
+        let full_lift = crate::controls::lyric_lift(anchor, surface, dpi);
+        self.pres.set_bar(
+            surface.1 as f32 - 128.0 * crate::controls::ui_scale(surface, dpi),
+            self.ctl.lyric_lift(anchor) / full_lift.max(1e-3),
+        );
+        self.pres
+            .set_album_scene(self.switch.target() == SceneKind::Focus, surface);
         let mut overlay_params = self
             .pres
             .update(dt as f32, surface, params.energy, params.swell);
@@ -780,14 +798,14 @@ impl App {
             },
             position: self.last_np.as_ref().and_then(|n| n.position_now(now)),
             duration: self.last_np.as_ref().and_then(|n| n.duration_s),
-            fg: overlay_params.text_color,
-            tint: overlay_params.halo_color,
+            fg: overlay_params.colors.title,
+            tint: overlay_params.accent,
         });
         for job in self.ctl.take_jobs() {
             self.worker.submit(job);
         }
         // Album Focus radiates from the artwork rectangle (one source of truth: the overlay layout).
-        let target_vis = match overlay_params.art {
+        let target_vis = match overlay_params.art.or(overlay_params.art_prev) {
             Some(a) => {
                 let (w, h) = (surface.0.max(1) as f32, surface.1.max(1) as f32);
                 self.focus_last = [a.cx / w, a.cy / h, a.hw / h, a.hh / h];
@@ -846,6 +864,8 @@ impl App {
                     GpuOp::SetArt(img) => {
                         ov.set_art(&g.device, &g.queue, (img.width, img.height), &img.rgba);
                     }
+                    GpuOp::ShiftArt => ov.shift_art(&g.device),
+                    GpuOp::ClearPrevArt => ov.clear_prev_art(&g.device),
                     GpuOp::ClearArt => ov.clear_art(&g.device),
                     GpuOp::SetText(i, b) => {
                         ov.set_text(&g.device, &g.queue, i, (b.width, b.height), &b.coverage);
@@ -979,6 +999,7 @@ pub fn run(opts: SceneOpts) -> i32 {
         _ => MediaFeed::Off,
     };
     let layout = opts.layout;
+    let reduced_motion = opts.reduced_motion;
     let lyric_source = match (&opts.lyrics_dir, opts.media) {
         (Some(d), _) => LyricSource::Dir(d.clone()),
         (None, MediaChoice::Demo) => LyricSource::Demo,
@@ -1007,6 +1028,7 @@ pub fn run(opts: SceneOpts) -> i32 {
         pres: {
             let mut p = Presentation::new(layout);
             p.set_lyric_source(lyric_source);
+            p.set_reduced_motion(reduced_motion);
             p
         },
         worker: Worker::start(),
