@@ -1,0 +1,28 @@
+[package]
+name = "mg-media"
+description = "Now-playing metadata and artwork from Windows media sessions (SMTC). Untrusted input; bounded."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "=0.62.2", default-features = false, features = [
+  "std",
+  "Foundation",
+  "Foundation_Collections",
+  "Media_Control",
+  "Storage_Streams",
+  "Graphics_Imaging",
+  "Win32_Foundation",
+  "Win32_System_Com",
+  "Web_Http",
+  "Web_Http_Filters",
+  "Web_Http_Headers",
+  "Data_Json",
+] }
+
+[lints]
+workspace = true

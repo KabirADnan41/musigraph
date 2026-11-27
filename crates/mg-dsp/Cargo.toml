@@ -1,0 +1,15 @@
+[package]
+name = "mg-dsp"
+description = "Pure audio analysis: FFT, bands, smoothing, beat detection (no OS code)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+rustfft = "=6.4.1"
+
+[lints]
+workspace = true
