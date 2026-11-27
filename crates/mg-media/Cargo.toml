@@ -18,6 +18,10 @@ windows = { version = "=0.62.2", default-features = false, features = [
   "Graphics_Imaging",
   "Win32_Foundation",
   "Win32_System_Com",
+  "Web_Http",
+  "Web_Http_Filters",
+  "Web_Http_Headers",
+  "Data_Json",
 ] }
 
 [lints]

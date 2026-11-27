@@ -344,3 +344,76 @@ The mg-media test count there should read 33 for commit 3eb9341 (36 included 3 u
   - (c) The test field `lift` was renamed `push_lift` (it reads push + lift).
 - **Deferred:** the fragile exact-length fixture pattern in selftest.rs:611 (owned by the running Album Focus part-1 agent; fix after it lands).
 - **Limitation:** FL_BASS_LEAK is measured on one synthetic chord; tune on real music in Session 3.
+
+## 2026-11-27 - Stage E part 1: LRCLIB client core (mg-media, mocked tests only)
+- **Branch:** feature/poc-audio-fullscreen; uncommitted. No real network request was made (tests use a mock transport and synthetic text).
+- **Files:**
+  - new `crates/mg-media/src/lrclib/mod.rs`: Query/URL building, `evaluate`/`judge`, JSON via Windows.Data.Json, the `Requester` state machine.
+  - new `lrclib/client.rs`: `LrclibClient`, the worker thread and per-frame facade.
+  - new `lrclib/winrt.rs`: `WinRtTransport` (Windows.Web.Http).
+  - new `lrclib/tests.rs`.
+  - `lib.rs`: `pub mod lrclib` and a doc line.
+  - `Cargo.toml`: windows features `Web_Http`, `Web_Http_Filters`, `Web_Http_Headers` and `Data_Json` (owner-approved). `cargo tree -p mg-media` is unchanged and the Cargo.lock hash is unchanged.
+- **Safeguards and how each is enforced (test in brackets):**
+  - Consent:
+    - `Requester::poll` returns None unless consented; consent starts OFF [no_consent_never_requests: 2000 mixed steps; client without_consent_the_transport_is_never_called].
+    - Revoke bumps the generation, which cancels in-flight work via the worker's shared generation, drops late replies and clears track, cache and lyrics memory [revoke_during_debounce_or_flight_stops_everything, revoke_invalidates_late_replies_and_clears_memory, client revoke_cancels_in_flight_and_discards_the_reply].
+  - Request:
+    - GET `https://lrclib.net/api/get` with track_name, artist_name, album_name (omitted when empty) and duration.
+    - RFC 3986 percent-encoding.
+    - Empty title or artist is refused, so a lookup is never title-only.
+    - Duration is required, finite, rounded and must lie in 1..=3600 [query_refuses_*, url_is_percent_encoded_and_pinned].
+  - Strict match:
+    - The returned duration must be within +/-2 s of the duration sent; NaN or missing is rejected.
+    - instrumental=true is rejected.
+    - A missing trackName is rejected as ambiguous.
+    - The version words (live, remix, mix, acoustic, cover, instrumental, karaoke, remaster(ed), extended, edit, unplugged, demo) in title+album must be the same set on both sides, matched as whole words.
+    - syncedLyrics goes through the existing bounded `lrc::parse`.
+    - Plain-only lyrics give the distinct `Unsynced` result (sanitised, at most MAX_LINES lines); malformed synced text falls back to plain and never to invented timing [duration_must_match_*, version_word_mismatch_is_rejected, plain_only_*, instrumental_*].
+  - Second, normalised query: deliberately NOT implemented, because it risks remix/live mix-ups.
+  - Status policy:
+    - 404 -> NotFound.
+    - 429/503 -> RetryAfter, clamped to 1..600 s (default 60 s), plus a 1 s margin before any further request.
+    - 3xx -> Refused (AllowAutoRedirect=false, so redirects are never followed).
+    - Any other status -> Error [status_codes_are_classified].
+  - Size: 512 KiB cap.
+    - The transport rejects a Content-Length above the cap and reads the body in 16 KiB chunks, aborting once the cap would be exceeded (memory stays bounded; the check is applied after decompression).
+    - `evaluate` re-checks the size.
+    - JSON nesting deeper than 16 is refused before the system parser runs [transport_errors_and_oversize_*, json_body_is_parsed_strictly, json_depth_*].
+  - Hostile JSON: wrong types count as absent; invalid UTF-8, NaN or trailing garbage give Error; a lone surrogate is replaced and sanitised [json_hostile_values_*].
+  - Pacing:
+    - 1.5 s debounce, so skipping through tracks sends nothing.
+    - One request in flight; each key is requested once per session.
+    - Session RAM cache of settled keys (cap 1024).
+    - At most 10 requests per rolling minute.
+    - Error backoff from 10 s doubling to 300 s [debounce_*, skipping_*, one_in_flight_*, global_rate_cap_*, retry_after_*, errors_back_off_*].
+  - Transport (Windows):
+    - HttpBaseProtocolFilter settings: AllowAutoRedirect=false, AllowUI=false, CookieUsageBehavior=NoCookies, CacheControl Read=NoCache and Write=NoCache.
+    - User-Agent `Musigraph/<version> (+https://github.com/KabirADnan41/musigraph)`.
+    - ResponseHeadersRead; the body is read only for status 200.
+    - 8 s app-side deadline over the whole request; the IAsyncOperation is cancelled on deadline, revoke or shutdown.
+    - Only URLs starting `https://lrclib.net/api/` are fetched [filter_has_the_privacy_settings (settings read back, no network), non_approved_urls_are_refused_without_a_request, only_https_on_the_approved_host_is_allowed].
+  - Threads: one worker thread with a sync_channel(1) queue. The engine-side `update()` never blocks. Drop cancels and joins (detaching after 2 s) [drop_mid_request_returns_promptly, missing_transport_degrades_to_error_without_hanging].
+  - Privacy: nothing is written to disk and nothing logs. `Debug` of Query, Outcome and HttpResponse is redacted to counts and status [debug_output_is_redacted].
+- **Verification:**
+  - `cargo test -p mg-media`: 69 passed (33 new lrclib).
+  - `cargo clippy -p mg-media --all-targets -- -D warnings`: clean.
+  - `rustfmt --check` on own files: clean.
+  - RED was observed first: 29 tests failed on todo!() stubs.
+- **Limitations:**
+  - The +/-2 s check is against the rounded duration that was sent; this mirrors LRCLIB's rule and is up to 0.5 s looser than the exact track length.
+  - Retry-After in HTTP-date form falls back to 60 s.
+  - The fixed 1 s margin stands in for random jitter.
+  - An Error settles that track for the session, so there are no retry storms; an offline start loses lyrics for that track only.
+  - JSON parsing is Windows-only (stub returns None elsewhere).
+  - The WinRT request path (status, Retry-After header, stream reads, cancellation of a live operation) is compiled but UNEXERCISED: no network in tests.
+  - Default headers added by the OS stack (e.g. Accept-Encoding) are UNVERIFIED.
+  - OS-internal disk use beyond the documented HTTP cache is UNVERIFIED.
+- **Remains:**
+  - Consent prompt (owner wording) and its persistence.
+  - Engine wiring (call `LrclibClient::start(WinRtTransport::new)`, then `update()` per frame).
+  - The labelled "Not synchronized" panel for `Unsynced`.
+  - Source priority (local .lrc first).
+  - Sonnet High security and correctness review (§27).
+  - Joint interactive test against the live service with owner approval.
+  - Public-release gate (terms and licence).

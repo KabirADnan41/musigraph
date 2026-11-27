@@ -5,7 +5,8 @@
 //! match; `NowPlaying::app_id` tells the scene which application the metadata came from.
 //!
 //! Everything a media session reports (text, artwork bytes, timeline) is UNTRUSTED: strings are
-//! sanitised and length-limited, artwork is size-limited, nothing is executed or persisted. No network.
+//! sanitised and length-limited, artwork is size-limited, nothing is executed or persisted. No network,
+//! except the consent-gated `lrclib` lyrics lookup (off by default).
 
 #![deny(unsafe_code)]
 
@@ -24,6 +25,7 @@ pub use session::NowPlayingWatcher;
 pub mod control;
 pub mod display;
 pub mod lrc;
+pub mod lrclib;
 pub mod palette;
 pub mod synth;
 
