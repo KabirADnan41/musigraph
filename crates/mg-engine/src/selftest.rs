@@ -1110,7 +1110,7 @@ fn focus_checks(failures: &mut Vec<String>) -> bool {
 
 /// Scene panel (S5): the real thumbnails (runtime, throwaway scene set) and labels (DirectWrite) through the real
 /// `ScenePanel` and overlay, over the live scene at 16:9, 21:9, 4:3 and 9:16. Checks: the panel changes the picture,
-/// every tile's thumbnail shows (not the placeholder), reduced motion fades without rising, repeated open/close
+/// every tile's thumbnail differs from the placeholder draw, reduced motion fades without rising, repeated open/close
 /// never creates another atlas, and the draw cost delta is printed. With `MG_SCENE_DUMP=<dir>` writes
 /// `panel-<w>x<h>.png` for visual inspection.
 fn panel_previews(failures: &mut Vec<String>) -> bool {
@@ -1129,7 +1129,7 @@ fn panel_previews(failures: &mut Vec<String>) -> bool {
     let mut scene = SceneSet::new_headless(&h.device);
     let dump = std::env::var("MG_SCENE_DUMP").ok();
     let t0 = std::time::Instant::now();
-    let thumbs = crate::scene_thumbs::generate(&h.device, &h.queue);
+    let thumbs = crate::scene_thumbs::generate_guarded(&h.device, &h.queue);
     println!(
         "PANEL thumbnails generated in {:.0} ms (throwaway scene set, one-time)",
         t0.elapsed().as_secs_f64() * 1000.0
@@ -1196,20 +1196,43 @@ fn panel_previews(failures: &mut Vec<String>) -> bool {
                 changed * 100.0
             ));
         }
-        // every tile shows its thumbnail (brighter and more varied than the neutral placeholder) and its label
-        for (i, t) in draw.tiles[..draw.count].iter().enumerate() {
-            let (cx, cy) = (t.rect[0] as u32, t.rect[1] as u32);
-            let at = |x: u32, y: u32| {
-                let o = ((y * res.0 + x) * 4) as usize;
-                [img[o], img[o + 1], img[o + 2]]
-            };
-            let c = at(cx.min(res.0 - 1), cy.min(res.1 - 1));
-            if c == [0, 0, 0] {
-                failures.push(format!("panel {tag}: tile {i} is black"));
+        // every tile shows a REAL thumbnail: its pixels differ from the same panel drawn with placeholders
+        // (mean absolute difference over the thumbnail rectangle), and every tile has its label
+        let mut ph = draw.clone();
+        ph.tiles.iter_mut().for_each(|t| t.has_thumb = false);
+        match render(Some(ph)) {
+            Ok(placeholder) => {
+                for (i, t) in draw.tiles[..draw.count].iter().enumerate() {
+                    let [cx, cy, hw, hh] = t.rect;
+                    let (x0, x1) = ((cx - 0.8 * hw) as u32, (cx + 0.8 * hw) as u32);
+                    let (y0, y1) = ((cy - 0.8 * hh) as u32, (cy + 0.8 * hh) as u32);
+                    let (mut sum, mut n) = (0u64, 0u64);
+                    for y in y0..y1.min(res.1) {
+                        for x in x0..x1.min(res.0) {
+                            let o = ((y * res.0 + x) * 4) as usize;
+                            for k in 0..3 {
+                                sum += u64::from(img[o + k].abs_diff(placeholder[o + k]));
+                                n += 1;
+                            }
+                        }
+                    }
+                    let mad = sum as f64 / n.max(1) as f64;
+                    if mad < 3.0 {
+                        failures.push(format!(
+                            "panel {tag}: tile {i} looks like the placeholder (mad {mad:.2})"
+                        ));
+                    }
+                    if t.label[2] <= 0.0 {
+                        failures.push(format!("panel {tag}: tile {i} has no label"));
+                    }
+                }
             }
-            if t.label[2] <= 0.0 {
-                failures.push(format!("panel {tag}: tile {i} has no label"));
-            }
+            Err(_) => failures.push(format!("panel {tag}: placeholder render failed")),
+        }
+        if draw.caption[2] <= 0.0 {
+            failures.push(format!(
+                "panel {tag}: no \"Representative previews\" caption"
+            ));
         }
         if let Some(dir) = &dump {
             let png = mg_media::synth::png_rgba(res.0, res.1, &srgb_view(&img));

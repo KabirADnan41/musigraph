@@ -21,10 +21,20 @@ const MAX_TEXTURE_SIDE: u32 = 4096;
 /// the glyph coverage in alpha).
 pub const THUMB_SIZE: (u32, u32) = (256, 144);
 pub const THUMB_CELLS: usize = 5;
-pub const LABEL_SIZE: (u32, u32) = (256, 64);
-pub const LABEL_CELLS: usize = 8;
+pub const LABEL_SIZE: (u32, u32) = (320, 64);
+pub const LABEL_CELLS: usize = 9;
 pub const LABEL_ORIGIN_Y: u32 = 2 * THUMB_SIZE.1;
-pub const ATLAS_SIZE: (u32, u32) = (3 * THUMB_SIZE.0, LABEL_ORIGIN_Y + 3 * LABEL_SIZE.1);
+pub const ATLAS_SIZE: (u32, u32) = (3 * LABEL_SIZE.0, LABEL_ORIGIN_Y + 3 * LABEL_SIZE.1);
+
+// Opacities of the panel (mirrored by name in overlay.wgsl; `panel_contrast_*` tests compute with these).
+pub const PANEL_SCRIM_TOP: f32 = 0.45;
+pub const PANEL_SCRIM_BOTTOM: f32 = 0.65;
+pub const PANEL_PLATE_ALPHA: f32 = 0.75;
+pub const PANEL_LABEL_ALPHA: f32 = 0.92;
+pub const PANEL_HEADING_ALPHA: f32 = 0.78;
+pub const PANEL_PILL_BACK_ALPHA: f32 = 0.80;
+pub const PANEL_PILL_TEXT_ALPHA: f32 = 0.85;
+pub const PANEL_KEYLINE_ALPHA: f32 = 0.90;
 
 /// Artwork placement in surface pixels. `(cx, cy)` is the centre; `hw`/`hh` the half extents (the caller
 /// preserves the image aspect ratio when computing them). The plate (rounded corners, 1 px inner stroke, contact
@@ -252,7 +262,22 @@ pub const PANEL_TILES: usize = THUMB_CELLS;
 pub const LABEL_CURRENT: usize = 5;
 pub const LABEL_EXPERIMENTAL_PILL: usize = 6;
 pub const LABEL_EXPERIMENTAL_HEADING: usize = 7;
-const PANEL_BYTES: usize = (5 + PANEL_TILES * 6) * 16;
+/// "Representative previews" caption under the tiles.
+pub const LABEL_CAPTION: usize = 8;
+const PANEL_BYTES: usize = (6 + PANEL_TILES * 6) * 16;
+
+// The atlas, the tile count and the shader agree with the scene list (a new scene fails to compile here).
+const _: () = assert!(THUMB_CELLS == crate::scene::SceneKind::ALL.len());
+const _: () = assert!(PANEL_TILES == THUMB_CELLS);
+const _: () = assert!(LABEL_CURRENT == THUMB_CELLS && LABEL_CAPTION + 1 == LABEL_CELLS);
+const _: () = assert!(
+    THUMB_CELLS <= 6 && LABEL_CELLS <= 9,
+    "3 columns, 2 thumbnail rows, 3 label rows"
+);
+const _: () = assert!(
+    THUMB_SIZE.0 <= LABEL_SIZE.0,
+    "thumbnail cells fit the atlas width"
+);
 
 /// One scene tile, final surface pixels. `(cx, cy, hw, hh)` is the thumbnail rectangle after the CPU applied
 /// the hover scale and the rise; text rectangles are integer-aligned and drawn 1:1 from the atlas label cells.
@@ -292,6 +317,8 @@ pub struct PanelDraw {
     /// "EXPERIMENTAL" heading text rectangle (left, top, w, h); w 0 = none.
     pub heading: [f32; 4],
     pub heading_alpha: f32,
+    /// "Representative previews" caption text rectangle (left, top, w, h); w 0 = none.
+    pub caption: [f32; 4],
     /// Bitmap sizes (w, h) of the pill texts, centred in their pills by the shader.
     pub cur_text: [f32; 2],
     pub exp_text: [f32; 2],
@@ -330,6 +357,7 @@ impl PanelDraw {
         );
         put(&mut o, &self.heading.map(|v| v.max(0.0)));
         put(&mut o, &[self.count.min(PANEL_TILES) as f32, 0.0, 0.0, 0.0]);
+        put(&mut o, &self.caption.map(|v| v.max(0.0)));
         let flag = |b: bool| if b { 1.0 } else { 0.0 };
         for t in &self.tiles {
             put(&mut o, &t.rect.map(|v| v.max(0.0)));
@@ -1278,6 +1306,7 @@ mod tests {
             tiles,
             heading: [20.0, 205.0, 40.0, 10.0],
             heading_alpha: 1.0,
+            caption: [0.0; 4],
             cur_text: [20.0, 8.0],
             exp_text: [20.0, 8.0],
         }
@@ -1289,6 +1318,54 @@ mod tests {
             c / 12.92
         } else {
             ((c + 0.055) / 1.055).powf(2.4)
+        }
+    }
+
+    /// WCAG contrast of white text of opacity `text` over a backdrop of linear luminance `back` that the scrim
+    /// (`scrim` black) and optionally the label plate (`plate`) darken, with the real shader opacities.
+    fn text_contrast(back: f32, scrim: f32, plate: f32, text: f32) -> f32 {
+        let bg = back * (1.0 - scrim) * (1.0 - plate);
+        let fg = text + (1.0 - text) * bg;
+        (fg + 0.05) / (bg + 0.05)
+    }
+
+    #[test]
+    fn panel_contrast_labels_headings_pills_and_caption_reach_4_5_to_1_over_the_brightest_scene() {
+        // worst case: a pure white scene under the lightest part of the scrim, and every brightness below it
+        for i in 0..=100 {
+            let back = i as f32 / 100.0;
+            for (what, text) in [
+                ("label", PANEL_LABEL_ALPHA),
+                ("heading and caption", PANEL_HEADING_ALPHA),
+            ] {
+                let c = text_contrast(back, PANEL_SCRIM_TOP, PANEL_PLATE_ALPHA, text);
+                assert!(c >= 4.5, "{what} over {back}: {c:.2}");
+            }
+            // pill text sits on its own dark backing instead of the plate
+            let c = text_contrast(
+                back,
+                PANEL_SCRIM_TOP,
+                PANEL_PILL_BACK_ALPHA,
+                PANEL_PILL_TEXT_ALPHA,
+            );
+            assert!(c >= 4.5, "pill over {back}: {c:.2}");
+        }
+        // the plate is what makes it work: without it a white scene fails (the review finding)
+        assert!(text_contrast(1.0, PANEL_SCRIM_TOP, 0.0, PANEL_LABEL_ALPHA) < 4.5);
+    }
+
+    #[test]
+    fn panel_contrast_the_focus_ring_reads_on_every_backdrop() {
+        // ring (white, opaque) between two black keylines (PANEL_KEYLINE_ALPHA), over the scrim-darkened scene
+        let ratio = |a: f32, b: f32| (a.max(b) + 0.05) / (a.min(b) + 0.05);
+        for i in 0..=100 {
+            let back = i as f32 / 100.0 * (1.0 - PANEL_SCRIM_TOP);
+            let keyline = back * (1.0 - PANEL_KEYLINE_ALPHA);
+            assert!(ratio(1.0, keyline) >= 3.0, "ring vs keyline over {back}");
+            assert!(
+                ratio(1.0, back).max(ratio(keyline, back)) >= 3.0 || ratio(1.0, keyline) >= 3.0,
+                "{back}"
+            );
         }
     }
 
@@ -1307,8 +1384,32 @@ mod tests {
             THUMB_SIZE.0, THUMB_SIZE.1
         )));
         assert!(src.contains(&format!("const LABEL_ORIGIN_Y = {LABEL_ORIGIN_Y}.0;")));
-        assert_eq!((LABEL_SIZE.0, LABEL_SIZE.1), (256, 64), "shader cell size");
-        assert_eq!(PANEL_BYTES, (5 + 30) * 16);
+        assert_eq!((LABEL_SIZE.0, LABEL_SIZE.1), (320, 64), "shader cell size");
+        assert_eq!(PANEL_BYTES, (6 + 30) * 16);
+        assert!(src.contains(&format!(
+            "const LABEL_CELL = vec2<f32>({}.0, {}.0);",
+            LABEL_SIZE.0, LABEL_SIZE.1
+        )));
+        for (name, id) in [
+            ("L_CURRENT", LABEL_CURRENT),
+            ("L_PILL", LABEL_EXPERIMENTAL_PILL),
+            ("L_HEADING", LABEL_EXPERIMENTAL_HEADING),
+            ("L_CAPTION", LABEL_CAPTION),
+        ] {
+            assert!(src.contains(&format!("const {name} = {id}u;")), "{name}");
+        }
+        for (name, v) in [
+            ("SCRIM_TOP", PANEL_SCRIM_TOP),
+            ("SCRIM_BOTTOM", PANEL_SCRIM_BOTTOM),
+            ("PLATE_ALPHA", PANEL_PLATE_ALPHA),
+            ("LABEL_ALPHA", PANEL_LABEL_ALPHA),
+            ("HEADING_ALPHA", PANEL_HEADING_ALPHA),
+            ("PILL_BACK_ALPHA", PANEL_PILL_BACK_ALPHA),
+            ("PILL_TEXT_ALPHA", PANEL_PILL_TEXT_ALPHA),
+            ("KEYLINE_ALPHA", PANEL_KEYLINE_ALPHA),
+        ] {
+            assert!(src.contains(&format!("const {name} = {v:.2};")), "{name}");
+        }
         assert_eq!(d.scissor((640, 360)), (0, 0, 640, 360));
         assert_eq!(d.scissor((0, 0)), (0, 0, 1, 1));
         let mut h = d.clone();

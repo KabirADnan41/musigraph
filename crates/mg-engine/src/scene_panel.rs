@@ -10,8 +10,8 @@ use crate::controls::{self, Rect};
 use crate::presentation::{GpuOp, Job, Ready};
 use crate::scene_thumbs::Thumbs;
 use mg_gfx::overlay::{
-    LABEL_CELLS, LABEL_CURRENT, LABEL_EXPERIMENTAL_HEADING, LABEL_EXPERIMENTAL_PILL, LABEL_SIZE,
-    PANEL_TILES, PanelDraw, PanelTileDraw,
+    LABEL_CAPTION, LABEL_CELLS, LABEL_CURRENT, LABEL_EXPERIMENTAL_HEADING, LABEL_EXPERIMENTAL_PILL,
+    LABEL_SIZE, PANEL_TILES, PanelDraw, PanelTileDraw,
 };
 use mg_gfx::scene::SceneKind;
 use mg_text::{Align, Cut, LineStyle, TextBitmap};
@@ -28,6 +28,9 @@ pub const HEADING_H: f32 = 14.0;
 pub const HEADING_GAP: f32 = 12.0;
 pub const GROUP_GAP: f32 = 36.0;
 pub const MARGIN: f32 = 24.0;
+/// The "Representative previews" caption: height and distance below the tiles.
+pub const CAPTION_H: f32 = 14.0;
+pub const CAPTION_GAP: f32 = 18.0;
 /// Tile shrink factors tried (largest first) when the content does not fit the surface.
 const FACTORS: [f32; 5] = [1.0, 0.85, 0.7, 0.55, 0.45];
 
@@ -85,6 +88,8 @@ pub struct PanelLayout {
     pub tiles: [Tile; MAX_TILES],
     /// Where the "EXPERIMENTAL" heading's line box starts (left edge) and its box, when there are such tiles.
     pub heading: Option<Rect>,
+    /// Caption line box under the tiles (as wide as the block).
+    pub caption: Rect,
     /// Columns of the grid (the tile count in one-row mode).
     pub cols: usize,
     /// Tile width factor chosen to fit (1.0 = full size).
@@ -115,6 +120,20 @@ struct Placed {
     tiles: [Rect; MAX_TILES],
     heading: Option<Rect>,
     size: (f32, f32),
+}
+
+impl Placed {
+    /// Appends the caption line below the block.
+    fn with_caption(mut self) -> (Self, Rect) {
+        let cap = Rect {
+            x: 0.0,
+            y: self.size.1 + CAPTION_GAP,
+            w: self.size.0,
+            h: CAPTION_H,
+        };
+        self.size.1 += CAPTION_GAP + CAPTION_H;
+        (self, cap)
+    }
 }
 
 fn place(n: usize, main: usize, cols: usize, factor: f32, one_row: bool) -> Placed {
@@ -209,9 +228,9 @@ pub fn layout(surface: (u32, u32), dpi: f32) -> PanelLayout {
     let mut chosen = None;
     'fit: for f in FACTORS {
         for cols in (1..=want.min(n.max(1))).rev() {
-            let p = place(n, main, cols, f, one_row);
+            let (p, cap) = place(n, main, cols, f, one_row).with_caption();
             let fits = p.size.0 * s <= avail_w && p.size.1 * s <= avail_h;
-            chosen = Some((p, f, cols));
+            chosen = Some((p, cap, f, cols));
             if fits {
                 break 'fit;
             }
@@ -220,7 +239,7 @@ pub fn layout(surface: (u32, u32), dpi: f32) -> PanelLayout {
             }
         }
     }
-    let (p, factor, cols) = chosen.expect("a candidate");
+    let (p, cap, factor, cols) = chosen.expect("a candidate");
     let ox = ((w - p.size.0 * s) * 0.5).max(0.0);
     let oy = top + ((avail_h - p.size.1 * s) * 0.5).max(0.0);
     let mv = |r: Rect| Rect {
@@ -259,6 +278,7 @@ pub fn layout(surface: (u32, u32), dpi: f32) -> PanelLayout {
         count: n,
         tiles,
         heading: p.heading.map(mv),
+        caption: mv(cap),
         cols,
         factor,
         bounds: mv(Rect {
@@ -730,6 +750,7 @@ pub fn render_labels(
     out[LABEL_CURRENT] = line("Current", 10.0, 600, 0.02);
     out[LABEL_EXPERIMENTAL_PILL] = line("EXPERIMENTAL", 9.0, 600, 0.08);
     out[LABEL_EXPERIMENTAL_HEADING] = line("EXPERIMENTAL", 11.0, 600, 0.08);
+    out[LABEL_CAPTION] = line("Representative previews", 11.0, 500, 0.02);
     out
 }
 
@@ -852,6 +873,18 @@ impl ScenePanel {
             ],
             _ => [0.0; 4],
         };
+        let cp = dims(LABEL_CAPTION);
+        let caption = if cp.0 > 0.0 {
+            let c = self.lay.caption;
+            [
+                (c.x + 0.5 * (c.w - cp.0)).round(),
+                (c.y + 0.5 * (c.h - cp.1)).round(),
+                cp.0,
+                cp.1,
+            ]
+        } else {
+            [0.0; 4]
+        };
         Some(PanelDraw {
             alpha,
             scale: s,
@@ -860,6 +893,7 @@ impl ScenePanel {
             tiles,
             heading,
             heading_alpha: self.tile_alpha(first_exp),
+            caption,
             cur_text: [cur.0, cur.1],
             exp_text: [exp.0, exp.1],
         })
@@ -953,6 +987,11 @@ mod tests {
                 assert!(apart, "{surface:?} tiles {i} and {j} overlap");
             }
         }
+        let c = l.caption;
+        assert!(
+            c.x >= 0.0 && c.y >= 0.0 && c.x + c.w <= w && c.y + c.h <= bar_top,
+            "{surface:?} caption"
+        );
         if let Some(hd) = l.heading {
             assert!(hd.x >= 0.0 && hd.x + hd.w <= w && hd.y >= 0.0 && hd.y + hd.h <= h);
         }
@@ -1274,24 +1313,6 @@ mod tests {
         }
     }
 
-    // ---- contrast ----------------------------------------------------------------------------------------------------
-
-    fn lum(c: f32) -> f32 {
-        c
-    }
-
-    /// The focus indicator is two-tone (white ring with a black keyline outside): on ANY backdrop one of the two
-    /// is at least 3:1 (WCAG 1.4.11), the scrim notwithstanding.
-    #[test]
-    fn the_two_tone_focus_ring_has_at_least_3_to_1_against_every_backdrop() {
-        let ratio = |a: f32, b: f32| (a.max(b) + 0.05) / (a.min(b) + 0.05);
-        for i in 0..=100 {
-            let backdrop = lum(i as f32 / 100.0);
-            let best = ratio(1.0, backdrop).max(ratio(0.0, backdrop));
-            assert!(best >= 3.0, "backdrop {backdrop}: {best:.2}");
-        }
-    }
-
     // ---- runtime: labels, thumbnails, the draw and resource growth -------------------------------------------------
 
     fn fake_labels() -> Ready {
@@ -1393,6 +1414,10 @@ mod tests {
             assert_eq!(t.exp_pill[2] > 0.0, t.experimental);
         }
         assert!(d.heading[2] > 0.0 && d.heading_alpha == 1.0);
+        assert!(
+            d.caption[2] > 0.0,
+            "the Representative previews caption is drawn as text"
+        );
     }
 
     #[test]

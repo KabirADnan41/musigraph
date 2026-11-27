@@ -23,7 +23,105 @@ fn ticks() -> Vec<Tick> {
     Sim::new(SR, FPS, MapTuning::default()).run(&x[..n])
 }
 
-/// Renders every scene. Blocking GPU work: call it from a worker thread, never from the frame loop.
+/// An original, procedural album cover (generated here, no image asset, no real artwork): a dusk gradient, soft
+/// ripples and a low sun. Deterministic arithmetic only.
+pub fn procedural_cover() -> mg_media::ArtImage {
+    const N: u32 = 96;
+    let rgba = (0..N * N)
+        .flat_map(|i| {
+            let (x, y) = (
+                (i % N) as f32 / (N - 1) as f32,
+                (i / N) as f32 / (N - 1) as f32,
+            );
+            let (dx, dy) = (x - 0.62, y - 0.68);
+            let r = (dx * dx + dy * dy).sqrt();
+            let sun = (1.0 - (r / 0.17).powi(2)).clamp(0.0, 1.0);
+            let ripple = 0.5 + 0.5 * (r * 38.0).sin();
+            let glow = (1.0 - r * 1.6).clamp(0.0, 1.0);
+            let base = [0.10 + 0.38 * y, 0.07 + 0.10 * x, 0.30 + 0.30 * (1.0 - y)];
+            let tint = [0.95, 0.52, 0.28];
+            let c: [f32; 3] = std::array::from_fn(|k| {
+                let v = base[k] * (0.82 + 0.18 * ripple) + tint[k] * (0.30 * glow + 0.70 * sun);
+                v.clamp(0.0, 1.0)
+            });
+            [
+                (c[0] * 255.0) as u8,
+                (c[1] * 255.0) as u8,
+                (c[2] * 255.0) as u8,
+                255,
+            ]
+        })
+        .collect();
+    mg_media::ArtImage {
+        width: N,
+        height: N,
+        rgba,
+    }
+}
+
+/// The Focus picture the way Album Focus shows it: the cover's room light and palette in the throwaway scene, the
+/// cover plate over it. The live Focus scene is not involved.
+fn render_focus(
+    scene: &mut SceneSet,
+    device: &Device,
+    queue: &Queue,
+    p: &mut mg_gfx::scene::SceneParams,
+) -> Option<Vec<u8>> {
+    use crate::presentation::{apply_album, art_extra};
+    use mg_gfx::overlay::{ArtDraw, Overlay, OverlayParams};
+    let cover = procedural_cover();
+    scene.set_focus_art(queue, art_extra(&cover, 0).map(|e| *e.light));
+    let (w, h) = (THUMB_SIZE.0 as f32, THUMB_SIZE.1 as f32);
+    let aspect = w / h;
+    // the Album layout's cover rectangle (centre x, centre y, half size in screen heights), as the self-test uses
+    let rect = [0.31 * aspect, 0.46, 0.28, 0.28];
+    p.album.rect = rect;
+    p.album.art_w = [1.0, 0.0];
+    let (px, tw, th) = cover.thumbnail(64);
+    if tw > 0 && th > 0 {
+        let pal = mg_media::palette::extract(&px, tw, th);
+        apply_album(&mut p.palette, &pal, 1.0, 0.85 + 0.30 * p.energy);
+    }
+    scene.focus_acquire(device);
+    let mut ov = Overlay::new(
+        device,
+        queue,
+        mg_gfx::context::TextureFormat::Rgba8UnormSrgb,
+    );
+    if !ov.set_art(device, queue, (cover.width, cover.height), &cover.rgba) {
+        return None;
+    }
+    let op = OverlayParams {
+        res: THUMB_SIZE,
+        art: Some(ArtDraw {
+            cx: rect[0] * h,
+            cy: rect[1] * h,
+            hw: rect[2] * h,
+            hh: rect[2] * h,
+            alpha: 1.0,
+            radius: 3.0,
+            shadow: 1.0,
+            lod: 0.0,
+        }),
+        ..Default::default()
+    };
+    let img = scene
+        .render_offscreen_scenes(
+            device,
+            queue,
+            THUMB_SIZE,
+            p,
+            SceneKind::Focus,
+            None,
+            &|enc, view| ov.draw(queue, enc, view, &op),
+        )
+        .ok();
+    scene.set_focus_art(queue, None);
+    img
+}
+
+/// Renders every scene with a throwaway scene set (dropped on return). Blocking GPU work with a readback per
+/// scene, meant to run once before the first visible frame; wrap it in `context::with_error_scope`.
 pub fn generate(device: &Device, queue: &Queue) -> Thumbs {
     let ticks = ticks();
     let mut scene = SceneSet::new(device, wgpu_srgb(), 1.0);
@@ -40,14 +138,32 @@ pub fn generate(device: &Device, queue: &Queue) -> Thumbs {
         }
         let mut p = last.params.clone();
         p.mode = SceneMode::Live; // the Synthetic marker is for the live picture, not a preview
-        out[kind.index()] = scene
-            .render_offscreen_scenes(device, queue, THUMB_SIZE, &p, kind, None, &|_, _| {})
-            .ok();
+        out[kind.index()] = if kind == SceneKind::Focus {
+            render_focus(&mut scene, device, queue, &mut p)
+        } else {
+            scene
+                .render_offscreen_scenes(device, queue, THUMB_SIZE, &p, kind, None, &|_, _| {})
+                .ok()
+        };
         if kind == SceneKind::Fluid {
             scene.fluid_release();
         }
     }
     out
+}
+
+/// `generate` inside error scopes: a validation or out-of-memory error yields no thumbnails (placeholders)
+/// instead of reaching the app's fatal uncaptured-error handler.
+pub fn generate_guarded(device: &Device, queue: &Queue) -> Thumbs {
+    let r = mg_gfx::context::with_error_scope(device, || generate(device, queue));
+    mg_gfx::context::wait_idle(device); // the throwaway scene set is dropped: let the GPU free it now
+    match r {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("scene thumbnails unavailable: {e}");
+            Thumbs::default()
+        }
+    }
 }
 
 fn wgpu_srgb() -> mg_gfx::context::TextureFormat {
@@ -65,6 +181,30 @@ mod tests {
             .sum::<f32>()
             / (img.len() / 4) as f32
             / 3.0
+    }
+
+    #[test]
+    fn generating_thumbnails_leaves_no_gpu_memory_behind_and_a_failure_degrades_to_placeholders() {
+        let Ok(h) = init_headless() else {
+            eprintln!("SKIPPED (no hardware GPU)");
+            return;
+        };
+        let before = mg_gfx::context::allocated_bytes(&h.device);
+        let t = generate_guarded(&h.device, &h.queue);
+        assert!(t.iter().all(Option::is_some));
+        drop(t);
+        mg_gfx::context::wait_idle(&h.device);
+        if let (Some(b), Some(a)) = (before, mg_gfx::context::allocated_bytes(&h.device)) {
+            eprintln!("GPU allocations: {b} before, {a} after generation (throwaway set released)");
+            assert!(a <= b + 4 * 1024 * 1024, "{b} -> {a}");
+        }
+        // the cover is procedural, deterministic and not flat
+        let c = procedural_cover();
+        assert_eq!(c.rgba.len(), (c.width * c.height * 4) as usize);
+        assert_eq!(c.rgba, procedural_cover().rgba);
+        assert!(
+            c.rgba.chunks_exact(4).any(|p| p[0] > 200) && c.rgba.chunks_exact(4).any(|p| p[0] < 80)
+        );
     }
 
     #[test]

@@ -116,6 +116,25 @@ fn button_action(b: ButtonId) -> KeyAction {
 /// The keys the open scene panel takes before the global key map (so Esc closes the panel, not the app, and the
 /// arrows move the panel focus instead of changing track). Enter ignores key repeat; Space, `[` `]`, the digits,
 /// L, A and F stay global.
+/// Where an Esc press goes: an open panel closes (and the key is then "held": its auto-repeat is swallowed until it
+/// is released); a panel still fading out swallows it too, so a second Esc cannot exit the app by accident.
+#[derive(Debug, PartialEq)]
+enum EscRoute {
+    Panel,
+    Swallow,
+    App,
+}
+
+fn route_esc(panel_open: bool, panel_visible: bool, held_after_close: bool) -> EscRoute {
+    if panel_open {
+        EscRoute::Panel
+    } else if panel_visible || held_after_close {
+        EscRoute::Swallow
+    } else {
+        EscRoute::App
+    }
+}
+
 fn panel_key(code: KeyCode, shift: bool, repeat: bool) -> Option<PanelKey> {
     Some(match code {
         KeyCode::Escape => PanelKey::Escape,
@@ -390,9 +409,8 @@ struct App {
     pointer: Option<(f32, f32)>,
     /// The last input was the keyboard (the panel shows its focus ring only then).
     keyboard_input: bool,
-    /// Runtime scene thumbnails: started once shortly after launch on a worker thread, delivered here.
-    thumbs_rx: Option<std::sync::mpsc::Receiver<crate::scene_thumbs::Thumbs>>,
-    thumbs_started: bool,
+    /// Esc closed the panel and is still held: its auto-repeat must not reach the app (cleared on release).
+    esc_held: bool,
     cursor_hidden: bool,
     mods: ModifiersState,
     last_unsupported_note: Option<Instant>,
@@ -482,6 +500,12 @@ impl ApplicationHandler for App {
                 scene.set_fluid_tier(self.opts.fluid_tier);
                 self.scene = Some(scene);
                 self.overlay = Some(Overlay::new(&gpu.device, &gpu.queue, gpu.config.format));
+                // Scene-panel thumbnails: rendered once, here, before the first frame is presented (a throwaway
+                // scene set, error-scoped, released at once). Failure leaves placeholders; nothing runs later.
+                self.panel.on_thumbs(crate::scene_thumbs::generate_guarded(
+                    &gpu.device,
+                    &gpu.queue,
+                ));
                 self.gpu = Some(gpu);
             }
             Err(e) => {
@@ -508,8 +532,18 @@ impl ApplicationHandler for App {
                     // alt-tab while a button is held: no release event will come, so nothing may stay pressed
                     self.mods = ModifiersState::empty();
                     self.ctl.focus_lost();
+                    self.esc_held = false;
                 }
             }
+            WindowEvent::KeyboardInput {
+                event:
+                    KeyEvent {
+                        physical_key: PhysicalKey::Code(KeyCode::Escape),
+                        state: ElementState::Released,
+                        ..
+                    },
+                ..
+            } => self.esc_held = false,
             WindowEvent::KeyboardInput {
                 event:
                     KeyEvent {
@@ -656,6 +690,17 @@ impl App {
         self.sync_view();
         self.ctl.key_activity();
         self.keyboard_input = true;
+        if code == KeyCode::Escape {
+            match route_esc(self.panel.is_open(), self.panel.visible(), self.esc_held) {
+                EscRoute::Panel => {
+                    self.esc_held = true;
+                    let ev = self.panel.key(PanelKey::Escape);
+                    return self.on_panel_event(ev);
+                }
+                EscRoute::Swallow => return,
+                EscRoute::App => {}
+            }
+        }
         // an open scene panel takes its keys first (Esc closes only the panel)
         if self.panel.is_open()
             && toggle_allowed(self.mods)
@@ -903,6 +948,9 @@ impl App {
         // layout), the cover weights and the text pocket; the mapper owns the music fields.
         self.pres.merge_focus(&mut params.album);
         params.album.bar = bar_vis;
+        if self.panel.visible() {
+            self.last_auto_switch = now; // no tour while the panel is up, and no instant jump when it closes
+        }
         if let Some(every) = self.opts.auto_scenes {
             if now.duration_since(self.last_auto_switch).as_secs() >= every {
                 self.last_auto_switch = now;
@@ -934,24 +982,6 @@ impl App {
         if let Some(e) = g.take_error() {
             self.result = Err(format!("wgpu error: {e}"));
             return el.exit();
-        }
-        // Scene thumbnails: made once, half a second after launch, off the render thread with a throwaway scene set
-        if !self.thumbs_started && self.start.elapsed() >= Duration::from_millis(500) {
-            self.thumbs_started = true;
-            let (device, queue) = (g.device.clone(), g.queue.clone());
-            let (tx, rx) = std::sync::mpsc::channel();
-            let spawned = std::thread::Builder::new()
-                .name("mg-thumbs".into())
-                .spawn(move || {
-                    let _ = tx.send(crate::scene_thumbs::generate(&device, &queue));
-                });
-            if spawned.is_ok() {
-                self.thumbs_rx = Some(rx);
-            }
-        }
-        if let Some(t) = self.thumbs_rx.as_ref().and_then(|rx| rx.try_recv().ok()) {
-            self.panel.on_thumbs(t);
-            self.thumbs_rx = None;
         }
         let t_ops = Instant::now();
         if let Some(ov) = self.overlay.as_mut() {
@@ -1144,8 +1174,7 @@ pub fn run(opts: SceneOpts) -> i32 {
         panel: ScenePanel::new(),
         pointer: None,
         keyboard_input: false,
-        thumbs_rx: None,
-        thumbs_started: false,
+        esc_held: false,
         cursor_hidden: false,
         mods: ModifiersState::empty(),
         last_unsupported_note: None,
@@ -1321,6 +1350,22 @@ mod tests {
         assert_eq!(k(KeyCode::Escape), Some(Exit));
         assert_eq!(k(KeyCode::KeyQ), None);
         assert_eq!(k(KeyCode::ArrowUp), None);
+    }
+
+    #[test]
+    fn esc_never_exits_the_app_while_the_panel_is_up_or_its_closing_key_is_still_held() {
+        // open: Esc closes the panel, nothing else
+        assert_eq!(route_esc(true, true, false), EscRoute::Panel);
+        // the second Esc during the 150 ms fade, and the auto-repeat of the closing Esc after it, are swallowed
+        assert_eq!(route_esc(false, true, true), EscRoute::Swallow);
+        assert_eq!(route_esc(false, true, false), EscRoute::Swallow);
+        assert_eq!(route_esc(false, false, true), EscRoute::Swallow);
+        // panel gone and the key released: Esc exits as before
+        assert_eq!(route_esc(false, false, false), EscRoute::App);
+        assert_eq!(
+            key_action(KeyCode::Escape, ModifiersState::empty(), false),
+            Some(KeyAction::Exit)
+        );
     }
 
     #[test]
