@@ -41,7 +41,7 @@ impl Consent {
     }
 
     /// Persist "Disable"/"No" (also the revoke path) and return the new state.
-    pub fn decline() -> Consent {
+    pub fn decline() -> (Consent, bool) {
         Self::decline_to(app_dir().as_deref())
     }
 
@@ -53,11 +53,17 @@ impl Consent {
         Consent::Granted
     }
 
-    pub fn decline_to(dir: Option<&Path>) -> Consent {
-        if let Some(d) = dir {
-            let _ = save_to(d, Consent::Declined);
-        }
-        Consent::Declined
+    /// Revokes consent: the session is Declined at once; the bool says whether that is durable on disk. If the
+    /// write fails, the stored file is deleted instead so a stale "granted" can never return at the next start
+    /// (fail closed: a missing file loads as Unasked). `false` only when both fail; the caller should warn.
+    pub fn decline_to(dir: Option<&Path>) -> (Consent, bool) {
+        let durable = dir.is_none_or(|d| {
+            save_to(d, Consent::Declined).is_ok() || {
+                let p = d.join(FILE);
+                !p.exists() || std::fs::remove_file(p).is_ok()
+            }
+        });
+        (Consent::Declined, durable)
     }
 }
 
@@ -166,7 +172,7 @@ mod tests {
         assert_eq!(load_from(&d), Consent::Unasked);
         assert_eq!(Consent::grant_to(Some(&d)), Consent::Granted);
         assert_eq!(load_from(&d), Consent::Granted);
-        assert_eq!(Consent::decline_to(Some(&d)), Consent::Declined);
+        assert_eq!(Consent::decline_to(Some(&d)), (Consent::Declined, true));
         assert_eq!(load_from(&d), Consent::Declined);
         assert_eq!(Consent::grant_to(None), Consent::Granted); // in-memory only
     }
@@ -193,6 +199,47 @@ mod tests {
 
     #[test]
     fn prompt_is_verbatim() {
-        assert_eq!(PROMPT, "Enable automatic online lyrics?\nMusigraph can retrieve lyrics from LRCLIB using the currently playing track's title, artist, album and duration. These details, your connection IP address and the Musigraph application identifier will be visible to the service.\nNo account is required. Musigraph does not upload your audio or maintain a listening history. LRCLIB's data-retention practices have not been verified.\nYou can disable online lyrics at any time.");
+        assert_eq!(
+            PROMPT,
+            "Enable automatic online lyrics?\nMusigraph can retrieve lyrics from LRCLIB using the currently playing track's title, artist, album and duration. These details, your connection IP address and the Musigraph application identifier will be visible to the service.\nNo account is required. Musigraph does not upload your audio or maintain a listening history. LRCLIB's data-retention practices have not been verified.\nYou can disable online lyrics at any time."
+        );
+    }
+}
+
+#[cfg(test)]
+mod revoke_tests {
+    use super::*;
+
+    #[test]
+    fn a_failed_revoke_write_deletes_the_stored_grant_instead_of_leaving_it() {
+        let d =
+            PathBuf::from(r"F:\musigraph\temp").join(format!("lc-revoke-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        save_to(&d, Consent::Granted).unwrap();
+        assert_eq!(load_from(&d), Consent::Granted);
+        // make the temp-file write fail: a directory sits where the temp file must go
+        std::fs::create_dir(d.join(format!("{FILE}.tmp"))).unwrap();
+        let (c, durable) = Consent::decline_to(Some(&d));
+        assert_eq!(c, Consent::Declined);
+        assert!(durable);
+        assert_eq!(
+            load_from(&d),
+            Consent::Unasked,
+            "stale grant must not survive"
+        );
+        assert!(!load_from(&d).allows_network());
+    }
+
+    #[test]
+    fn a_normal_revoke_persists_declined() {
+        let d =
+            PathBuf::from(r"F:\musigraph\temp").join(format!("lc-revoke2-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        save_to(&d, Consent::Granted).unwrap();
+        assert_eq!(Consent::decline_to(Some(&d)), (Consent::Declined, true));
+        assert_eq!(load_from(&d), Consent::Declined);
+        assert_eq!(Consent::decline_to(None), (Consent::Declined, true));
     }
 }
