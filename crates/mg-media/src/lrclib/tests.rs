@@ -380,7 +380,6 @@ fn featured_artist_variations_are_handled() {
         ("Test Artist FEAT. Guest", "test artist"),
         ("Test Artist (feat. Guest)", "Test Artist"),
         ("Test Artist ft. Guest", "Test Artist & Guest"),
-        ("Test Artist, Guest", "Test Artist"),
         ("Test Artist & Guest", "test artist, guest"),
     ] {
         assert!(
@@ -795,4 +794,47 @@ fn submit_failure_releases_the_slot() {
     let req = r.poll(t0 + DEBOUNCE).unwrap();
     r.on_submit_failed(&req);
     assert_eq!(r.poll(t0 + ms(1600)).unwrap(), req);
+}
+
+#[test]
+fn numbered_parts_with_version_words_stay_distinct() {
+    assert_ne!(
+        core_title("Medley - Part 1 - Remastered"),
+        core_title("Medley - Part 2 - Remastered")
+    );
+    assert_ne!(
+        core_title("Song (Part 1 Remix)"),
+        core_title("Song (Part 2 Remix)")
+    );
+    // version words and the remaster year still fold away; credits are dropped
+    assert_eq!(
+        core_title("Song - Remastered 2011"),
+        core_title("Song (Remastered)")
+    );
+    assert_eq!(core_title("Song (feat. X)"), core_title("Song"));
+    assert_eq!(core_title("Song – Live"), core_title("Song [Live]"));
+}
+
+#[test]
+fn a_band_name_with_a_comma_is_not_reduced_to_its_first_word() {
+    assert!(same_artist("Earth, Wind & Fire", "Earth, Wind & Fire"));
+    assert!(!same_artist("Earth, Wind & Fire", "Earth"));
+    assert!(!same_artist("Earth, Wind & Fire feat. X", "Earth"));
+    // guests differ: still the same main credit
+    assert!(same_artist("A feat. B", "A"));
+    assert!(same_artist("A", "A feat. B"));
+    // the record credits several artists: first artist decides
+    assert!(same_artist("A", "A, B"));
+    assert!(same_artist("A, C", "A & B"));
+    assert!(!same_artist("C", "A, B"));
+}
+
+/// A multi-artist credit sent against a single-artist record is indistinguishable from a band name containing
+/// ", " or " & " ("Earth, Wind & Fire" vs "Earth"), so it is rejected (strict default; owner question Q-005c).
+#[test]
+fn multi_artist_sent_against_a_single_artist_record_is_rejected() {
+    assert!(!accepted(
+        &qa("Synthetic Song", "Test Artist, Guest"),
+        &named("Synthetic Song", "Test Artist")
+    ));
 }

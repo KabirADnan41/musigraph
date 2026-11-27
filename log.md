@@ -439,3 +439,11 @@ The mg-media test count there should read 33 for commit 3eb9341 (36 included 3 u
   - `filter` is read only by the test (`allow(dead_code)` outside tests).
   - The WinRT request path is still unexercised (no network).
 - **Remains:** the independent Sonnet High review (§27) of this diff.
+
+## 2026-11-27 - LRCLIB re-review LOW follow-ups (main session)
+- Corrective re-review of 10d9082: PASS WITH SUGGESTIONS (all 7 resolved; online retrieval may be enabled after wiring under the stated conditions).
+- **Follow-ups in lrclib/mod.rs, RED first (2 new tests failed on the old code):**
+  - (1) `core_title` now examines every ` - ` / ` – ` segment and bracket. Credits are dropped; elsewhere only version words, plus a 19xx/20xx year inside a version part, are removed. "Part 1 - Remastered" and "Part 2 - Remastered" (and "(Part 1 Remix)" vs "(Part 2 Remix)") stay distinct.
+  - (2) `same_artist`: whole credit, or the main credit with featured guests removed, or the first-artist shortcut only when the RECORD credits several artists. "Earth, Wind & Fire" no longer matches "Earth".
+- **Consequence:** the existing case ("Test Artist, Guest" sent vs "Test Artist" record) moved from accepted to rejected. It has exactly the shape of the band-name case, so this is a stricter expectation, made explicit in its own test (owner question Q-005c).
+- **Checks:** mg-media 81 tests pass; clippy clean; rustfmt on the two files.

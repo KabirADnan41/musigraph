@@ -375,14 +375,13 @@ fn is_separator(c: char) -> bool {
                 | '\u{FE10}'..='\u{FE6F}' | '\u{FF00}'..='\u{FF65}'))
 }
 
-/// Title key: bracketed or ` - ` segments that carry a version word (already compared) or a featured
-/// artist credit are dropped, remaining version words removed, the rest folded.
+/// Title key: every ` - ` segment and bracketed part is examined. A featured-artist credit is dropped; in any
+/// other part only the version words (compared separately) and, inside a version part, a year are removed, so
+/// "Part 1 - Remastered" and "Part 2 - Remastered" stay different. The rest is folded.
 fn core_title(s: &str) -> String {
-    let (head, tail) = s
-        .split_once(" - ")
-        .or_else(|| s.split_once(" \u{2013} "))
-        .unwrap_or((s, ""));
-    let (mut kept, mut segs, mut rest) = (String::new(), vec![tail], head);
+    let mut dashed = s.split(" - ").flat_map(|p| p.split(" \u{2013} "));
+    let head = dashed.next().unwrap_or(s);
+    let (mut kept, mut segs, mut rest) = (String::new(), dashed.collect::<Vec<_>>(), head);
     while let Some(i) = rest.find(['(', '[']) {
         kept.push_str(&rest[..i]);
         let close = if rest[i..].starts_with('(') { ')' } else { ']' };
@@ -401,9 +400,18 @@ fn core_title(s: &str) -> String {
                     .iter()
                     .any(|k| w.eq_ignore_ascii_case(k))
             });
-        if !credit && version_words(seg).is_empty() {
-            kept.push(' ');
-            kept.push_str(seg);
+        if credit {
+            continue;
+        }
+        let version = !version_words(seg).is_empty();
+        for w in seg.split_whitespace() {
+            let year = w.len() == 4
+                && w.bytes().all(|b| b.is_ascii_digit())
+                && (w.starts_with("19") || w.starts_with("20"));
+            if !(version && year) {
+                kept.push(' ');
+                kept.push_str(w);
+            }
         }
     }
     let words: Vec<&str> = kept
@@ -414,10 +422,27 @@ fn core_title(s: &str) -> String {
     if key.is_empty() { fold(s) } else { key }
 }
 
-/// Same artist: the whole credits match, or the first credited artists match.
+/// Same artist: the whole credits match; or they match once featured guests are removed; or, only when the
+/// record itself credits several artists, the first credited artists match. A band name containing ", " or
+/// " & " ("Earth, Wind & Fire") is therefore never reduced to its first word against a single-artist record.
 fn same_artist(sent: &str, theirs: &str) -> bool {
-    let p = fold(primary_artist(sent));
-    fold(sent) == fold(theirs) || (!p.is_empty() && p == fold(primary_artist(theirs)))
+    let (ms, mt) = (main_credit(sent), main_credit(theirs));
+    let multi = mt.contains(", ") || mt.contains(" & ");
+    let p = fold(primary_artist(ms));
+    fold(sent) == fold(theirs)
+        || (!fold(ms).is_empty() && fold(ms) == fold(mt))
+        || (multi && !p.is_empty() && p == fold(primary_artist(mt)))
+}
+
+/// Credit before any featuring marker.
+fn main_credit(s: &str) -> &str {
+    let lower = s.to_ascii_lowercase(); // same byte offsets as `s`
+    let cut = [" feat.", " (feat.", " ft.", " (ft.", " featuring "]
+        .iter()
+        .filter_map(|p| lower.find(p))
+        .min()
+        .unwrap_or(s.len());
+    &s[..cut]
 }
 
 /// Text before the first `, `, ` & ` or featuring marker.
