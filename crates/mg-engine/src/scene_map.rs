@@ -1991,7 +1991,6 @@ mod fluid_gpu_tests {
             RES,
             &t.params,
             SceneKind::Fluid,
-            None,
             &|_, _| {},
         )
         .expect("render")

@@ -1050,7 +1050,7 @@ impl App {
         let queue = g.queue.clone();
         let overlay = self.overlay.as_ref();
         let t_render = Instant::now();
-        match scene.render_scenes(g, &params, tr.scene, None, |enc, view| {
+        match scene.render_scenes(g, &params, tr.scene, |enc, view| {
             if let Some(ov) = overlay {
                 ov.draw(&queue, enc, view, &overlay_params);
             }

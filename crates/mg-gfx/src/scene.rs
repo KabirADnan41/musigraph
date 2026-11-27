@@ -730,7 +730,7 @@ impl SceneSet {
         }
     }
 
-    /// Drops the Focus room texture (what the live loop does when Focus is neither shown nor crossfading); the
+    /// Drops the Focus room texture (what the live loop does when Focus is not the drawn scene); the
     /// cover colours and the buffers stay. Acquire it again before drawing Focus.
     pub fn focus_release(&mut self) {
         self.focus.room = None;
@@ -748,36 +748,46 @@ impl SceneSet {
         self.fluid.set_tier(tier);
     }
 
-    /// Draws `scene` (or a crossfade `scene -> to` at blend `t`), then `post` records overlays.
-    /// The Fluid simulation advances (fixed steps, from `p.time`) only while Fluid is one of the two scenes;
-    /// otherwise its textures are released, so the next entry starts from a clear field. Focus's room texture
-    /// likewise exists only while Focus is one of the two scenes (it is redrawn every frame, so nothing is lost).
+    /// The resource rule, in one place: only the scene about to be drawn holds heavy resources. The Fluid simulation
+    /// advances (fixed steps, from `p.time`) while Fluid is drawn, else its textures are released (the next entry
+    /// starts from a clear field, hidden under the transition veil); Focus's room texture exists only while Focus is
+    /// drawn. Two heavy scenes are therefore never held at once, whatever the transition does.
+    pub fn prepare(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        res: (u32, u32),
+        p: &SceneParams,
+        scene: SceneKind,
+    ) {
+        if scene == SceneKind::Fluid {
+            self.fluid.advance(device, queue, res, &p.fluid, p.time);
+        } else {
+            self.fluid.release();
+        }
+        if scene == SceneKind::Focus {
+            self.focus_acquire(device);
+        } else {
+            self.focus_release();
+        }
+    }
+
+    /// Draws `scene`, then `post` records overlays. Exactly one scene is drawn per frame (see `prepare` for what
+    /// it holds); transition looks travel in `p.fx`.
     pub fn render_scenes<F: FnOnce(&mut wgpu::CommandEncoder, &wgpu::TextureView)>(
         &mut self,
         gpu: &mut Gpu,
         p: &SceneParams,
         scene: SceneKind,
-        xfade: Option<(SceneKind, f32)>,
         post: F,
     ) -> Result<FrameStatus, String> {
         let res = self.inner.current_render_size(gpu);
-        if scene == SceneKind::Fluid || xfade.is_some_and(|(k, _)| k == SceneKind::Fluid) {
-            self.fluid
-                .advance(&gpu.device, &gpu.queue, res, &p.fluid, p.time);
-        } else {
-            self.fluid.release();
-        }
-        if scene == SceneKind::Focus || xfade.is_some_and(|(k, _)| k == SceneKind::Focus) {
-            self.focus_acquire(&gpu.device);
-        } else {
-            self.focus_release();
-        }
+        self.prepare(&gpu.device, &gpu.queue, res, p, scene);
         let queue = gpu.queue.clone();
         self.inner.render_scenes(
             gpu,
             &p.pack(res),
             scene.index(),
-            xfade.map(|(k, t)| (k.index(), t)),
             &Self::groups(&self.focus, &self.fluid, &queue, p, res),
             post,
         )
@@ -862,8 +872,7 @@ impl SceneSet {
         self.fluid.read_dye(device, queue)
     }
 
-    /// Headless render of any scene or crossfade, then `post`.
-    #[allow(clippy::too_many_arguments)]
+    /// Headless render of any scene, then `post`.
     pub fn render_offscreen_scenes(
         &self,
         device: &wgpu::Device,
@@ -871,7 +880,6 @@ impl SceneSet {
         res: (u32, u32),
         p: &SceneParams,
         scene: SceneKind,
-        xfade: Option<(SceneKind, f32)>,
         post: &dyn Fn(&mut wgpu::CommandEncoder, &wgpu::TextureView),
     ) -> Result<Vec<u8>, String> {
         self.inner.render_offscreen_scenes(
@@ -881,7 +889,6 @@ impl SceneSet {
             res.1,
             &p.pack(res),
             scene.index(),
-            xfade.map(|(k, t)| (k.index(), t)),
             &Self::groups(&self.focus, &self.fluid, queue, p, res),
             post,
         )
@@ -1067,16 +1074,8 @@ mod tests {
         p.album.art_w = [1.0, 0.0];
         scene.set_focus_art(&h.queue, Some(light([1.0, 0.0, 0.0], [0.0, 0.0, 1.0])));
         let draw = |s: &SceneSet| {
-            s.render_offscreen_scenes(
-                &h.device,
-                &h.queue,
-                res,
-                &p,
-                SceneKind::Focus,
-                None,
-                &|_, _| {},
-            )
-            .unwrap()
+            s.render_offscreen_scenes(&h.device, &h.queue, res, &p, SceneKind::Focus, &|_, _| {})
+                .unwrap()
         };
         let maxd = |x: &[u8], y: &[u8]| x.iter().zip(y).map(|(p, q)| p.abs_diff(*q)).max().unwrap();
         assert!(scene.focus_room_alive());
@@ -1125,16 +1124,8 @@ mod tests {
         p.album.rect = [0.5 * 640.0 / 360.0, 0.46, 0.25, 0.25];
         p.album.spill = 0.9;
         let render = |s: &SceneSet, p: &SceneParams| {
-            s.render_offscreen_scenes(
-                &h.device,
-                &h.queue,
-                res,
-                p,
-                SceneKind::Focus,
-                None,
-                &|_, _| {},
-            )
-            .unwrap()
+            s.render_offscreen_scenes(&h.device, &h.queue, res, p, SceneKind::Focus, &|_, _| {})
+                .unwrap()
         };
         // no cover: the empty slot is a soft light, never darker than its surroundings
         p.album.art_w = [0.0, 0.0];
@@ -1495,7 +1486,7 @@ mod tests {
         let render = |k: SceneKind, fx: Fx| {
             let p = SceneParams { fx, ..base.clone() };
             scene
-                .render_offscreen_scenes(&h.device, &h.queue, res, &p, k, None, &|_, _| {})
+                .render_offscreen_scenes(&h.device, &h.queue, res, &p, k, &|_, _| {})
                 .unwrap()
         };
         let lum = |i: &[u8], x0, x1, y0, y1| mean_lum(i, res.0, x0, x1, y0, y1);
@@ -1606,7 +1597,7 @@ mod tests {
     }
 
     #[test]
-    fn every_scene_renders_and_a_crossfade_blends_between_two_scenes_headless() {
+    fn every_scene_renders_and_looks_different_headless() {
         let Some((h, scene)) = headless() else { return };
         let res = (320u32, 180u32);
         let mut p = SceneParams {
@@ -1622,14 +1613,14 @@ mod tests {
         }
         p.aurora_band = [0.5, 0.6, 0.4, 0.3];
         p.aurora_phase = [0.1, 0.4, 0.7, 0.9];
-        let render = |k: SceneKind, x: Option<(SceneKind, f32)>| {
+        let render = |k: SceneKind| {
             scene
-                .render_offscreen_scenes(&h.device, &h.queue, res, &p, k, x, &|_, _| {})
+                .render_offscreen_scenes(&h.device, &h.queue, res, &p, k, &|_, _| {})
                 .unwrap()
         };
-        let a = render(SceneKind::Spectrum, None);
-        let b = render(SceneKind::Aurora, None);
-        let c = render(SceneKind::Focus, None);
+        let a = render(SceneKind::Spectrum);
+        let b = render(SceneKind::Aurora);
+        let c = render(SceneKind::Focus);
         assert!(a != b && b != c && a != c, "scenes must look different");
         let diff = |x: &[u8], y: &[u8]| {
             x.iter()
@@ -1642,54 +1633,25 @@ mod tests {
             diff(&a, &b) > 3.0 && diff(&b, &c) > 3.0 && diff(&a, &c) > 3.0,
             "scenes differ clearly"
         );
-        let x0 = render(SceneKind::Spectrum, Some((SceneKind::Aurora, 0.0)));
-        let x1 = render(SceneKind::Spectrum, Some((SceneKind::Aurora, 1.0)));
-        let xm = render(SceneKind::Spectrum, Some((SceneKind::Aurora, 0.5)));
-        let maxd = |x: &[u8], y: &[u8]| x.iter().zip(y).map(|(p, q)| p.abs_diff(*q)).max().unwrap();
-        assert!(
-            maxd(&x0, &a) <= 2,
-            "t=0 shows the first scene ({})",
-            maxd(&x0, &a)
-        );
-        assert!(
-            maxd(&x1, &b) <= 2,
-            "t=1 shows the second scene ({})",
-            maxd(&x1, &b)
-        );
-        let mid: Vec<u8> = a
-            .iter()
-            .zip(&b)
-            .map(|(p, q)| ((u16::from(*p) + u16::from(*q)) / 2) as u8)
-            .collect();
-        assert!(
-            maxd(&xm, &mid) <= 3,
-            "t=0.5 is the average ({})",
-            maxd(&xm, &mid)
-        );
-        // same scene on both sides is just that scene
-        assert_eq!(render(SceneKind::Aurora, Some((SceneKind::Aurora, 0.5))), b);
-        // a fourth scene crosses over like the others
-        let o = render(SceneKind::Orb, None);
+        let o = render(SceneKind::Orb);
         assert!(
             diff(&o, &a) > 3.0 && diff(&o, &b) > 3.0 && diff(&o, &c) > 3.0,
             "orb differs"
         );
-        let ox = render(SceneKind::Orb, Some((SceneKind::Aurora, 1.0)));
-        assert!(maxd(&ox, &b) <= 2, "orb -> aurora t=1 shows aurora");
         orb_is_a_lit_sphere_that_answers_to_bass_treble_and_onsets(&h, &scene);
-        fluid_renders_and_crossfades(&h, p);
+        fluid_renders(&h, p);
     }
 
-    /// Fluid joins the crossfade like the others: released it shows its dark base, a stepped field differs from
-    /// every other scene, and a crossfade into it ends on exactly the Fluid frame.
-    fn fluid_renders_and_crossfades(h: &crate::context::Headless, mut p: SceneParams) {
+    /// Fluid renders like the others: released it shows its dark base, a stepped field differs from
+    /// every other scene, and releasing it returns to the clear field.
+    fn fluid_renders(h: &crate::context::Headless, mut p: SceneParams) {
         let res = (320u32, 180u32);
         let mut scene = SceneSet::new(&h.device, wgpu::TextureFormat::Rgba8Unorm, 1.0);
-        let render = |s: &SceneSet, p: &SceneParams, k: SceneKind, x: Option<(SceneKind, f32)>| {
-            s.render_offscreen_scenes(&h.device, &h.queue, res, p, k, x, &|_, _| {})
+        let render = |s: &SceneSet, p: &SceneParams, k: SceneKind| {
+            s.render_offscreen_scenes(&h.device, &h.queue, res, p, k, &|_, _| {})
                 .unwrap()
         };
-        let idle = render(&scene, &p, SceneKind::Fluid, None);
+        let idle = render(&scene, &p, SceneKind::Fluid);
         let rgb = mean_lum(&idle, res.0, 0, res.0, 0, res.1);
         assert!(rgb > 0.005 && rgb < 0.3, "dark base {rgb}");
         for e in &mut p.fluid.emit {
@@ -1698,7 +1660,7 @@ mod tests {
         p.fluid.flow[0] = 0.08;
         scene.fluid_step(&h.device, &h.queue, res, &p, 240);
         assert_eq!(scene.fluid_grid(), Some((384, 216)), "default tier T1");
-        let f = render(&scene, &p, SceneKind::Fluid, None);
+        let f = render(&scene, &p, SceneKind::Fluid);
         assert!(mad(&f, &idle) > 1.0, "dye shows: {}", mad(&f, &idle));
         for k in [
             SceneKind::Spectrum,
@@ -1706,36 +1668,57 @@ mod tests {
             SceneKind::Focus,
             SceneKind::Orb,
         ] {
-            assert!(
-                mad(&f, &render(&scene, &p, k, None)) > 3.0,
-                "{k:?} vs fluid"
-            );
+            assert!(mad(&f, &render(&scene, &p, k)) > 3.0, "{k:?} vs fluid");
         }
         let maxd = |x: &[u8], y: &[u8]| x.iter().zip(y).map(|(p, q)| p.abs_diff(*q)).max().unwrap();
-        let o = render(&scene, &p, SceneKind::Orb, None);
-        assert!(
-            maxd(
-                &render(&scene, &p, SceneKind::Orb, Some((SceneKind::Fluid, 1.0))),
-                &f
-            ) <= 2
-        );
-        assert!(
-            maxd(
-                &render(&scene, &p, SceneKind::Fluid, Some((SceneKind::Orb, 1.0))),
-                &o
-            ) <= 2
-        );
-        let m = render(&scene, &p, SceneKind::Orb, Some((SceneKind::Fluid, 0.5)));
-        assert!(
-            mad(&m, &f) > 0.5 && mad(&m, &o) > 0.5,
-            "half way is a blend"
-        );
         scene.fluid_release();
         assert_eq!(scene.fluid_grid(), None);
         assert!(
-            maxd(&render(&scene, &p, SceneKind::Fluid, None), &idle) <= 1,
+            maxd(&render(&scene, &p, SceneKind::Fluid), &idle) <= 1,
             "released = clear"
         );
+    }
+
+    #[test]
+    fn only_the_drawn_scene_holds_resources_over_200_random_scene_changes_headless() {
+        let Some((h, mut scene)) = headless() else {
+            return;
+        };
+        let res = (320u32, 180u32);
+        let mut p = SceneParams {
+            mode: SceneMode::Live,
+            ..Default::default()
+        };
+        let mut rng = 7u32;
+        let mut pick = |p: &mut SceneParams| {
+            rng = rng.wrapping_mul(1664525).wrapping_add(1013904223);
+            p.time += 0.05;
+            SceneKind::ALL[(rng >> 16) as usize % SceneKind::ALL.len()]
+        };
+        let draw = |scene: &mut SceneSet, p: &SceneParams, k: SceneKind| {
+            scene.prepare(&h.device, &h.queue, res, p, k);
+            scene
+                .render_offscreen_scenes(&h.device, &h.queue, res, p, k, &|_, _| {})
+                .unwrap();
+            let _ = h.device.poll(wgpu::PollType::wait_indefinitely());
+        };
+        // warm up: every scene once (pipelines, the largest resource set)
+        for k in SceneKind::ALL {
+            draw(&mut scene, &p, k);
+        }
+        let warm = crate::context::allocated_bytes(&h.device);
+        for _ in 0..200 {
+            let k = pick(&mut p);
+            draw(&mut scene, &p, k);
+            assert_eq!(scene.fluid_grid().is_some(), k == SceneKind::Fluid, "{k:?}");
+            assert_eq!(scene.focus_room_alive(), k == SceneKind::Focus, "{k:?}");
+        }
+        if let (Some(w), Some(now)) = (warm, crate::context::allocated_bytes(&h.device)) {
+            assert!(
+                now <= w + w / 10 + (1 << 20),
+                "GPU memory grew over 200 changes: {w} -> {now}"
+            );
+        }
     }
 
     #[test]
@@ -1752,15 +1735,7 @@ mod tests {
         };
         let render = |p: &SceneParams| {
             scene
-                .render_offscreen_scenes(
-                    &h.device,
-                    &h.queue,
-                    res,
-                    p,
-                    SceneKind::Aurora,
-                    None,
-                    &|_, _| {},
-                )
+                .render_offscreen_scenes(&h.device, &h.queue, res, p, SceneKind::Aurora, &|_, _| {})
                 .unwrap()
         };
         let a = render(&mk(0.0));
@@ -1800,15 +1775,7 @@ mod tests {
         };
         let render = |p: &SceneParams| {
             let img = scene
-                .render_offscreen_scenes(
-                    &h.device,
-                    &h.queue,
-                    res,
-                    p,
-                    SceneKind::Orb,
-                    None,
-                    &|_, _| {},
-                )
+                .render_offscreen_scenes(&h.device, &h.queue, res, p, SceneKind::Orb, &|_, _| {})
                 .unwrap();
             assert_eq!(img.len(), (res.0 * res.1 * 4) as usize);
             img

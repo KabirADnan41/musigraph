@@ -100,7 +100,6 @@ fn orb_flicker(ticks: &[Tick]) -> Option<f32> {
             RES,
             &t.params,
             SceneKind::Orb,
-            None,
             &|_, _| {},
         ) else {
             return Some(f32::NAN);
@@ -198,16 +197,11 @@ fn presentation_previews(failures: &mut Vec<String>) -> bool {
             apply_album(&mut p.palette, &album, w, 0.85 + 0.30 * p.energy);
             pres.merge_focus(&mut p.album);
             let bare =
-                scene.render_offscreen_scenes(&h.device, &h.queue, res, &p, kind, None, &|_, _| {});
-            let img = scene.render_offscreen_scenes(
-                &h.device,
-                &h.queue,
-                res,
-                &p,
-                kind,
-                None,
-                &|enc, view| ov.draw(&h.queue, enc, view, &op),
-            );
+                scene.render_offscreen_scenes(&h.device, &h.queue, res, &p, kind, &|_, _| {});
+            let img =
+                scene.render_offscreen_scenes(&h.device, &h.queue, res, &p, kind, &|enc, view| {
+                    ov.draw(&h.queue, enc, view, &op)
+                });
             let (Ok(bare), Ok(img)) = (bare, img) else {
                 failures.push(format!("presentation {layout:?}/{i}: render failed"));
                 continue;
@@ -374,7 +368,6 @@ fn album_previews(failures: &mut Vec<String>) -> bool {
                 res,
                 &p,
                 SceneKind::Focus,
-                None,
                 &|enc, view| ov.draw(&h.queue, enc, view, &op),
             ) else {
                 failures.push(format!("{tag}: render failed"));
@@ -449,7 +442,6 @@ fn controls_previews(failures: &mut Vec<String>) -> bool {
         res,
         &base_params,
         SceneKind::Spectrum,
-        None,
         &|_, _| {},
     );
     let Ok(bare) = bare else {
@@ -512,7 +504,6 @@ fn controls_previews(failures: &mut Vec<String>) -> bool {
             res,
             &base_params,
             SceneKind::Spectrum,
-            None,
             &|enc, view| ov.draw(&h.queue, enc, view, &p),
         ) else {
             failures.push(format!("controls {name}: render failed"));
@@ -563,15 +554,7 @@ fn orb_checks(failures: &mut Vec<String>) -> bool {
     let Ok(h) = headless() else { return false };
     let scene = SceneSet::new_headless(&h.device);
     let render = |p: &mg_gfx::scene::SceneParams| {
-        scene.render_offscreen_scenes(
-            &h.device,
-            &h.queue,
-            RES,
-            p,
-            SceneKind::Orb,
-            None,
-            &|_, _| {},
-        )
+        scene.render_offscreen_scenes(&h.device, &h.queue, RES, p, SceneKind::Orb, &|_, _| {})
     };
     let mad = |a: &[u8], b: &[u8]| {
         a.iter()
@@ -613,7 +596,6 @@ fn orb_checks(failures: &mut Vec<String>) -> bool {
                 (960, 540),
                 &p,
                 SceneKind::Orb,
-                None,
                 &|_, _| {},
             );
             if let Ok(big) = big {
@@ -694,7 +676,6 @@ fn fluid_checks(failures: &mut Vec<String>) -> bool {
                 RES,
                 &t.params,
                 SceneKind::Fluid,
-                None,
                 &|_, _| {},
             ) else {
                 failures.push(format!("fluid/{name}: render failed"));
@@ -729,7 +710,6 @@ fn fluid_checks(failures: &mut Vec<String>) -> bool {
                 (960, 540),
                 p,
                 SceneKind::Fluid,
-                None,
                 &|_, _| {},
             ) {
                 let _ = std::fs::write(
@@ -859,7 +839,6 @@ fn focus_checks(failures: &mut Vec<String>) -> bool {
                 RES,
                 &p,
                 SceneKind::Focus,
-                None,
                 &|_, _| {},
             ) else {
                 failures.push(format!("focus/{name}: render failed"));
@@ -974,7 +953,6 @@ fn focus_checks(failures: &mut Vec<String>) -> bool {
                 res,
                 &p,
                 SceneKind::Focus,
-                None,
                 &|_, _| {},
             ) else {
                 failures.push(format!("focus {cname} {}x{}: render failed", res.0, res.1));
@@ -1180,7 +1158,6 @@ fn panel_previews(failures: &mut Vec<String>) -> bool {
                 res,
                 &p,
                 SceneKind::Orb,
-                None,
                 &|enc, view| ov.draw(&h.queue, enc, view, &op),
             )
         };
