@@ -5,6 +5,8 @@
 mod controls;
 mod levels;
 mod lyric_view;
+#[allow(dead_code)] // until wired into the lyrics flow
+mod lyrics_consent;
 mod media_feed;
 #[allow(dead_code)] // until scene_run polls it (Q-007 wiring)
 mod motion_pref;
