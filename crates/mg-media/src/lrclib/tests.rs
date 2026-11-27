@@ -214,7 +214,6 @@ fn version_word_mismatch_is_rejected() {
         "Synthetic Song (Live)",
         "Synthetic Song - Remix",
         "Synthetic Song (Acoustic)",
-        "Synthetic Song [Remastered 2011]",
         "Synthetic Song (Extended Mix)",
         "Synthetic Song (Radio Edit)",
         "Synthetic Song (Instrumental)",
@@ -249,7 +248,10 @@ fn version_word_mismatch_is_rejected() {
     (r.track_name, r.album_name) = (Some("live song - remaster".into()), None);
     assert!(matches!(judge(&live, &r), Outcome::Synced(_)));
     r.track_name = Some("Live Song".into());
-    assert_eq!(judge(&live, &r), Outcome::Rejected);
+    assert!(
+        matches!(judge(&live, &r), Outcome::Synced(_)),
+        "remaster-only difference"
+    );
 }
 
 fn qa(title: &str, artist: &str) -> Query {
@@ -447,7 +449,7 @@ fn status_codes_are_classified() {
     for s in [300, 301, 302, 303, 307, 308, 399] {
         assert_eq!(evaluate(&q(), ok(s, "")), Outcome::Refused, "{s}");
     }
-    for s in [0, 100, 201, 204, 400, 401, 403, 418, 500, 502, 504, 999] {
+    for s in [0, 100, 201, 204, 400, 401, 403, 418, 600, 999] {
         assert_eq!(evaluate(&q(), ok(s, &json("200"))), Outcome::Error, "{s}");
     }
     let ra = |status, ra: Option<Duration>| {
@@ -492,9 +494,7 @@ fn transport_errors_and_oversize_are_refused_or_errors() {
     use TransportError::*;
     assert_eq!(evaluate(&q(), Err(TooLarge)), Outcome::Refused);
     assert_eq!(evaluate(&q(), Err(NotAllowed)), Outcome::Refused);
-    for e in [Cancelled, Timeout, Network] {
-        assert_eq!(evaluate(&q(), Err(e)), Outcome::Error);
-    }
+    assert_eq!(evaluate(&q(), Err(Cancelled)), Outcome::Error);
     let big = format!("{}{}", json("200"), " ".repeat(MAX_BODY_BYTES));
     assert_eq!(evaluate(&q(), ok(200, &big)), Outcome::Refused);
 }
@@ -837,4 +837,190 @@ fn multi_artist_sent_against_a_single_artist_record_is_rejected() {
         &qa("Synthetic Song", "Test Artist, Guest"),
         &named("Synthetic Song", "Test Artist")
     ));
+}
+
+// ---- Q-005b: remaster-only differences ----
+
+#[test]
+fn remaster_alone_never_separates_recordings_but_other_version_words_do() {
+    let q = |t: &str| Query::new(t, "Test Artist", "", Some(200.0)).unwrap();
+    let r = |t: &str| named(t, "Test Artist");
+    // remaster vs original, either direction, any year placement
+    assert!(accepted(
+        &q("Synthetic Song"),
+        &r("Synthetic Song - 2011 Remaster")
+    ));
+    assert!(accepted(
+        &q("Synthetic Song (Remastered 2011)"),
+        &r("Synthetic Song")
+    ));
+    assert!(accepted(
+        &q("Synthetic Song [Remastered]"),
+        &r("Synthetic Song - Remaster 2009")
+    ));
+    // remaster + live vs live: accepted; live vs studio stays rejected
+    assert!(accepted(
+        &q("Synthetic Song (Live) [Remastered 2011]"),
+        &r("Synthetic Song (Live)")
+    ));
+    assert!(!accepted(&q("Synthetic Song (Live)"), &r("Synthetic Song")));
+    assert!(!accepted(
+        &q("Synthetic Song"),
+        &r("Synthetic Song (Live) - Remastered")
+    ));
+    // remix / acoustic / edit / extended / mix stay strict
+    for w in ["Remix", "Acoustic", "Radio Edit", "Extended", "Mix"] {
+        let t = format!("Synthetic Song ({w})");
+        assert!(!accepted(&q("Synthetic Song"), &r(&t)), "{w}");
+        assert!(
+            !accepted(&q("Synthetic Song (Remastered)"), &r(&t)),
+            "{w} vs remaster"
+        );
+    }
+    // title and duration checks are unchanged
+    assert!(!accepted(
+        &q("Other Song (Remastered)"),
+        &r("Synthetic Song")
+    ));
+    let mut far = r("Synthetic Song - Remastered");
+    far.duration = Some(203.0);
+    assert!(!accepted(&q("Synthetic Song"), &far));
+}
+
+// ---- Q-005a: one bounded retry ----
+
+#[test]
+fn only_genuinely_transient_failures_are_classified_retryable() {
+    use TransportError::*;
+    for e in [Timeout, Network] {
+        assert_eq!(evaluate(&q(), Err(e)), Outcome::Transient, "{e:?}");
+    }
+    for s in [500, 502, 504, 599] {
+        assert_eq!(evaluate(&q(), ok(s, "")), Outcome::Transient, "{s}");
+    }
+    // permanent / policy / invalid results are not retryable
+    assert_eq!(evaluate(&q(), Err(Cancelled)), Outcome::Error);
+    for s in [400, 401, 403, 418, 100, 204] {
+        assert_eq!(evaluate(&q(), ok(s, "")), Outcome::Error, "{s}");
+    }
+    assert_eq!(evaluate(&q(), ok(200, "not json")), Outcome::Error);
+    assert_eq!(evaluate(&q(), ok(404, "")), Outcome::NotFound);
+    assert_eq!(evaluate(&q(), ok(302, "")), Outcome::Refused);
+    assert_eq!(evaluate(&q(), Err(TooLarge)), Outcome::Refused);
+}
+
+#[test]
+fn a_transient_failure_is_retried_once_after_the_backoff() {
+    let t0 = Instant::now();
+    let mut r = on(t0);
+    let req = r.poll(t0 + DEBOUNCE).unwrap();
+    let t1 = t0 + ms(2000);
+    assert_eq!(
+        r.on_outcome(t1, &req, Outcome::Transient),
+        None,
+        "not reported yet"
+    );
+    assert_eq!(r.poll(t1 + ms(9_999)), None, "backoff applies");
+    let again = r.poll(t1 + ms(10_000)).expect("one retry");
+    assert_eq!(again.query, q());
+    // second failure for the same key is final: no further retry this session
+    let t2 = t1 + ms(10_000);
+    assert_eq!(
+        r.on_outcome(t2, &again, Outcome::Transient),
+        Some(Outcome::Error)
+    );
+    assert_eq!(r.poll(t2 + Duration::from_secs(3600)), None);
+    // a retry that succeeds is delivered normally
+    let mut r = on(t0);
+    let req = r.poll(t0 + DEBOUNCE).unwrap();
+    r.on_outcome(t1, &req, Outcome::Transient);
+    let again = r.poll(t1 + ms(10_000)).unwrap();
+    assert_eq!(
+        r.on_outcome(t2, &again, Outcome::NotFound),
+        Some(Outcome::NotFound)
+    );
+}
+
+#[test]
+fn retry_after_responses_are_retried_at_most_once_per_track() {
+    let t0 = Instant::now();
+    let mut r = on(t0);
+    let pause = Duration::from_secs(30);
+    let req = r.poll(t0 + DEBOUNCE).unwrap();
+    assert_eq!(
+        r.on_outcome(t0 + ms(2000), &req, Outcome::RetryAfter(pause)),
+        None
+    );
+    let t1 = t0 + ms(2000) + pause + Duration::from_secs(1);
+    let again = r.poll(t1).expect("the one retry");
+    assert_eq!(
+        r.on_outcome(t1, &again, Outcome::RetryAfter(pause)),
+        Some(Outcome::Error)
+    );
+    assert_eq!(r.poll(t1 + Duration::from_secs(7200)), None);
+}
+
+#[test]
+fn permanent_outcomes_are_never_retried() {
+    let t0 = Instant::now();
+    for o in [
+        Outcome::Error,
+        Outcome::Rejected,
+        Outcome::Refused,
+        Outcome::NotFound,
+    ] {
+        let mut r = on(t0);
+        let req = r.poll(t0 + DEBOUNCE).unwrap();
+        assert_eq!(r.on_outcome(t0 + ms(2000), &req, o.clone()), Some(o));
+        assert_eq!(r.poll(t0 + Duration::from_secs(3600)), None);
+    }
+}
+
+#[test]
+fn a_pending_retry_is_cancelled_by_track_change_and_by_revoke() {
+    let t0 = Instant::now();
+    // track changed before the failure came back: nothing scheduled, nothing reported
+    let mut r = on(t0);
+    let req = r.poll(t0 + DEBOUNCE).unwrap();
+    r.observe(t0 + ms(1600), Some(&qn(5)));
+    assert_eq!(r.on_outcome(t0 + ms(1700), &req, Outcome::Transient), None);
+    assert_eq!(
+        r.poll(t0 + ms(20_000)).unwrap().query,
+        qn(5),
+        "new track, not a retry"
+    );
+    // track changes during the backoff: the old track is not retried
+    let mut r = on(t0);
+    let req = r.poll(t0 + DEBOUNCE).unwrap();
+    r.on_outcome(t0 + ms(2000), &req, Outcome::Transient);
+    r.observe(t0 + ms(3000), Some(&qn(6)));
+    assert_eq!(r.poll(t0 + ms(20_000)).unwrap().query, qn(6));
+    // revoke: stale generation, and the retry allowance is forgotten with the other memory
+    let mut r = on(t0);
+    let req = r.poll(t0 + DEBOUNCE).unwrap();
+    r.set_consent(false);
+    assert_eq!(r.on_outcome(t0 + ms(2000), &req, Outcome::Transient), None);
+    r.set_consent(true);
+    r.observe(t0 + ms(3000), Some(&q()));
+    assert_eq!(r.poll(t0 + ms(30_000)).unwrap().query, q());
+}
+
+#[test]
+fn retries_still_obey_the_rate_cap_and_the_pause() {
+    let t0 = Instant::now();
+    let mut r = Requester::default();
+    r.set_consent(true);
+    let mut t = t0;
+    let mut sent = 0usize;
+    for i in 0..40u32 {
+        r.observe(t, Some(&qn(i)));
+        t += DEBOUNCE;
+        if let Some(req) = r.poll(t) {
+            sent += 1;
+            r.on_outcome(t, &req, Outcome::Transient);
+        }
+        t += ms(10);
+    }
+    // each failure also pauses (backoff), so far fewer than the cap's worth go out
+    assert!(sent <= MAX_REQUESTS_PER_MINUTE, "{sent}");
 }

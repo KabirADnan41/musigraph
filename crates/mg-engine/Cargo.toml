@@ -16,5 +16,10 @@ mg-media = { path = "../mg-media" }
 mg-text = { path = "../mg-text" }
 winit = { version = "=0.30.13", default-features = false, features = ["rwh_06"] }
 
+[target.'cfg(windows)'.dependencies]
+windows = { version = "=0.62.2", default-features = false, features = [
+  "Win32_UI_WindowsAndMessaging",
+] }
+
 [lints]
 workspace = true

@@ -6,6 +6,8 @@ mod controls;
 mod levels;
 mod lyric_view;
 mod media_feed;
+#[allow(dead_code)] // until scene_run polls it (Q-007 wiring)
+mod motion_pref;
 mod music_summary;
 mod nowplaying;
 mod presentation;

@@ -163,6 +163,8 @@ mod tests {
         block: bool,
         saw_cancel: Arc<AtomicBool>,
         started: Arc<AtomicBool>,
+        /// Statuses to answer first (front first); 404 once empty.
+        script: Arc<Mutex<std::collections::VecDeque<u16>>>,
     }
 
     impl Transport for Mock {
@@ -184,8 +186,9 @@ mod tests {
                 }
                 return Err(TransportError::Timeout);
             }
+            let status = self.script.lock().unwrap().pop_front().unwrap_or(404);
             Ok(HttpResponse {
-                status: 404,
+                status,
                 retry_after: None,
                 body: Vec::new(),
             })
@@ -246,6 +249,32 @@ mod tests {
         drop(calls);
         let other = Query::new("Other", "Test Artist", "", Some(180.0)).unwrap();
         assert!(c.update(t1, Some(&other)).is_none());
+    }
+
+    #[test]
+    fn a_server_error_is_retried_once_after_the_backoff_then_reported() {
+        let m = Mock::default();
+        m.script.lock().unwrap().extend([500, 500, 500]);
+        let m2 = m.clone();
+        let mut c = LrclibClient::start(move || Some(m2)).unwrap();
+        c.set_consent(true);
+        let t0 = Instant::now();
+        c.update(t0, Some(&q()));
+        let t1 = t0 + Duration::from_secs(2);
+        c.update(t1, Some(&q()));
+        assert!(wait_until(|| m.calls.lock().unwrap().len() == 1));
+        // reply is consumed, then the backoff (10 s) holds the retry back
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(c.update(t1 + Duration::from_secs(5), Some(&q())).is_none());
+        assert_eq!(m.calls.lock().unwrap().len(), 1);
+        let t2 = t1 + Duration::from_secs(16); // reply was taken in at t1+5, so the pause ends at t1+15
+        assert!(wait_until(
+            || c.update(t2, Some(&q())) == Some(&Outcome::Error)
+        ));
+        for k in 0..20 {
+            c.update(t2 + Duration::from_secs(400 + k), Some(&q()));
+        }
+        assert_eq!(m.calls.lock().unwrap().len(), 2, "exactly one retry");
     }
 
     #[test]

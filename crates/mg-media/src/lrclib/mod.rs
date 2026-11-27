@@ -12,6 +12,14 @@
 //! nothing is written to disk; nothing here logs; `Debug` output of queries and lyrics is redacted.
 //! Without consent no request is ever produced; revoking consent cancels, invalidates and clears.
 //!
+//! Retry (owner-approved Q-005a): a transport error/timeout/5xx (`Outcome::Transient`) or a 429/503 gets ONE
+//! retry per track key per session, after the applicable backoff / Retry-After, only while that track still
+//! plays and consent stands (generation check), through the same rate cap and pause. 4xx, 404, redirects,
+//! rejected/ambiguous matches and invalid or oversize replies are final.
+//! Match (Q-005b): "remaster"/"remastered" is the only version word ignored; live, remix, acoustic, edit,
+//! extended, mix etc. must still agree as sets. A multi-artist query against a single-artist record stays
+//! rejected (Q-005c).
+//!
 //! Usage: create ONE long-lived `LrclibClient` per process (the rate cap, Retry-After pause and
 //! negative cache live in it; a fresh client would reset them) and call `update` only from the
 //! engine/main thread. The transport is created on, and never leaves, the worker thread.
@@ -192,7 +200,9 @@ pub enum Outcome {
     RetryAfter(Duration),
     /// Policy refusal: redirect, disallowed URL, oversized body.
     Refused,
-    /// Network failure, timeout, malformed body or unexpected status.
+    /// Transport error, timeout or 5xx (other than 503): worth ONE bounded retry (see `Requester`).
+    Transient,
+    /// Permanent failure: cancelled call, malformed body or unexpected status. Never retried.
     Error,
 }
 
@@ -205,6 +215,7 @@ impl fmt::Debug for Outcome {
             Self::Rejected => f.write_str("Rejected"),
             Self::RetryAfter(d) => write!(f, "RetryAfter({d:?})"),
             Self::Refused => f.write_str("Refused"),
+            Self::Transient => f.write_str("Transient"),
             Self::Error => f.write_str("Error"),
         }
     }
@@ -252,7 +263,8 @@ pub fn evaluate(q: &Query, r: Result<HttpResponse, TransportError>) -> Outcome {
     let resp = match r {
         Ok(resp) => resp,
         Err(TransportError::TooLarge | TransportError::NotAllowed) => return Outcome::Refused,
-        Err(_) => return Outcome::Error,
+        Err(TransportError::Timeout | TransportError::Network) => return Outcome::Transient,
+        Err(TransportError::Cancelled) => return Outcome::Error,
     };
     match resp.status {
         200 if resp.body.len() > MAX_BODY_BYTES => Outcome::Refused,
@@ -264,6 +276,7 @@ pub fn evaluate(q: &Query, r: Result<HttpResponse, TransportError>) -> Outcome {
                 .clamp(MIN_RETRY_AFTER, MAX_RETRY_AFTER),
         ),
         300..=399 => Outcome::Refused, // redirects are never followed
+        500..=599 => Outcome::Transient,
         _ => Outcome::Error,
     }
 }
@@ -280,7 +293,8 @@ pub fn judge(q: &Query, rec: &Record) -> Outcome {
     let theirs = format!("{track} {}", rec.album_name.as_deref().unwrap_or(""));
     if !duration_ok
         || rec.instrumental == Some(true)
-        || version_words(&format!("{} {}", q.title, q.album)) != version_words(&theirs)
+        || distinguishing_words(&format!("{} {}", q.title, q.album))
+            != distinguishing_words(&theirs)
         || core_title(&q.title) != core_title(track)
         || !same_artist(&q.artist, artist)
     {
@@ -340,6 +354,14 @@ fn version_words(s: &str) -> Vec<&'static str> {
     found.sort_unstable();
     found.dedup();
     found
+}
+
+/// `version_words` without "remaster": a remaster is the same recording for lyrics purposes (Q-005b). Every
+/// other version word still has to match as a set.
+fn distinguishing_words(s: &str) -> Vec<&'static str> {
+    let mut w = version_words(s);
+    w.retain(|&v| v != "remaster");
+    w
 }
 
 /// Comparison key: Unicode lowercase with whitespace, punctuation and symbols removed. Letters and
@@ -544,6 +566,8 @@ pub struct Requester {
     in_flight: Option<Request>,
     /// Tracks already answered this session (positive for the current track, or any negative).
     settled: HashSet<Query>,
+    /// Tracks that already used their single retry this session (bounded like `settled`).
+    retried: HashSet<Query>,
     sent: VecDeque<Instant>,
     paused_until: Option<Instant>,
     backoff: Duration,
@@ -557,6 +581,7 @@ impl Default for Requester {
             current: None,
             in_flight: None,
             settled: HashSet::new(),
+            retried: HashSet::new(),
             sent: VecDeque::new(),
             paused_until: None,
             backoff: BACKOFF_MIN,
@@ -585,6 +610,7 @@ impl Requester {
             self.current = None;
             self.in_flight = None;
             self.settled = HashSet::new(); // release memory, not just length
+            self.retried = HashSet::new();
         }
         self.consent = on;
     }
@@ -638,19 +664,33 @@ impl Requester {
             return None;
         }
         self.in_flight = None;
+        let is_current = self.current.as_ref().map(|(q, _)| q) == Some(&req.query);
+        let retryable = matches!(outcome, Outcome::RetryAfter(_) | Outcome::Transient);
+        let mut outcome = outcome;
         match outcome {
             Outcome::RetryAfter(d) => {
-                // not settled: the same track is asked again once the pause is over
                 self.paused_until = Some(now + d + RETRY_MARGIN);
-                return None;
             }
-            Outcome::Error => {
+            Outcome::Transient | Outcome::Error => {
                 self.paused_until = Some(now + self.backoff);
                 self.backoff = (self.backoff * 2).min(BACKOFF_MAX);
             }
             _ => self.backoff = BACKOFF_MIN,
         }
-        let is_current = self.current.as_ref().map(|(q, _)| q) == Some(&req.query);
+        if retryable {
+            // One bounded retry per track key: only while the track is still playing, never twice. The
+            // pause above is the applicable backoff; the global rate cap applies to the retry in `poll`.
+            if !is_current {
+                return None; // track changed: nothing is retried or remembered
+            }
+            if self.retried.len() >= MAX_SETTLED {
+                self.retried.clear();
+            }
+            if self.retried.insert(req.query.clone()) {
+                return None; // not settled: `poll` asks again once the pause is over
+            }
+            outcome = Outcome::Error; // second failure is final
+        }
         if !is_current && matches!(outcome, Outcome::Synced(_) | Outcome::Unsynced(_)) {
             return None; // lyrics for a track no longer playing are not kept
         }
