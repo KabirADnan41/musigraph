@@ -20,7 +20,7 @@ use crate::music_summary::MusicSummary;
 use crate::presentation::{GpuOp, Layout, Presentation, Ready, Worker, apply_album};
 use crate::scene_map::{Input, MapTuning, SceneMapper};
 use crate::scene_panel::{PanelEvent, PanelKey, ScenePanel};
-use crate::scene_switch::SceneSwitch;
+use crate::scene_switch::{FULL, Phase, SceneSwitch, scene_luma};
 use mg_audio::capture::Loopback;
 use mg_dsp::features::{MusicFeatures, MusicTracker};
 use mg_dsp::{AnalysisParams, Analyzer, AudioFrame};
@@ -911,6 +911,7 @@ impl App {
                 self.motion_reduced = r;
                 self.mapper.set_reduced_motion(r);
                 self.pres.set_reduced_motion(r);
+                self.switch.set_reduced(r);
                 self.panel.set_reduced(r);
             }
         }
@@ -1000,10 +1001,9 @@ impl App {
             let (last, due) = tour_step(self.last_auto_switch, now, every, self.panel.visible());
             self.last_auto_switch = last;
             if due {
-                self.switch.request(self.switch.target().next());
+                self.switch.request_with(self.switch.target().next(), FULL);
             }
         }
-        let (style, xfade) = self.switch.update(dt as f32);
         let (album, album_w) = self.pres.album();
         apply_album(
             &mut params.palette,
@@ -1011,6 +1011,9 @@ impl App {
             album_w,
             0.85 + 0.30 * params.energy,
         );
+        let tr = self
+            .switch
+            .update(dt as f32, |_| scene_luma(&params.palette));
         let label = self.label(fresh);
         if label != self.title {
             if let Some(w) = &self.window {
@@ -1046,7 +1049,7 @@ impl App {
         let queue = g.queue.clone();
         let overlay = self.overlay.as_ref();
         let t_render = Instant::now();
-        match scene.render_scenes(g, &params, style, xfade, |enc, view| {
+        match scene.render_scenes(g, &params, tr.scene, None, |enc, view| {
             if let Some(ov) = overlay {
                 ov.draw(&queue, enc, view, &overlay_params);
             }
@@ -1065,7 +1068,8 @@ impl App {
                         ));
                     }
                 }
-                self.last_frame = Some((now, [poll_ms, ops_ms, render_ms], xfade.is_some()));
+                self.last_frame =
+                    Some((now, [poll_ms, ops_ms, render_ms], tr.phase != Phase::Idle));
                 self.presented += 1;
                 self.skip_since = None;
             }
@@ -1208,7 +1212,11 @@ pub fn run(opts: SceneOpts) -> i32 {
         worker: Worker::start(),
         last_media_poll: None,
         last_np: None,
-        switch: SceneSwitch::new(style),
+        switch: {
+            let mut s = SceneSwitch::new(style);
+            s.set_reduced(reduced_motion);
+            s
+        },
         last_auto_switch: Instant::now(),
         gpu: None,
         window: None,
