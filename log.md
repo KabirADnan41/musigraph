@@ -333,3 +333,14 @@ The mg-media test count there should read 33 for commit 3eb9341 (36 included 3 u
   - mg-text 8 tests (new: wrapping bounds incl. CJK, Latin-only tracking, RTL ink inside the bitmap, both cuts render); mg-media 36 (3 new display tests).
   - fmt check and clippy (mg-text, mg-media, mg-engine) clean.
   - Not verified: the Segoe UI fallback path (this machine has the variable cuts), and on-screen use (part 1 wires it in).
+
+## 2026-11-27 - Fluid re-review follow-ups (main session)
+- Corrective re-review of 2c61845: PASS WITH SUGGESTIONS (6 findings + FL1/FL2 resolved, no threshold lowered).
+- **Follow-ups in scene_map.rs:**
+  - (a) New test `a_bass_line_under_loud_low_mids_keeps_most_of_its_strength`: a 120 Hz line plus an equally loud 350 Hz tone must keep at least 0.7x its alone strength. RED: 0.481 vs 0.692 (0.695x).
+  - Fix: the flat "minus half the group above" became a leakage-excess gate. The 60-250 Hz group counts once it rises above FL_BASS_LEAK=0.65 x the 250-500 Hz group (measured skirt on the 262 Hz pad: 0.645 vs 0.991), via smoothstep(0, 0.15).
+  - GREEN: 0.701 vs 0.692. The pad bass emitter went 0.26 -> 0.00 (it has no real bass). All 16 fluid tests pass, including GPU shape and thumbnails.
+  - (b) The safe-box comment now states it bounds emitter centres only (the treble veil spreads to the sides; the bottom 38% is protected by the shader mask and the sigma clamp).
+  - (c) The test field `lift` was renamed `push_lift` (it reads push + lift).
+- **Deferred:** the fragile exact-length fixture pattern in selftest.rs:611 (owned by the running Album Focus part-1 agent; fix after it lands).
+- **Limitation:** FL_BASS_LEAK is measured on one synthetic chord; tune on real music in Session 3.

@@ -161,7 +161,12 @@ pub const FLUID_VORTEX_GAP_S: f32 = 0.25;
 const FL_VORTEX_LIFE_S: f32 = 2.0;
 /// How long an onset may wait for its accent to confirm it (the features trail the onset by a frame or two).
 const FL_ONSET_WAIT_S: f32 = 0.1;
-/// Everything the sim injects stays in this uv box (y down): above artwork, lyrics and the control bar.
+/// Fraction of the 250-500 Hz group (absolute, dB-normalised) that shows up in the 60-250 Hz group as skirt
+/// leakage (measured on a 262 Hz chord fixture: 0.645 vs 0.991).
+const FL_BASS_LEAK: f32 = 0.65;
+/// Emitter CENTRES stay in this uv box (y down), above artwork, lyrics and the control bar. Splats can spread
+/// past its sides (the wide treble veil reaches about 0.22 of the width at 16:9; the edge sink absorbs it); the
+/// bottom 38% is protected by the shader zone mask and the sigma clamp, not by this box.
 pub const FLUID_SAFE_X: (f32, f32) = (0.15, 0.85);
 pub const FLUID_SAFE_Y: (f32, f32) = (0.12, 0.58);
 /// Slowest flow ever (sh/s): silence still breathes, barely.
@@ -219,9 +224,12 @@ impl FluidMap {
         // AGC normalises every band to its own recent range, so it cannot tell a bass-heavy song from a bright
         // one; the absolute band level gates each emitter (presence) and AGC shapes it within that.
         // The analyzer's 60-250 Hz group also catches the skirt of a strong 250-500 Hz group (a 262 Hz chord
-        // reads ~0.65 there): the bass presence discounts half of the group above, so a pad does not drive the
-        // bass emitter. Sub-bass (< 60 Hz) always counts in full.
-        let low_abs = c(absolute[0]).max(c(absolute[1]) - 0.5 * c(absolute[2]));
+        // reads ~0.65 there while the group above reads ~0.99, i.e. leakage ~0.65x the group above). The bass group
+        // counts only to the extent it rises above that leakage estimate, then in full: a pad does not drive the
+        // bass emitter, while a real bass line under loud low-mids keeps its level (it sits well above the
+        // estimate). Sub-bass (< 60 Hz) always counts in full.
+        let leak_excess = c(absolute[1]) - FL_BASS_LEAK * c(absolute[2]);
+        let low_abs = c(absolute[0]).max(c(absolute[1]) * smoothstep(0.0, 0.15, leak_excess));
         let presence = |i: usize| (2.0 * if i == 0 { low_abs } else { band(absolute, i) }).min(1.0);
         let drive = |i: usize| 0.4 * band(&m.long, i) + 0.6 * band(&m.short, i);
         let level = if silent { 0.0 } else { c(m.level) };
@@ -1152,7 +1160,7 @@ pub(crate) mod fluid_tests {
     struct Char {
         tau: f32,
         detail: f32,
-        lift: f32,
+        push_lift: f32,
         jet_w: f32,
         freq: f32,
         spread: f32,
@@ -1166,7 +1174,11 @@ pub(crate) mod fluid_tests {
             "treble" => synth::sine(9000.0, 0.4, SR, n(8.0)),
             _ => fx(name, 8.0),
         };
-        let t = run(&x, 60.0);
+        char_of(&x)
+    }
+
+    fn char_of(x: &[f32]) -> Char {
+        let t = run(x, 60.0);
         let tail = &t[t.len() - 240..];
         let avg = |f: &dyn Fn(&FluidParams) -> f32| {
             tail.iter().map(|k| f(&k.params.fluid)).sum::<f32>() / tail.len() as f32
@@ -1174,7 +1186,7 @@ pub(crate) mod fluid_tests {
         Char {
             tau: avg(&|f| f.look[0]),
             detail: avg(&|f| f.misc[2]),
-            lift: avg(&|f| f.swirl[3]),
+            push_lift: avg(&|f| f.swirl[3]),
             jet_w: avg(&|f| f.look[3]),
             freq: avg(&|f| f.flow[1]),
             spread: avg(&|f| f.misc[3]),
@@ -1185,6 +1197,34 @@ pub(crate) mod fluid_tests {
 
     /// FL1: kick, pad, sub-bass drone, hats and a 9 kHz tone move differently because their spectral and temporal
     /// features differ (crest, onsets, low end, centroid), not because of noise or a louder global intensity.
+    /// The pad bass-leak correction subtracts part of the band above 250 Hz: a real bass line under loud
+    /// low-mids must be weakened at most moderately, never hidden (review 2026-11-27 measured about 0.77x).
+    #[test]
+    fn a_bass_line_under_loud_low_mids_keeps_most_of_its_strength() {
+        let alone = synth::sine(120.0, 0.4, SR, n(8.0));
+        let mixed: Vec<f32> = alone
+            .iter()
+            .zip(synth::sine(350.0, 0.4, SR, n(8.0)))
+            .map(|(a, b)| a + b)
+            .collect();
+        let (a, m) = (char_of(&alone), char_of(&mixed));
+        eprintln!(
+            "FLUID bass-leak: alone {:.3} mixed {:.3}",
+            a.bass_emit, m.bass_emit
+        );
+        assert!(
+            a.bass_emit > 0.3,
+            "bass alone must drive the bass emitter: {}",
+            a.bass_emit
+        );
+        assert!(
+            m.bass_emit >= 0.7 * a.bass_emit,
+            "bass under low-mids {} vs alone {}",
+            m.bass_emit,
+            a.bass_emit
+        );
+    }
+
     #[test]
     fn fluid_motion_character_follows_the_music_features() {
         let [kick, pad, drone, hats, treble] =
@@ -1198,7 +1238,7 @@ pub(crate) mod fluid_tests {
         ] {
             eprintln!(
                 "FLUID char {n:6} tau={:.2} detail={:.2} lift={:.3} jet_w={:.3} freq={:.2} spread={:.2} bass_emit={:.2} spawns={}",
-                c.tau, c.detail, c.lift, c.jet_w, c.freq, c.spread, c.bass_emit, c.spawns
+                c.tau, c.detail, c.push_lift, c.jet_w, c.freq, c.spread, c.bass_emit, c.spawns
             );
         }
         // impulsive (kick, hats): vortices, churning fine curl, short dye memory
@@ -1220,9 +1260,9 @@ pub(crate) mod fluid_tests {
         }
         // a steady low end lifts a broad, large-scale plume; kick impacts are narrow jets; a pad lifts little
         assert!(
-            drone.lift > 0.06 && drone.jet_w > 0.25,
+            drone.push_lift > 0.06 && drone.jet_w > 0.25,
             "drone plume {} {}",
-            drone.lift,
+            drone.push_lift,
             drone.jet_w
         );
         assert!(
@@ -1232,10 +1272,10 @@ pub(crate) mod fluid_tests {
             drone.jet_w
         );
         assert!(
-            pad.lift < 0.5 * drone.lift,
+            pad.push_lift < 0.5 * drone.push_lift,
             "pad lift {} vs drone {}",
-            pad.lift,
-            drone.lift
+            pad.push_lift,
+            drone.push_lift
         );
         // the pad's 262 Hz spill does not drive the bass emitter like a real low end does
         assert!(
