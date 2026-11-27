@@ -142,6 +142,32 @@ fn route_esc(
     }
 }
 
+/// The Esc key's state across events: `held` from the press that closed the panel until that key is released
+/// (or the window loses focus, when no release event will come). The real key handler drives this.
+#[derive(Debug, Default)]
+struct EscState {
+    held: bool,
+}
+
+impl EscState {
+    /// An Esc press event (`repeat` = OS auto-repeat): where it goes; the press that closes the panel is held.
+    fn press(&mut self, panel_open: bool, panel_visible: bool, repeat: bool) -> EscRoute {
+        let r = route_esc(panel_open, panel_visible, repeat, self.held);
+        if r == EscRoute::Panel {
+            self.held = true;
+        }
+        r
+    }
+
+    fn release(&mut self) {
+        self.held = false;
+    }
+
+    fn focus_lost(&mut self) {
+        self.held = false;
+    }
+}
+
 /// The `--auto-scenes` tour clock, pure so it can be tested with a fake clock: while the panel is up the timer is
 /// reset to `now` every frame (nothing is due, nothing accumulates), so closing it neither switches at once nor
 /// catches up. Returns (new last-switch time, a switch is due).
@@ -430,7 +456,7 @@ struct App {
     /// The last input was the keyboard (the panel shows its focus ring only then).
     keyboard_input: bool,
     /// Esc closed the panel and is still held: its auto-repeat must not reach the app (cleared on release).
-    esc_held: bool,
+    esc: EscState,
     cursor_hidden: bool,
     mods: ModifiersState,
     last_unsupported_note: Option<Instant>,
@@ -552,7 +578,7 @@ impl ApplicationHandler for App {
                     // alt-tab while a button is held: no release event will come, so nothing may stay pressed
                     self.mods = ModifiersState::empty();
                     self.ctl.focus_lost();
-                    self.esc_held = false;
+                    self.esc.focus_lost();
                 }
             }
             WindowEvent::KeyboardInput {
@@ -563,7 +589,7 @@ impl ApplicationHandler for App {
                         ..
                     },
                 ..
-            } => self.esc_held = false,
+            } => self.esc.release(),
             WindowEvent::KeyboardInput {
                 event:
                     KeyEvent {
@@ -711,14 +737,11 @@ impl App {
         self.ctl.key_activity();
         self.keyboard_input = true;
         if code == KeyCode::Escape {
-            match route_esc(
-                self.panel.is_open(),
-                self.panel.visible(),
-                repeat,
-                self.esc_held,
-            ) {
+            match self
+                .esc
+                .press(self.panel.is_open(), self.panel.visible(), repeat)
+            {
                 EscRoute::Panel => {
-                    self.esc_held = true;
                     let ev = self.panel.key(PanelKey::Escape);
                     return self.on_panel_event(ev);
                 }
@@ -1197,7 +1220,7 @@ pub fn run(opts: SceneOpts) -> i32 {
         panel: ScenePanel::new(),
         pointer: None,
         keyboard_input: false,
-        esc_held: false,
+        esc: EscState::default(),
         cursor_hidden: false,
         mods: ModifiersState::empty(),
         last_unsupported_note: None,
@@ -1420,6 +1443,38 @@ mod tests {
                 EscRoute::App
             ]
         );
+    }
+
+    /// Drives the production `EscState` (the one the window handler uses) through real event sequences.
+    #[test]
+    fn esc_state_swallows_only_the_closing_presses_repeats_and_a_release_or_focus_loss_ends_it() {
+        // press closes the panel; its auto-repeats during and after the fade are swallowed; after the release a
+        // new press exits the app
+        let mut e = EscState::default();
+        assert_eq!(e.press(true, true, false), EscRoute::Panel);
+        assert_eq!(e.press(false, true, true), EscRoute::Swallow);
+        assert_eq!(e.press(false, false, true), EscRoute::Swallow);
+        assert_eq!(e.press(false, false, true), EscRoute::Swallow);
+        e.release();
+        assert_eq!(
+            e.press(false, false, false),
+            EscRoute::App,
+            "new press after release"
+        );
+        // a new press while the panel still fades (key already released) also exits
+        let mut e = EscState::default();
+        assert_eq!(e.press(true, true, false), EscRoute::Panel);
+        e.release();
+        assert_eq!(e.press(false, true, false), EscRoute::App);
+        // the window loses focus while Esc is held: no release event will come, a later press must still exit
+        let mut e = EscState::default();
+        assert_eq!(e.press(true, true, false), EscRoute::Panel);
+        e.focus_lost();
+        assert_eq!(e.press(false, false, false), EscRoute::App);
+        // no panel involved: Esc is never held and always exits
+        let mut e = EscState::default();
+        assert_eq!(e.press(false, false, false), EscRoute::App);
+        assert_eq!(e.press(false, false, true), EscRoute::App);
     }
 
     #[test]

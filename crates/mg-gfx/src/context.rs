@@ -168,6 +168,31 @@ pub fn invalid_texture(device: &Device) -> wgpu::Texture {
         view_formats: &[],
     })
 }
+
+/// Records a pass that clears `view` to a uniform grey `v` (tests and the self-test: a known backdrop under overlays).
+pub fn clear_view(enc: &mut wgpu::CommandEncoder, view: &wgpu::TextureView, v: f64) {
+    drop(enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+        label: Some("backdrop"),
+        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+            view,
+            depth_slice: None,
+            resolve_target: None,
+            ops: wgpu::Operations {
+                load: wgpu::LoadOp::Clear(wgpu::Color {
+                    r: v,
+                    g: v,
+                    b: v,
+                    a: 1.0,
+                }),
+                store: wgpu::StoreOp::Store,
+            },
+        })],
+        depth_stencil_attachment: None,
+        timestamp_writes: None,
+        occlusion_query_set: None,
+        multiview_mask: None,
+    }));
+}
 /// Live GPU allocations in bytes where the backend reports them (diagnostics and tests).
 pub fn allocated_bytes(device: &Device) -> Option<u64> {
     device

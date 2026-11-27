@@ -1256,6 +1256,54 @@ fn panel_previews(failures: &mut Vec<String>) -> bool {
             }
         }
         println!("PANEL {tag}: worst rendered 15 px label contrast {worst:.2}:1");
+        // glyph extremes over a PURE-WHITE backdrop (the worst case): the real labels, the rows of the topmost and
+        // bottommost ink and every inked row, ink against the plate beside it on the same row
+        if tag == "16x9" {
+            let op = OverlayParams {
+                res,
+                panel: Some(draw.clone()),
+                ..Default::default()
+            };
+            let white = scene.render_offscreen_with(&h.device, &h.queue, res, &p, &|enc, view| {
+                mg_gfx::context::clear_view(enc, view, 1.0);
+                ov.draw(&h.queue, enc, view, &op)
+            });
+            let Ok(white) = white else {
+                failures.push("panel: white-backdrop render failed".into());
+                continue;
+            };
+            let mut worst = (f32::MAX, 0u32, 0u32);
+            for (i, t) in draw.tiles[..draw.count].iter().enumerate() {
+                let [lx, ly, lw, lh] = t.label.map(|v| v as u32);
+                if lw == 0 {
+                    continue;
+                }
+                let l =
+                    |x: u32, y: u32| f32::from(white[((y * res.0 + x) * 4 + 1) as usize]) / 255.0;
+                let row_ink = |y: u32| (lx..lx + lw).map(|x| l(x, y)).fold(0.0f32, f32::max);
+                let top = (ly..ly + lh).map(row_ink).fold(0.0f32, f32::max);
+                for y in ly..ly + lh {
+                    let ink = row_ink(y);
+                    if ink < 0.95 * top.max(0.6) {
+                        continue; // not a glyph row
+                    }
+                    let c = (ink + 0.05) / (l(lx + 1, y) + 0.05);
+                    if c < worst.0 {
+                        worst = (c, i as u32, y - ly);
+                    }
+                }
+            }
+            println!(
+                "PANEL white backdrop: worst glyph-row contrast {:.2}:1 (tile {}, row {} of the bitmap)",
+                worst.0, worst.1, worst.2
+            );
+            if worst.0 < 4.5 {
+                failures.push(format!(
+                    "panel: glyph extremes over white {:.2}:1 < 4.5:1",
+                    worst.0
+                ));
+            }
+        }
         if draw.caption[2] <= 0.0 {
             failures.push(format!(
                 "panel {tag}: no \"Representative previews\" caption"

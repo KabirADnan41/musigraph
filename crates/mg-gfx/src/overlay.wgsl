@@ -400,7 +400,7 @@ fn centred(c: vec2<f32>, sz: vec2<f32>) -> vec4<f32> {
 // A soft dark plate behind a label so white text keeps its contrast over any scene (pale ones included).
 fn label_plate(dst: vec4<f32>, p: vec2<f32>, rect: vec4<f32>, s: f32, al: f32) -> vec4<f32> {
     if (rect.z <= 0.0) { return dst; }
-    let half = 0.5 * rect.zw + vec2<f32>(6.0 * s, 1.0 * s);
+    let half = 0.5 * rect.zw + vec2<f32>(6.0 * s, 6.0 * s);
     let d = sd_round_box(p - rect.xy - 0.5 * rect.zw, half, min(half.y, 8.0 * s));
     return over(dst, vec3<f32>(0.0), PLATE_ALPHA * al * (1.0 - smoothstep(-6.0 * s, 3.0 * s, d)));
 }

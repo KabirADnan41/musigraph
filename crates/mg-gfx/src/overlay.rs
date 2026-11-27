@@ -1430,6 +1430,13 @@ mod tests {
                 ("label", (90, 183), (73, 183)),
                 ("heading", (40, 213), (23, 213)),
                 ("caption", (40, 238), (23, 238)),
+                // glyph extremes: the very first and last bitmap rows (ink touching the bitmap edge)
+                ("label top row", (90, 175), (73, 175)),
+                ("label bottom row", (90, 190), (73, 190)),
+                ("heading top row", (40, 205), (23, 205)),
+                ("heading bottom row", (40, 220), (23, 220)),
+                ("caption top row", (40, 230), (23, 230)),
+                ("caption bottom row", (40, 245), (23, 245)),
             ] {
                 let (l_ink, l_bg) = (lum(&img, ink.0, ink.1), lum(&img, bg.0, bg.1));
                 let c = (l_ink + 0.05) / (l_bg + 0.05);
