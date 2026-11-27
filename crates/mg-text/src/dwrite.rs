@@ -38,11 +38,11 @@ const FALLBACK: PCWSTR = w!("Segoe UI");
 const VAR_DISPLAY: PCWSTR = w!("Segoe UI Variable Display");
 const VAR_TEXT: PCWSTR = w!("Segoe UI Variable Text");
 
-/// `name` if the system font collection has that family, else the Segoe UI fallback.
+/// `Some(name)` if the system font collection has that family, else `None` (the caller falls back to Segoe UI).
 ///
 /// # Safety
 /// `dw` must be a live factory; `name` a static NUL-terminated string.
-unsafe fn probe_family(dw: &IDWriteFactory, name: PCWSTR) -> PCWSTR {
+unsafe fn probe_family(dw: &IDWriteFactory, name: PCWSTR) -> Option<PCWSTR> {
     let mut coll: Option<IDWriteFontCollection> = None;
     let (mut idx, mut exists) = (0u32, BOOL(0));
     // SAFETY: out-pointers are locals that outlive the calls.
@@ -52,11 +52,7 @@ unsafe fn probe_family(dw: &IDWriteFactory, name: PCWSTR) -> PCWSTR {
                 .as_ref()
                 .is_some_and(|c| c.FindFamilyName(name, &mut idx, &mut exists).is_ok())
     };
-    if found && exists.as_bool() {
-        name
-    } else {
-        FALLBACK
-    }
+    (found && exists.as_bool()).then_some(name)
 }
 
 /// Uninitialises COM on drop; owned by `TextRenderer` as its last field so it runs after the interfaces.
@@ -78,6 +74,7 @@ pub struct TextRenderer {
     /// Resolved once at startup: Segoe UI Variable Display/Text, or Segoe UI where missing.
     display: PCWSTR,
     text: PCWSTR,
+    variable: bool,
     /// Declared last so COM is uninitialised only after every interface above has been released.
     _com: ComGuard,
 }
@@ -108,8 +105,8 @@ impl TextRenderer {
             (d2d, dwrite, wic)
         };
         // SAFETY: live factory, static names.
-        let (display, text) = if force_fallback {
-            (FALLBACK, FALLBACK)
+        let (vd, vt) = if force_fallback {
+            (None, None)
         } else {
             unsafe {
                 (
@@ -118,19 +115,23 @@ impl TextRenderer {
                 )
             }
         };
+        // a bool, not a pointer comparison: identical `w!` constants need not share an address in release builds
+        let variable = vd.is_some() && vt.is_some();
+        let (display, text) = (vd.unwrap_or(FALLBACK), vt.unwrap_or(FALLBACK));
         Some(Self {
             d2d,
             dwrite,
             wic,
             display,
             text,
+            variable,
             _com: guard,
         })
     }
 
     /// True when the Segoe UI Variable cuts were found (false = Segoe UI fallback, e.g. Windows 10).
     pub fn has_variable_cuts(&self) -> bool {
-        self.display != FALLBACK && self.text != FALLBACK
+        self.variable
     }
 
     /// Renders one line (or, with `max_lines > 1`, a wrapped block) of text. `None` for empty/whitespace-only
@@ -541,7 +542,16 @@ mod tests {
                     w(&var),
                     w(&fb)
                 );
-                assert!(w(&fb).is_some_and(|x| x > 0));
+                let (v, b) = (w(&var).unwrap() as f32, w(&fb).unwrap() as f32);
+                assert!(b > 0.0);
+                // the fallback must not change the composition: widths within 3% of the variable cuts (checked
+                // only when this machine has them; on a machine without them both renderers are the fallback)
+                if var.has_variable_cuts() {
+                    assert!(
+                        ((b - v) / v).abs() <= 0.03,
+                        "{s:?} {cut:?}: variable {v} fallback {b}"
+                    );
+                }
             }
         }
     }
