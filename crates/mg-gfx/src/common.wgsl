@@ -2,7 +2,7 @@
 // One uniform block for all scenes: the CPU mapper fills the common fields every frame and the
 // scene-specific ones (ex0..ex5); each scene reads only what it needs. Fluid reuses none of ex0, ex1, ex3.y, ex4, ex5 or c
 // (ex2 and ex3.xzw are the transition fx every scene shares): it
-// reads its own block `FU` at @group(1) (fluid.wgsl, packed by fluid::FluidParams), so a crossfade between Fluid
+// reads its own block `FU` at @group(1) (fluid.wgsl, packed by fluid::FluidParams), so a scene change between Fluid
 // and Aurora/Focus/Orb can never feed one scene the other's fields. Fluid reads res, time, mode and pal0..pal3 here.
 
 struct U {
@@ -102,7 +102,6 @@ fn mode_marker(col_in: vec3<f32>, frag: vec4<f32>, aspect: f32, line_y: f32) -> 
 // ex2 = veils 0 (visible) .. 1 (hidden): x atmosphere, y geometry, z particles, w global (scenes without separable
 // layers); ex3.x = bridge relative luminance, ex3.z = bridge breathing amplitude, ex3.w = iris strength. All zero:
 // every helper below returns its input unchanged, so a scene without a transition is bit-identical.
-fn keep_atmo() -> f32 { return 1.0 - u.ex2.x; }
 fn keep_geom() -> f32 { return 1.0 - u.ex2.y; }
 fn keep_part() -> f32 { return 1.0 - u.ex2.z; }
 
@@ -141,9 +140,14 @@ fn bridge_colour(fragxy: vec2<f32>) -> vec3<f32> {
     return rgb + vec3<f32>((hash21(fragxy) - 0.5) / 255.0);
 }
 
-// Layered scenes: their layers fade themselves, the rest of the picture follows the atmosphere veil to the bridge.
+// Layered scenes: geometry and particles fade themselves (keep_geom / keep_part); the rest of the picture follows the
+// MEAN of the three layer veils to the bridge. The atmosphere is not also dimmed, and following the mean (not the
+// atmosphere veil alone, which leads late on exit) makes the bridge take over as the bright layers vanish, so the
+// luminance path is a straight lerp instead of a dip.
+fn layers_veil() -> f32 { return (u.ex2.x + u.ex2.y + u.ex2.z) / 3.0; }
+
 fn veil_layers(c: vec3<f32>, fragxy: vec2<f32>) -> vec3<f32> {
-    let v = clamp(u.ex2.x, 0.0, 1.0);
+    let v = clamp(layers_veil(), 0.0, 1.0);
     if (v <= 0.0) { return c; }
     return mix(c, bridge_colour(fragxy), v);
 }

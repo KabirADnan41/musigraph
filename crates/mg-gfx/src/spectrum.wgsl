@@ -71,7 +71,7 @@ fn dust_layer(p: vec2<f32>, aspect: f32, cell: f32, phase: f32, lanes: f32, dens
 
 @fragment
 fn fs(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
-    if (u.ex2.x >= 1.0) { return vec4<f32>(bridge_colour(frag.xy), 1.0); }
+    if (layers_veil() >= 1.0) { return vec4<f32>(bridge_colour(frag.xy), 1.0); }
     let aspect = u.res.x / u.res.y;
     var p = frag.xy / u.res;                       // 0..1, y down
     let t = u.time;
@@ -106,7 +106,6 @@ fn fs(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
     let onset_lift = max(u.c.y * exp(-u.c.x / 0.35), u.c.w * exp(-u.c.z / 0.35));
     col += mix(u.pal2.rgb, vec3<f32>(1.0), 0.45) * (1.0 - smoothstep(0.0008, 0.0026, abs(p.y - yh))) * (0.30 * breathe + 1.6 * onset_lift);
     col += u.pal2.rgb * exp(-abs(p.y - yh) * 70.0) * 0.10 * (0.5 + glow);
-    col *= keep_atmo();
 
     // ---- spectrum above the horizon -----------------------------------------------------------
     let d_up = yh - p.y;

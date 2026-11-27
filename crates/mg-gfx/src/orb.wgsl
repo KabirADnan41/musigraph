@@ -77,7 +77,7 @@ fn orb_normal(p: vec3<f32>) -> vec3<f32> {
 
 @fragment
 fn fs(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
-    if (u.ex2.x >= 1.0) { return vec4<f32>(bridge_colour(frag.xy), 1.0); }
+    if (layers_veil() >= 1.0) { return vec4<f32>(bridge_colour(frag.xy), 1.0); }
     let aspect = u.res.x / u.res.y;
     let p = frag.xy / u.res;
     let t = u.time;
@@ -99,7 +99,6 @@ fn fs(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
     var col = mix(u.pal0.rgb, u.pal1.rgb * 0.30, wash) * 0.6 * (0.35 + 0.65 * haze);
     col += u.pal1.rgb * exp(-max(r - 1.0, 0.0) * 1.5) * (0.07 + 0.10 * glow + 0.14 * breath) * (0.5 + 0.5 * u.energy);
     col += u.pal3.rgb * exp(-r * 0.7) * 0.05 * (0.5 + 0.5 * u.energy);
-    col *= keep_atmo();
 
     // ray vs. bounding sphere (radius 1.2), then <= 24 sphere-tracing steps inside it
     let ro = vec3<f32>(0.0, 0.0, -4.0);

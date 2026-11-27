@@ -792,7 +792,7 @@ impl App {
         }
     }
 
-    /// What the panel decided: a selection is a scene request (the crossfade and its latest-wins rule live in
+    /// What the panel decided: a selection is a scene request (the transition and its latest-wins rule live in
     /// `SceneSwitch`); a manual choice restarts the tour timer like the keys do.
     fn on_panel_event(&mut self, ev: PanelEvent) {
         if let PanelEvent::Select(k) = ev {
@@ -1064,7 +1064,7 @@ impl App {
                     // track data is recorded) plus the event-loop wait before this frame.
                     if interval > HITCH_MS && self.hitches.len() < 24 {
                         self.hitches.push(format!(
-                            "HITCH t={:.1}s interval={interval:.0}ms prev: poll+jobs={p_poll:.1} gpu_ops={p_ops:.1} render={p_render:.1} xfade={p_xfade}",
+                            "HITCH t={:.1}s interval={interval:.0}ms prev: poll+jobs={p_poll:.1} gpu_ops={p_ops:.1} render={p_render:.1} transition={p_xfade}",
                             self.start.elapsed().as_secs_f64(),
                         ));
                     }

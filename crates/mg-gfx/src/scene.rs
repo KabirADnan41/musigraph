@@ -761,7 +761,11 @@ impl SceneSet {
         scene: SceneKind,
     ) {
         if scene == SceneKind::Fluid {
-            self.fluid.advance(device, queue, res, &p.fluid, p.time);
+            // fully veiled (the bridge) and already allocated: nothing of the field is visible, so do not step it
+            let hidden = p.fx.veil[3] >= 1.0 && self.fluid.grid().is_some();
+            if !hidden {
+                self.fluid.advance(device, queue, res, &p.fluid, p.time);
+            }
         } else {
             self.fluid.release();
         }
@@ -1503,6 +1507,67 @@ mod tests {
             lum(&flat, 140, 180, 70, 110) > lum(&flat, 0, 40, 0, 40) * 0.9,
             "radial lift, no hole"
         );
+        // the bridge on saturated, white and black palettes: Y stays near the requested luminance (radial lift and
+        // gamut clip included), never black, never bright
+        let pals: [(&str, [[f32; 3]; 4]); 4] = [
+            ("white", [[1.0; 3]; 4]),
+            ("black", [[0.0; 3]; 4]),
+            (
+                "red/blue",
+                [
+                    [1.0, 0.0, 0.0],
+                    [1.0, 0.0, 0.0],
+                    [0.0, 0.0, 1.0],
+                    [0.0, 0.0, 1.0],
+                ],
+            ),
+            (
+                "green/yellow",
+                [
+                    [0.0, 1.0, 0.0],
+                    [0.0, 1.0, 0.0],
+                    [1.0, 1.0, 0.0],
+                    [1.0, 1.0, 0.0],
+                ],
+            ),
+        ];
+        for (name, palette) in pals {
+            for luma in [0.04f32, 0.16, 0.25] {
+                let p = SceneParams {
+                    palette,
+                    fx: Fx {
+                        veil: [1.0; 4],
+                        bridge_luma: luma,
+                        ..Fx::default()
+                    },
+                    ..base.clone()
+                };
+                let img = scene
+                    .render_offscreen_scenes(
+                        &h.device,
+                        &h.queue,
+                        res,
+                        &p,
+                        SceneKind::Orb,
+                        &|_, _| {},
+                    )
+                    .unwrap();
+                let y = img
+                    .chunks_exact(4)
+                    .map(|q| {
+                        0.2126 * f32::from(q[0])
+                            + 0.7152 * f32::from(q[1])
+                            + 0.0722 * f32::from(q[2])
+                    })
+                    .sum::<f32>()
+                    / (img.len() / 4) as f32
+                    / 255.0;
+                assert!(
+                    y >= luma * 0.7 && y <= luma * 1.45 + 0.01,
+                    "{name} bridge Y {y:.4} for requested {luma} (lift +6% L, gamut clip)"
+                );
+            }
+        }
         for k in SceneKind::ALL {
             let idle = render(k, Fx::default());
             // veils at zero with the other fields set: the scene is untouched (early outs and exact multiplies)
@@ -1532,7 +1597,6 @@ mod tests {
         // layered scenes: one layer's veil removes only that layer; monolithic scenes ignore the layer veils
         for k in [SceneKind::Spectrum, SceneKind::Aurora, SceneKind::Orb] {
             let idle = render(k, Fx::default());
-            let l_all = lum(&idle, 0, res.0, 0, res.1);
             let geom = render(
                 k,
                 Fx {
@@ -1541,9 +1605,17 @@ mod tests {
                     ..Fx::default()
                 },
             );
+            let part = render(
+                k,
+                Fx {
+                    veil: [0.0, 0.0, 1.0, 0.0],
+                    bridge_luma: 0.16,
+                    ..Fx::default()
+                },
+            );
             assert!(
-                geom != idle && lum(&geom, 0, res.0, 0, res.1) < l_all,
-                "{k:?}: geometry veil removes the bars/ribbons/body"
+                geom != idle && part != idle && geom != part,
+                "{k:?}: the geometry and particle veils remove different layers"
             );
             let atmo = render(
                 k,
@@ -1753,7 +1825,7 @@ mod tests {
             / x.len() as f64
     }
 
-    /// Orb checks share the crossfade test's device: parallel headless devices can run out of GPU memory.
+    /// Orb checks share the scene tests's device: parallel headless devices can run out of GPU memory.
     fn orb_is_a_lit_sphere_that_answers_to_bass_treble_and_onsets(
         h: &crate::context::Headless,
         scene: &SceneSet,

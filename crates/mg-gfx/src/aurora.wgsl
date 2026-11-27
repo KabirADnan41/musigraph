@@ -31,7 +31,7 @@ fn ribbon(i: i32, xw: f32, p: vec2<f32>, glow: f32, swell: f32) -> vec3<f32> {
 
 @fragment
 fn fs(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
-    if (u.ex2.x >= 1.0) { return vec4<f32>(bridge_colour(frag.xy), 1.0); }
+    if (layers_veil() >= 1.0) { return vec4<f32>(bridge_colour(frag.xy), 1.0); }
     let aspect = u.res.x / u.res.y;
     let p = frag.xy / u.res;                    // 0..1, y down
     let t = u.time;
@@ -41,7 +41,7 @@ fn fs(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
     let scroll = vec2<f32>(u.b.y, u.b.z);
 
     // night sky: dark, tinted by the album palette
-    var col = u.pal0.rgb * mix(0.03, 0.20, smoothstep(0.1, 0.9, p.y)) * keep_atmo();
+    var col = u.pal0.rgb * mix(0.03, 0.20, smoothstep(0.1, 0.9, p.y));
 
     // one shared domain warp bends all ribbons together
     let w = fbm(vec2<f32>(p.x * aspect * 1.2, p.y * 0.6) + scroll) - 0.5;

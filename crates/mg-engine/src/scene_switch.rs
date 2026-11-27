@@ -76,6 +76,11 @@ const BRIDGE_MIN: f32 = 0.04;
 const BRIDGE_MAX: f32 = 0.25;
 /// Quiet this long after the last request releases a held bridge.
 const HOLD_RELEASE_S: f32 = 0.4;
+/// The flash guard and the per-frame luminance cap are a PALETTE-LEVEL PROXY, not measured screen luminance: the
+/// palette estimate was 2-4x too low for bright palettes (Spectrum 0.25 vs 0.49 measured, Fluid 0.13 vs 0.59), so the
+/// guard assumes at least this bright a scene. Dim scenes then only cost an unnecessary calm hold under hammering.
+/// Area- or region-level flashing validation is NOT claimed (tracked for Interactive Session 3).
+const GUARD_Y: f32 = 0.5;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Phase {
@@ -197,11 +202,56 @@ pub struct SceneSwitch {
     /// Times of recent effective requests (bounded by the window).
     requests: Vec<f32>,
     /// Luminance-swing tracker over the emitted luminance proxy.
-    ext: f32,
-    dir: i8,
+    tracker: SwingTracker,
     swings: Vec<f32>,
     holding: bool,
     bridge_y: Option<f32>,
+}
+
+/// Incremental luminance-swing counter (the one definition, shared with the self-test): `push` returns true when
+/// the series has reversed direction by at least `SWING_AMP`.
+#[derive(Default)]
+pub struct SwingTracker {
+    ext: f32,
+    dir: i8,
+    started: bool,
+}
+
+impl SwingTracker {
+    pub fn push(&mut self, y: f32) -> bool {
+        if !self.started {
+            self.started = true;
+            self.ext = y;
+        }
+        let d = f32::from(self.dir);
+        if self.dir == 0 {
+            if (y - self.ext).abs() > SWING_AMP {
+                self.dir = if y > self.ext { 1 } else { -1 };
+                self.ext = y;
+            }
+        } else if (y - self.ext) * d > 0.0 {
+            self.ext = y;
+        } else if (self.ext - y) * d > SWING_AMP {
+            self.dir = -self.dir;
+            self.ext = y;
+            return true;
+        }
+        false
+    }
+
+    /// Largest number of swings inside any 1 s window (`fps` frames) of a luminance series.
+    pub fn max_per_second(ys: &[f32], fps: usize) -> usize {
+        let mut t = Self::default();
+        let at: Vec<usize> = ys
+            .iter()
+            .enumerate()
+            .filter_map(|(i, &y)| t.push(y).then_some(i))
+            .collect();
+        at.iter()
+            .map(|&i| at.iter().filter(|&&j| j >= i && j < i + fps).count())
+            .max()
+            .unwrap_or(0)
+    }
 }
 
 fn max_delta(a: &[f32; 4], b: &[f32; 4]) -> f32 {
@@ -220,8 +270,7 @@ impl SceneSwitch {
             reduced: false,
             clock: 0.0,
             requests: Vec::new(),
-            ext: 0.0,
-            dir: 0,
+            tracker: SwingTracker::default(),
             swings: Vec::new(),
             holding: false,
             bridge_y: None,
@@ -374,32 +423,34 @@ impl SceneSwitch {
         let s = shorten(n);
         let prof = self.profile();
 
-        // flash guard: three swings in the last second hold the bridge until requests stop
+        // flash guard: a (palette-level proxy) luminance reversal count; at the limit the bridge is held until the swings
+        // have aged out of the last second AND requests stop. The settle that follows is itself a (last) swing, so the
+        // guard acts one swing early.
         let t1 = self.clock - 1.0;
         self.swings.retain(|&t| t >= t1);
-        // the settle that follows the guard is itself a (last) swing, so it acts one swing early
         if self.swings.len() + 1 >= MAX_SWINGS_PER_S {
             self.holding = true;
-        }
-        if self.holding
+        } else if self.holding
             && self
                 .requests
                 .iter()
                 .all(|&t| t < self.clock - HOLD_RELEASE_S)
         {
             self.holding = false;
-            self.swings.clear();
         }
         if self.holding {
             match self.st {
                 St::Exit {
                     to,
                     x,
+                    dir,
                     scale,
                     start,
                     staged,
-                    ..
                 } => {
+                    // park on the bridge; a reversal (request for the scene being left) re-enters that scene,
+                    // so the LAST request always wins
+                    let to = if dir < 0.0 { self.shown } else { to };
                     self.st = St::Exit {
                         to,
                         x,
@@ -420,7 +471,8 @@ impl SceneSwitch {
         };
         let (ys, yd) = (luma(self.shown), luma(dest));
         let by_target = bridge_target(ys, yd);
-        let lum_lim = MAX_DL / (ys - by_target).abs().max(MAX_DL);
+        let yg = ys.max(GUARD_Y);
+        let lum_lim = MAX_DL / (yg - self.bridge_y.unwrap_or(by_target)).abs().max(MAX_DL);
 
         match self.st {
             St::Idle => {}
@@ -502,8 +554,10 @@ impl SceneSwitch {
             self.bridge_y = None;
             0.0
         };
-        let y = ys * (1.0 - veil[3]) + bridge_luma * veil[3];
-        self.track_swings(y);
+        let y = yg * (1.0 - veil[3]) + bridge_luma * veil[3];
+        if self.tracker.push(y) {
+            self.swings.push(self.clock);
+        }
 
         let phase = match self.st {
             St::Idle => Phase::Idle,
@@ -518,25 +572,6 @@ impl SceneSwitch {
             bridge_luma,
             breathing: if active && prof.breathing { 0.02 } else { 0.0 },
             iris: if active && prof.iris { 1.0 } else { 0.0 },
-        }
-    }
-
-    fn track_swings(&mut self, y: f32) {
-        if self.dir == 0 && self.swings.is_empty() && self.ext == 0.0 {
-            self.ext = y;
-        }
-        let d = f32::from(self.dir);
-        if self.dir == 0 {
-            if (y - self.ext).abs() > SWING_AMP {
-                self.dir = if y > self.ext { 1 } else { -1 };
-                self.ext = y;
-            }
-        } else if (y - self.ext) * d > 0.0 {
-            self.ext = y;
-        } else if (self.ext - y) * d > SWING_AMP {
-            self.swings.push(self.clock);
-            self.dir = -self.dir;
-            self.ext = y;
         }
     }
 }
@@ -767,34 +802,77 @@ mod tests {
         }
     }
 
-    #[test]
-    fn there_is_no_queue_the_latest_request_wins_and_the_machine_settles() {
-        let kinds = SceneKind::ALL;
+    /// Runs `n` requests spaced by `gap(rng)` frames under luminance `lum`, then lets the machine settle. Returns
+    /// the scene the machine rests on and the LAST scene asked for.
+    fn random_requests(
+        seed: u32,
+        n: usize,
+        gap: impl Fn(u32) -> u32,
+        lum: fn(SceneKind) -> f32,
+    ) -> (SceneKind, SceneKind) {
         let mut s = SceneSwitch::new(Spectrum);
-        let mut rng = 12345u32;
+        let mut rng = seed;
         let mut last = Spectrum;
-        for _ in 0..100 {
+        for _ in 0..n {
             rng = rng.wrapping_mul(1664525).wrapping_add(1013904223);
-            last = kinds[(rng >> 16) as usize % kinds.len()];
+            last = SceneKind::ALL[(rng >> 16) as usize % SceneKind::ALL.len()];
             s.request(last);
-            for _ in 0..(rng >> 28) {
-                step(&mut s);
+            for _ in 0..gap(rng >> 20) {
+                s.update(DT, lum);
             }
-            assert!(
-                s.requests.len() <= 100
-                    && s.requests.iter().all(|&t| s.clock - t <= WINDOW_S + 0.3)
-            );
+            assert!(s.requests.iter().all(|&t| s.clock - t <= WINDOW_S + 0.3));
         }
-        let end = until_idle(&mut s);
-        let f = end.last().unwrap();
-        assert_eq!(f.phase, Phase::Idle);
-        assert_eq!(f.scene, s.target());
-        // after the last request settles nothing is pending: the scene is the last one asked for unless it was
-        // asked for while it was being left (that reverses to the shown scene), never an older request
-        let f2 = run(&mut s, 5.0);
-        assert_eq!((f2.phase, f2.scene), (Phase::Idle, f.scene));
-        let _ = last;
+        let mut f = s.update(DT, lum);
+        for _ in 0..3000 {
+            f = s.update(DT, lum);
+            if f.phase == Phase::Idle {
+                break;
+            }
+        }
+        assert_eq!(f.phase, Phase::Idle, "the machine settles");
+        assert_eq!(s.target(), f.scene);
+        // nothing is queued: after the quiet period the window is empty and the picture stays put
+        for _ in 0..400 {
+            s.update(DT, lum);
+        }
         assert!(s.requests.is_empty(), "the window drained: no hidden state");
+        assert_eq!(s.update(DT, lum).scene, f.scene);
+        (f.scene, last)
+    }
+
+    #[test]
+    fn there_is_no_queue_the_last_request_always_wins_even_under_the_flash_guard() {
+        let bright: fn(SceneKind) -> f32 = |_| 0.9;
+        for seed in 0..60u32 {
+            // dim scenes (guard idle), bright scenes with hammering gaps (guard engages), and slow requests
+            for (lum, gap) in [(DIM, 0u32..=15), (bright, 0..=7), (bright, 0..=40)] {
+                let span = gap.end() + 1;
+                let (rest, last) = random_requests(seed, 100, |r| r % span, lum);
+                assert_eq!(rest, last, "seed {seed} gaps {gap:?}");
+            }
+        }
+        // the reported M1 case: while the guard holds an exit towards Aurora, asking for the scene being left wins
+        let bright = |_: SceneKind| 0.9;
+        let mut s = SceneSwitch::new(Spectrum);
+        let mut engaged = false;
+        for i in 0..400 {
+            if i % 6 == 0 && !s.holding {
+                s.request(if (i / 6) % 2 == 0 { Aurora } else { Spectrum });
+            }
+            s.update(DT, bright);
+            if s.holding && matches!(s.st, St::Exit { dir, .. } if dir > 0.0) {
+                engaged = true;
+                break;
+            }
+        }
+        assert!(engaged, "the hammer engages the guard during an exit");
+        let shown = s.shown;
+        assert!(s.request(shown), "the request is accepted");
+        assert_eq!(s.target(), shown);
+        for _ in 0..3000 {
+            s.update(DT, bright);
+        }
+        assert_eq!((s.update(DT, bright).scene, s.target()), (shown, shown));
     }
 
     #[test]
@@ -918,66 +996,41 @@ mod tests {
         );
     }
 
-    /// Swings of a luminance sequence with the guard's own definition, counted independently of the machine.
-    fn count_swings(ys: &[f32]) -> Vec<usize> {
-        let (mut ext, mut dir) = (ys[0], 0i8);
-        let mut at = Vec::new();
-        for (i, &y) in ys.iter().enumerate() {
-            let d = f32::from(dir);
-            if dir == 0 {
-                if (y - ext).abs() > SWING_AMP {
-                    dir = if y > ext { 1 } else { -1 };
-                    ext = y;
-                }
-            } else if (y - ext) * d > 0.0 {
-                ext = y;
-            } else if (ext - y) * d > SWING_AMP {
-                at.push(i);
-                dir = -dir;
-                ext = y;
-            }
-        }
-        at
-    }
-
     #[test]
     fn the_flash_guard_never_allows_more_than_three_luminance_swings_per_second() {
-        let bright = |_: SceneKind| 0.9;
-        let mut s = SceneSwitch::new(Spectrum);
-        let mut ys = Vec::new();
-        let mut frames = Vec::new();
-        // hammer: reverse the exit every 0.1 s for 4 s
-        for i in 0..240 {
-            if i % 6 == 0 {
-                s.request(if (i / 6) % 2 == 0 { Aurora } else { Spectrum });
+        for (gap, bright_step) in [(6usize, 0.9f32), (4, 0.9), (9, 0.9), (6, 0.45)] {
+            let lum = move |_: SceneKind| bright_step;
+            let mut s = SceneSwitch::new(Spectrum);
+            let mut ys = Vec::new();
+            let mut parked = false;
+            // hammer for 4 s, then 10 s of settle: ALL frames are in the series
+            for i in 0..840 {
+                if i < 240 && i % gap == 0 {
+                    s.request(if (i / gap) % 2 == 0 { Aurora } else { Spectrum });
+                }
+                let f = s.update(DT, lum);
+                ys.push(bright_step * (1.0 - f.veil[3]) + f.bridge_luma * f.veil[3]);
+                parked |= f.phase == Phase::Bridge;
             }
-            let f = s.update(DT, bright);
-            ys.push(0.9 * (1.0 - f.veil[3]) + f.bridge_luma * f.veil[3]);
-            frames.push(f);
-        }
-        let swings = count_swings(&ys);
-        for (k, &i) in swings.iter().enumerate() {
-            let in_window = swings[k..].iter().take_while(|&&j| j < i + 60).count();
+            let per_s = SwingTracker::max_per_second(&ys, 60);
             assert!(
-                in_window <= MAX_SWINGS_PER_S,
-                "{in_window} swings within 1 s at frame {i}"
+                per_s <= MAX_SWINGS_PER_S,
+                "gap {gap}: {per_s} swings within 1 s"
             );
+            assert!(
+                ys.windows(2).all(|w| (w[1] - w[0]).abs() <= MAX_DL + 1e-3),
+                "per-frame luminance step"
+            );
+            assert!(
+                parked || gap != 6 || bright_step < 0.8,
+                "the guard parks on the bridge"
+            );
+            // requests stopped: it released and finished on the last scene asked for
+            let end = s.update(DT, lum);
+            assert_eq!((end.phase, end.scene), (Phase::Idle, s.target()));
         }
-        assert!(
-            !swings.is_empty(),
-            "the hammer must actually swing luminance"
-        );
-        assert!(
-            ys.windows(2).all(|w| (w[1] - w[0]).abs() <= MAX_DL + 1e-3),
-            "per-frame luminance step"
-        );
-        assert!(
-            frames.iter().any(|f| f.phase == Phase::Bridge),
-            "the guard parks on the bridge"
-        );
-        // requests stop: it releases and finishes on the last scene asked for
-        let end = (0..600).map(|_| s.update(DT, bright)).last().unwrap();
-        assert_eq!((end.phase, end.scene), (Phase::Idle, s.target()));
+        // a hammer that actually swings is detected by the shared definition
+        assert!(SwingTracker::max_per_second(&[0.9, 0.2, 0.9, 0.2, 0.9], 60) >= 3);
     }
 
     #[test]

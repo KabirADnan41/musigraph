@@ -5,7 +5,7 @@
 //! transition, 200 random transitions leave GPU memory flat, and `MG_SCENE_DUMP=<dir>` writes filmstrip PNGs.
 //! Luminance is the mean RELATIVE luminance of the raw (linear) headless target, the quantity WCAG 2.3.1 uses.
 
-use crate::scene_switch::{FULL, Frame, Phase, SceneSwitch, scene_luma};
+use crate::scene_switch::{FULL, Frame, Phase, SceneSwitch, SwingTracker, scene_luma};
 use crate::selftest::{headless, srgb_view};
 use mg_gfx::context::{Headless, allocated_bytes};
 use mg_gfx::overlay::{Overlay, OverlayParams};
@@ -49,27 +49,6 @@ fn mad(a: &[u8], b: &[u8]) -> f64 {
         .map(|(x, y)| f64::from(x.abs_diff(*y)))
         .sum::<f64>()
         / a.len() as f64
-}
-
-/// Swing indices of a luminance series: reversals of at least `amp` (same definition as the switch's guard).
-fn swings(ys: &[f32], amp: f32) -> Vec<usize> {
-    let (mut ext, mut dir, mut at) = (ys[0], 0i8, Vec::new());
-    for (i, &y) in ys.iter().enumerate() {
-        let d = f32::from(dir);
-        if dir == 0 {
-            if (y - ext).abs() > amp {
-                dir = if y > ext { 1 } else { -1 };
-                ext = y;
-            }
-        } else if (y - ext) * d > 0.0 {
-            ext = y;
-        } else if (ext - y) * d > amp {
-            at.push(i);
-            dir = -dir;
-            ext = y;
-        }
-    }
-    at
 }
 
 struct Ctx<'a> {
@@ -129,12 +108,18 @@ struct Run {
     lifecycle_ok: bool,
 }
 
-fn run_pair(c: &mut Ctx, from: SceneKind, to: SceneKind, pace: Pace) -> Option<Run> {
+/// `animate`: advance `p.time` every frame (breathing, dust and the Fluid steps move); otherwise time is frozen so
+/// first/last frames can be compared pixel for pixel with the idle references.
+fn run_pair(c: &mut Ctx, from: SceneKind, to: SceneKind, pace: Pace, animate: bool) -> Option<Run> {
     let mut s = switch_for(from, to, pace);
     let pal = c.p.palette;
+    let t0 = c.p.time;
     let (mut frames, mut imgs, mut lifecycle_ok) = (Vec::new(), Vec::new(), true);
     for _ in 0..600 {
         let f = s.update(DT, |k| scene_luma(k, &pal));
+        if animate {
+            c.p.time += DT;
+        }
         imgs.push(c.render(f.scene, f.fx(), None)?);
         lifecycle_ok &= c.lifecycle_ok(f.scene);
         frames.push(f);
@@ -142,6 +127,7 @@ fn run_pair(c: &mut Ctx, from: SceneKind, to: SceneKind, pace: Pace) -> Option<R
             break;
         }
     }
+    c.p.time = t0;
     Some(Run {
         frames,
         imgs,
@@ -168,162 +154,267 @@ fn dump_strip(dir: &str, name: &str, run: &Run) {
     let _ = std::fs::write(format!("{dir}/transition-{name}.png"), png);
 }
 
+/// Palette scenarios: the guard and the bridge only know the PALETTE-level luminance estimate (`scene_luma`), not
+/// the measured screen luminance, so bright, dark and white-cover cases are measured against it too.
+struct Scenario {
+    name: &'static str,
+    palette: Option<[[f32; 3]; 4]>,
+    white_cover: bool,
+}
+
+const BRIGHT: [[f32; 3]; 4] = [
+    [0.9, 0.9, 0.95],
+    [0.85, 0.85, 0.9],
+    [1.0, 1.0, 1.0],
+    [0.8, 0.85, 0.9],
+];
+
+const SCENARIOS: [Scenario; 4] = [
+    Scenario {
+        name: "demo",
+        palette: None,
+        white_cover: false,
+    },
+    Scenario {
+        name: "bright",
+        palette: Some(BRIGHT),
+        white_cover: false,
+    },
+    Scenario {
+        name: "dark",
+        palette: Some([
+            [0.01, 0.02, 0.04],
+            [0.02, 0.04, 0.08],
+            [0.08, 0.1, 0.15],
+            [0.04, 0.06, 0.1],
+        ]),
+        white_cover: false,
+    },
+    Scenario {
+        name: "white-cover",
+        palette: Some(BRIGHT),
+        white_cover: true,
+    },
+];
+
 /// Returns whether a GPU was available.
 pub fn transition_checks(failures: &mut Vec<String>) -> bool {
     let Ok(h) = headless() else { return false };
     let x = crate::sim::fixture("demo", 48_000).expect("demo fixture");
     let ticks = crate::sim::Sim::new(48_000, 60.0, crate::scene_map::MapTuning::default())
         .run(&x[..x.len().min(48_000 * 12)]);
-    let mut p = ticks.last().expect("ticks").params.clone();
-    p.mode = SceneMode::Live;
+    let mut base = ticks.last().expect("ticks").params.clone();
+    base.mode = SceneMode::Live;
     let mut c = Ctx {
         h: &h,
         scene: SceneSet::new_headless(&h.device),
-        p,
+        p: base.clone(),
     };
-    let dump = std::env::var("MG_SCENE_DUMP").ok();
+    println!(
+        "TRANSITION note: the flash guard and bridge luminance use a PALETTE-level proxy (scene_luma), not measured screen luminance; the checks below measure the real rendered luminance"
+    );
+    for sc in &SCENARIOS {
+        c.p = base.clone();
+        if let Some(pal) = sc.palette {
+            c.p.palette = pal;
+        }
+        if sc.white_cover {
+            c.scene.set_focus_art(
+                &h.queue,
+                Some(mg_gfx::scene::ArtLight {
+                    grid: [[1.0; 3]; mg_gfx::scene::ART_GRID * mg_gfx::scene::ART_GRID],
+                    mean: [1.0; 3],
+                    mean_y: 1.0,
+                }),
+            );
+            c.p.album.art_w = [1.0, 0.0];
+            c.p.album.rect = [0.9, 0.5, 0.2, 0.2];
+            c.p.album.spill = 1.0;
+        }
+        scenario_checks(&mut c, sc, failures);
+        if sc.white_cover {
+            c.scene.set_focus_art(&h.queue, None);
+        }
+    }
+    c.p = base;
+    overlay_check(&mut c, failures);
+    timing_report(&mut c);
+    true
+}
+
+fn scenario_checks(c: &mut Ctx, sc: &Scenario, failures: &mut Vec<String>) {
+    let dump = if sc.name == "demo" {
+        std::env::var("MG_SCENE_DUMP").ok()
+    } else {
+        None
+    };
     // idle frame and luminance of every scene (the reference for first/last frames and the bridge bounds)
     let mut idle = Vec::new();
     for k in SceneKind::ALL {
         let Some(img) = c.render(k, Default::default(), None) else {
-            failures.push(format!("transition: idle render of {k:?} failed"));
-            return true;
+            failures.push(format!(
+                "transition {}: idle render of {k:?} failed",
+                sc.name
+            ));
+            return;
         };
         println!(
-            "TRANSITION idle {k:?}: measured Y={:.4} (palette estimate {:.4})",
+            "TRANSITION [{}] idle {k:?}: measured Y={:.4} (palette estimate {:.4})",
+            sc.name,
             y_of(&img),
             scene_luma(k, &c.p.palette)
         );
         idle.push(img);
     }
-    let mut worst = (0.0f32, 0.0f32);
-    let mut count = 0;
-    for pace in [Pace::Quick, Pace::Full, Pace::Reduced] {
-        for from in SceneKind::ALL {
-            for to in SceneKind::ALL {
-                if from == to {
-                    continue;
-                }
-                let name = format!("{from:?}->{to:?}/{pace:?}");
-                let Some(r) = run_pair(&mut c, from, to, pace) else {
-                    failures.push(format!("transition {name}: render failed"));
-                    continue;
-                };
-                count += 1;
-                let ys: Vec<f32> = r.imgs.iter().map(|i| y_of(i)).collect();
-                let (ysrc, ydst) = (y_of(&idle[from.index()]), y_of(&idle[to.index()]));
-                let min_y = ys.iter().copied().fold(f32::MAX, f32::min);
-                let max_dl = ys
-                    .windows(2)
-                    .map(|w| (w[1] - w[0]).abs())
-                    .fold(0.0, f32::max);
-                let sw = swings(&ys, 0.1);
-                let per_s = sw
-                    .iter()
-                    .map(|&i| sw.iter().filter(|&&j| j >= i && j < i + 60).count())
-                    .max()
-                    .unwrap_or(0);
-                let floor = 0.5 * ysrc.min(ydst).min(0.04);
-                let first = mad(&r.imgs[0], &idle[from.index()]);
-                let last_f = r.frames.last().expect("frames");
-                let last = r.imgs.last().expect("imgs");
-                let ref_last = c
-                    .render(last_f.scene, Default::default(), None)
-                    .unwrap_or_default();
-                let flat = r
-                    .frames
-                    .iter()
-                    .zip(&r.imgs)
-                    .filter(|(f, _)| f.phase == Phase::Bridge)
-                    .map(|(_, i)| y_std(i))
-                    .fold(0.0, f32::max);
-                let bridge_y = r
-                    .frames
-                    .iter()
-                    .zip(&ys)
-                    .filter(|(f, _)| f.phase == Phase::Bridge)
-                    .map(|(_, &y)| y)
-                    .fold(0.0, f32::max);
-                worst = (worst.0.max(max_dl), worst.1.max(per_s as f32));
-                let secs = r.frames.len() as f32 * DT;
-                let mut bad = Vec::new();
-                if r.frames.last().map(|f| f.phase) != Some(Phase::Idle) || last_f.scene != to {
-                    bad.push("did not end idle on the destination".to_string());
-                }
-                if min_y.is_nan() || min_y < floor {
-                    bad.push(format!("blank frame: min Y {min_y:.4} < {floor:.4}"));
-                }
-                if max_dl > 0.105 {
-                    bad.push(format!("per-frame luminance step {max_dl:.3} > 0.1"));
-                }
-                if per_s > 3 {
-                    bad.push(format!("{per_s} luminance swings within 1 s"));
-                }
-                if first > 1.5 {
-                    bad.push(format!(
-                        "first frame differs from the source idle frame (mad {first:.2})"
-                    ));
-                }
-                if mad(last, &ref_last) != 0.0 || last_f.fx() != Default::default() {
-                    bad.push("last frame is not the destination idle frame".into());
-                }
-                if flat > 0.06 {
-                    bad.push(format!(
-                        "bridge frame not flat (std {flat:.3}): scene content leaks"
-                    ));
-                }
-                if bridge_y > (1.25 * ysrc.min(ydst)).max(0.06) {
-                    bad.push(format!(
-                        "bridge Y {bridge_y:.3} brighter than the scenes ({ysrc:.3}, {ydst:.3})"
-                    ));
-                }
-                if !r.lifecycle_ok {
-                    bad.push("a heavy scene's resources were held while it was not drawn".into());
-                }
-                if pace == Pace::Reduced
-                    && r.frames.iter().any(|f| {
-                        f.iris != 0.0
-                            || f.breathing != 0.0
-                            || f.veil.iter().any(|&v| v != f.veil[0])
-                    })
-                {
-                    bad.push("reduced motion used stagger, iris or breathing".into());
-                }
-                for b in &bad {
-                    failures.push(format!("transition {name}: {b}"));
-                }
-                if let (Some(dir), true) = (
-                    &dump,
-                    matches!(
-                        (from, to, pace),
-                        (SceneKind::Spectrum, SceneKind::Orb, Pace::Quick)
-                            | (SceneKind::Focus, SceneKind::Fluid, Pace::Quick)
-                            | (SceneKind::Aurora, SceneKind::Spectrum, Pace::Full)
-                            | (SceneKind::Orb, SceneKind::Focus, Pace::Reduced)
-                    ),
-                ) {
-                    dump_strip(dir, &name.replace(['>', '/'], "-").to_lowercase(), &r);
-                }
-                if matches!(
-                    (from, to),
-                    (SceneKind::Spectrum, SceneKind::Orb) | (SceneKind::Focus, SceneKind::Fluid)
-                ) {
-                    println!(
-                        "TRANSITION {name}: {secs:.2}s min_Y={min_y:.3} max_dY={max_dl:.3} swings/s={per_s} bridge_Y={bridge_y:.3} bridge_std={flat:.3} first_mad={first:.2} {}",
-                        if bad.is_empty() { "ok" } else { "FAILED" }
+    let (mut worst_dl, mut worst_sw, mut worst_dip, mut count) = (0.0f32, 0usize, 0.0f32, 0);
+    for animate in [false, true] {
+        // the animated variant (time advances, FULL breathes, Fluid steps) only for the demo scenario
+        if animate && sc.name != "demo" {
+            continue;
+        }
+        for pace in [Pace::Quick, Pace::Full, Pace::Reduced] {
+            for from in SceneKind::ALL {
+                for to in SceneKind::ALL {
+                    if from == to {
+                        continue;
+                    }
+                    let name = format!(
+                        "[{}{}] {from:?}->{to:?}/{pace:?}",
+                        sc.name,
+                        if animate { " animated" } else { "" }
                     );
+                    let Some(r) = run_pair(c, from, to, pace, animate) else {
+                        failures.push(format!("transition {name}: render failed"));
+                        continue;
+                    };
+                    count += 1;
+                    let ys: Vec<f32> = r.imgs.iter().map(|i| y_of(i)).collect();
+                    let (ysrc, ydst) = (y_of(&idle[from.index()]), y_of(&idle[to.index()]));
+                    let min_y = ys.iter().copied().fold(f32::MAX, f32::min);
+                    let max_dl = ys
+                        .windows(2)
+                        .map(|w| (w[1] - w[0]).abs())
+                        .fold(0.0, f32::max);
+                    let per_s = SwingTracker::max_per_second(&ys, 60);
+                    let floor = 0.5 * ysrc.min(ydst).min(0.04);
+                    let last_f = r.frames.last().expect("frames");
+                    let bridge_ys: Vec<f32> = r
+                        .frames
+                        .iter()
+                        .zip(&ys)
+                        .filter(|(f, _)| f.phase == Phase::Bridge)
+                        .map(|(_, &y)| y)
+                        .collect();
+                    let bridge_y = bridge_ys.iter().copied().fold(0.0, f32::max);
+                    let bridge_min = bridge_ys.iter().copied().fold(f32::MAX, f32::min);
+                    // the path never dips below the lowest of the two scenes and the bridge (one straight lerp)
+                    let dip = ysrc.min(ydst).min(bridge_min) - min_y;
+                    let flat = r
+                        .frames
+                        .iter()
+                        .zip(&r.imgs)
+                        .filter(|(f, _)| f.phase == Phase::Bridge)
+                        .map(|(_, i)| y_std(i))
+                        .fold(0.0, f32::max);
+                    worst_dl = worst_dl.max(max_dl);
+                    worst_sw = worst_sw.max(per_s);
+                    worst_dip = worst_dip.max(dip);
+                    let secs = r.frames.len() as f32 * DT;
+                    let mut bad = Vec::new();
+                    if last_f.phase != Phase::Idle
+                        || last_f.scene != to
+                        || last_f.fx() != Default::default()
+                    {
+                        bad.push("did not end idle on the destination with zero fx".to_string());
+                    }
+                    if min_y.is_nan() || min_y < floor {
+                        bad.push(format!("blank frame: min Y {min_y:.4} < {floor:.4}"));
+                    }
+                    if dip > 0.02 {
+                        bad.push(format!(
+                            "luminance dipped {dip:.3} below the scenes and the bridge"
+                        ));
+                    }
+                    if max_dl > 0.105 {
+                        bad.push(format!("per-frame luminance step {max_dl:.3} > 0.1"));
+                    }
+                    if per_s > 3 {
+                        bad.push(format!("{per_s} luminance swings within 1 s"));
+                    }
+                    if !animate {
+                        let first = mad(&r.imgs[0], &idle[from.index()]);
+                        let tol = if to == SceneKind::Fluid { 3.0 } else { 0.5 };
+                        let last = mad(r.imgs.last().expect("imgs"), &idle[to.index()]);
+                        if first > 1.5 {
+                            bad.push(format!(
+                                "first frame differs from the source idle frame (mad {first:.2})"
+                            ));
+                        }
+                        if last > tol {
+                            bad.push(format!(
+                                "last frame differs from the destination idle frame (mad {last:.2})"
+                            ));
+                        }
+                    }
+                    if flat > 0.06 {
+                        bad.push(format!(
+                            "bridge frame not flat (std {flat:.3}): scene content leaks"
+                        ));
+                    }
+                    if !bridge_ys.is_empty() && bridge_y > (1.25 * ysrc.min(ydst)).max(0.06) {
+                        bad.push(format!(
+                            "bridge Y {bridge_y:.3} brighter than the scenes ({ysrc:.3}, {ydst:.3})"
+                        ));
+                    }
+                    if !r.lifecycle_ok {
+                        bad.push("a heavy scene held resources while it was not drawn".into());
+                    }
+                    if pace == Pace::Reduced
+                        && r.frames.iter().any(|f| {
+                            f.iris != 0.0
+                                || f.breathing != 0.0
+                                || f.veil.iter().any(|&v| v != f.veil[0])
+                        })
+                    {
+                        bad.push("reduced motion used stagger, iris or breathing".into());
+                    }
+                    for b in &bad {
+                        failures.push(format!("transition {name}: {b}"));
+                    }
+                    if let (Some(dir), false, true) = (
+                        &dump,
+                        animate,
+                        matches!(
+                            (from, to, pace),
+                            (SceneKind::Spectrum, SceneKind::Orb, Pace::Quick)
+                                | (SceneKind::Focus, SceneKind::Fluid, Pace::Quick)
+                                | (SceneKind::Aurora, SceneKind::Spectrum, Pace::Full)
+                                | (SceneKind::Orb, SceneKind::Focus, Pace::Reduced)
+                        ),
+                    ) {
+                        let file = name.replace(['>', '/', '[', ']', ' '], "-").to_lowercase();
+                        dump_strip(dir, &file, &r);
+                    }
+                    if matches!(
+                        (from, to),
+                        (SceneKind::Spectrum, SceneKind::Orb)
+                            | (SceneKind::Focus, SceneKind::Fluid)
+                    ) {
+                        println!(
+                            "TRANSITION {name}: {secs:.2}s min_Y={min_y:.3} max_dY={max_dl:.3} swings/s={per_s} bridge_Y={bridge_y:.3} dip={dip:.3} bridge_std={flat:.3} {}",
+                            if bad.is_empty() { "ok" } else { "FAILED" }
+                        );
+                    }
                 }
             }
         }
     }
     println!(
-        "TRANSITION {count} pair runs: worst per-frame dY {:.3}, worst swings/s {}",
-        worst.0, worst.1
+        "TRANSITION [{}] {count} pair runs: worst per-frame dY {worst_dl:.3}, worst swings/s {worst_sw}, worst dip below scenes/bridge {worst_dip:.3}",
+        sc.name
     );
-    overlay_check(&mut c, failures);
-    churn_check(&mut c, failures);
-    timing_report(&mut c);
-    true
+    let floor = 0.5 * idle.iter().map(|i| y_of(i)).fold(0.04f32, f32::min);
+    churn_check(c, sc.name, floor, failures);
 }
 
 /// The overlay is drawn after the scene and never fades: strong overlay pixels (icons, text) over every frame of a
@@ -446,37 +537,82 @@ fn settled_bytes(c: &mut Ctx, s: &mut SceneSwitch) -> Option<u64> {
     allocated_bytes(&c.h.device)
 }
 
-fn churn_check(c: &mut Ctx, failures: &mut Vec<String>) {
+/// Random transitions at random moments (retargets, reversals, holds) with the rendered luminance MEASURED every
+/// frame: per-frame step, swings per second and blank frames are judged on the real pixels, plus the drawn-scene
+/// lifecycle and allocator bytes at rest before/after (backends that do not report them say so).
+fn churn_check(c: &mut Ctx, tag: &str, floor: f32, failures: &mut Vec<String>) {
     let mut s = SceneSwitch::new(SceneKind::Spectrum);
     let pal = c.p.palette;
-    let (mut rng, mut frames, mut bad, mut warm) = (99u32, 0u32, 0u32, None);
-    for i in 0..240 {
+    let (mut rng, mut bad, mut warm) = (99u32, 0u32, None);
+    let mut ys = Vec::new();
+    let mut tags = Vec::new();
+    // 240 requests: spaced 3..34 frames; the last 100 hammer every 5..8 frames
+    for i in 0..340 {
         if i == 40 {
             // the first 40 requests warm the allocator pools; growth is judged after that
             warm = settled_bytes(c, &mut s);
+            ys.clear();
+            tags.clear();
         }
         rng = rng.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
         s.request(SceneKind::ALL[(rng >> 16) as usize % SceneKind::ALL.len()]);
-        for _ in 0..(3 + (rng >> 27)) {
+        let gap = if i < 240 {
+            3 + (rng >> 27)
+        } else {
+            5 + (rng >> 30)
+        };
+        for _ in 0..gap {
             let f = s.update(DT, |k| scene_luma(k, &pal));
-            if c.render(f.scene, f.fx(), None).is_none() || !c.lifecycle_ok(f.scene) {
+            c.p.time += DT;
+            match c.render(f.scene, f.fx(), None) {
+                Some(img) => {
+                    ys.push(y_of(&img));
+                    tags.push((f.phase, f.scene));
+                }
+                None => bad += 1,
+            }
+            if !c.lifecycle_ok(f.scene) {
                 bad += 1;
             }
-            frames += 1;
         }
     }
     let now = settled_bytes(c, &mut s);
+    let max_dl = ys
+        .windows(2)
+        .map(|w| (w[1] - w[0]).abs())
+        .fold(0.0, f32::max);
+    let per_s = SwingTracker::max_per_second(&ys, 60);
+    let worst_at = (1..ys.len())
+        .max_by(|&a, &b| {
+            (ys[a] - ys[a - 1])
+                .abs()
+                .total_cmp(&(ys[b] - ys[b - 1]).abs())
+        })
+        .map(|i| (tags[i - 1], tags[i]));
+    let min_y = ys.iter().copied().fold(f32::MAX, f32::min);
+    let mem = match (warm, now) {
+        (Some(w), Some(n)) => format!("GPU allocator bytes at rest {w} -> {n}"),
+        _ => "allocator bytes not reported on this backend".to_string(),
+    };
     println!(
-        "TRANSITION churn: 240 requests ({frames} frames, 200 after warm-up), bad frames {bad}, GPU allocator bytes at rest {warm:?} -> {now:?}"
+        "TRANSITION [{tag}] churn: {} measured frames of 300 requests (240 random + 100 hammer, 40 warm-up), render/lifecycle failures {bad}, min Y {min_y:.3} (floor {floor:.3}), max per-frame dY {max_dl:.3}, swings/s {per_s}, {mem}",
+        ys.len()
     );
     if bad > 0 {
         failures.push(format!(
-            "transition churn: {bad} frames failed to render or broke the lifecycle"
+            "transition churn [{tag}]: {bad} frames failed to render or broke the lifecycle"
+        ));
+    }
+    if max_dl > 0.105 || per_s > 3 || min_y < floor {
+        failures.push(format!(
+            "transition churn [{tag}]: measured luminance out of bounds (dY {max_dl:.3} at {worst_at:?}, swings/s {per_s}, min Y {min_y:.3} < {floor:.3})"
         ));
     }
     if let (Some(w), Some(n)) = (warm, now) {
         if n > w + w / 10 + (1 << 18) {
-            failures.push(format!("transition churn: GPU memory grew {w} -> {n}"));
+            failures.push(format!(
+                "transition churn [{tag}]: GPU memory grew {w} -> {n}"
+            ));
         }
     }
 }
