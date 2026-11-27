@@ -524,3 +524,26 @@ The mg-media test count there should read 33 for commit 3eb9341 (36 included 3 u
   - Contrast readback (check 1) not done; it needs the part-2 pocket.
 - **Deferred to part 2:** focus.wgsl environment (stars, glow, gap ring, no-cover look), art-colour binding, CPU mips and the blur bridge (hook wired, LOD 0), contrast pocket, GPU timing.
 - **Remains:** independent Sonnet High review (§27) of this diff; commit by the main session.
+
+## 2026-11-27 - LRCLIB bounded retry + remaster tolerance (Q-005) and Windows reduced-animation detection (Q-007)
+- **Branch:** feature/poc-audio-fullscreen (uncommitted). **Files:** `crates/mg-media/src/lrclib/{mod,client,tests}.rs`; `crates/mg-engine/{Cargo.toml,src/motion_pref.rs,src/main.rs}`, `Cargo.lock` (+1 edge line).
+- **Q-005a retry:** new `Outcome::Transient` (transport Timeout/Network, 5xx except 503). `Requester::on_outcome` gives Transient and RetryAfter ONE retry per track key per session (`retried` set, cleared on revoke): the existing backoff / Retry-After pause applies, `poll` still enforces the rate cap, retry only while the track is current and the generation matches; a second failure is final (`Outcome::Error`). 4xx, 404, redirects, Rejected, invalid/oversize and Cancelled are never retried. Behaviour change: 5xx/timeouts used to settle immediately as Error; the old unbounded RetryAfter loop is now bounded to one retry.
+- **Q-005b:** `distinguishing_words` = `version_words` minus "remaster"; used only in `judge`. `core_title` unchanged (year tokens still dropped in version segments). Live/remix/acoustic/edit/extended/mix stay strict. Title, artist, duration checks unchanged. **Q-005c:** no change; existing test pins "A, B" vs "A" rejected.
+- **Q-007:** `motion_pref::animations_enabled()` (SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION), read-only, one scoped unsafe with SAFETY comment) and pure `reduced_motion(dev_flag)`. mg-engine had NO `windows` dependency (brief said existing): added `[target.'cfg(windows)'.dependencies] windows =0.62.2` with only `Win32_UI_WindowsAndMessaging`; package set (`cargo tree -p mg-engine`) unchanged. `mod motion_pref;` carries `#[allow(dead_code)]` until scene_run polls it.
+- **Verification:** `cargo test -p mg-media` 89 passed; `cargo clippy -p mg-media --all-targets -D warnings` clean; `cargo test -p mg-engine motion_pref` 3 passed; rustfmt --check clean on own files. mg-engine clippy fails only in the other agent's presentation.rs/selftest.rs (doc lints). Not done: engine wiring, live OS-toggle check.
+
+## 2026-11-27 lyrics consent (pure module, not yet wired)
+- **Branch:** feature/poc-audio-fullscreen (uncommitted). **Files:** new `crates/mg-engine/src/lyrics_consent.rs`; `main.rs` +2 lines (`#[allow(dead_code)] mod lyrics_consent;`).
+- `Consent {Unasked,Granted,Declined}` (default Unasked); `allows_network()` true only for Granted. Persists only the token in `%APPDATA%\Musigraph\lyrics-consent.txt` (atomic temp+rename; missing/corrupt/oversize(>32B)/unknown => Unasked; no APPDATA => in-memory). Granted only via `Consent::grant()`/`grant_to`; revoke = `decline()`. `PROMPT` const is the verbatim owner text. No network, no new deps.
+- **Verification:** `cargo test -p mg-engine lyrics_consent` 7 passed; clippy: no lints in this file. Not done: UI prompt, gating of the LRCLIB client, independent review.
+
+## 2026-11-28 - Consent store: fail-closed revoke (main session, follow-up to 28c09d8)
+- Owner-requested verification found one gap: `decline_to` ignored a failed write, so a stale "granted" file could survive and restore consent at the next start.
+- Fix: a failed Declined write now deletes the stored file (a missing file loads as Unasked); `decline()/decline_to()` return `(Consent, durable)`, durable=false only if both fail (the UI must then warn). The existing assertion was updated to the new return type only.
+- Tests (9 pass): failed-write revoke removes the grant (RED before the fix: the grant persisted); normal revoke persists Declined. Verified already: default Unasked; corrupt/oversize/garbage/directory fail closed; temp-file+rename means a partial write never becomes the real file; only the tri-state token is stored; prompt verbatim; tests use F:\musigraph\temp, never APPDATA.
+- Remaining at integration: revocation must also cancel in-flight requests, invalidate responses and clear online lyrics (the client already supports this via its generation); local lyrics and offline visuals must be independent of consent.
+
+## 2026-11-27 OnlineLyricsGate (lyrics_consent.rs)
+- Branch feature/poc-audio-fullscreen. Added `OnlineLyricsGate` (persisted Consent + in-memory session_revoked), `RevokeResult`, `REVOKE_WARNING`, `online_allowed_for_source`; revoke disables in memory first, then persists via decline_to; durable=false yields a warning that claims session-only.
+- Tests (gate_tests, mock transport only, no network): unasked=0 calls, grant->1 lookup->Synced, revoke clears + no calls after track change, in-flight cancel, restart Declined, write-fail/delete-ok => Unasked, both fail => durable false + warning, local source unaffected.
+- Verified: cargo test -p mg-engine lyrics_consent (14 passed). Not yet wired into engine (main/scene code untouched).

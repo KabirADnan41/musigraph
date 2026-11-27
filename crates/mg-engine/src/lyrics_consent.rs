@@ -106,6 +106,64 @@ pub fn save_to(dir: &Path, c: Consent) -> io::Result<()> {
     res
 }
 
+/// Warning shown when a revocation could not be written or deleted on disk.
+pub const REVOKE_WARNING: &str = "Online lyrics are disabled for this session only: the revocation could not be saved. Consent may return at the next start unless the file lyrics-consent.txt is removed manually.";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RevokeResult {
+    pub durable: bool,
+    pub warning: Option<&'static str>,
+}
+
+/// Runtime gate for online lyrics: persisted consent plus an in-memory session revocation that wins even
+/// if persisting the revocation fails. The engine must consult `allows_network()` before every request and
+/// mirror changes into `LrclibClient::set_consent`. Local lyrics never consult it.
+#[derive(Clone, Copy, Debug)]
+pub struct OnlineLyricsGate {
+    consent: Consent,
+    session_revoked: bool,
+}
+
+impl OnlineLyricsGate {
+    /// Startup / restart: stored state only (a stored grant is honoured, nothing is asked).
+    pub fn from_dir(dir: &Path) -> Self {
+        Self {
+            consent: load_from(dir),
+            session_revoked: false,
+        }
+    }
+
+    pub fn consent(&self) -> Consent {
+        self.consent
+    }
+
+    pub fn allows_network(&self) -> bool {
+        self.consent.allows_network() && !self.session_revoked
+    }
+
+    /// Explicit user action only.
+    pub fn grant(&mut self, dir: Option<&Path>) {
+        self.consent = Consent::grant_to(dir);
+        self.session_revoked = false;
+    }
+
+    /// Disables retrieval at once (in memory first), then persists; never claims durability it lacks.
+    pub fn revoke(&mut self, dir: Option<&Path>) -> RevokeResult {
+        self.session_revoked = true;
+        self.consent = Consent::Declined;
+        let (_, durable) = Consent::decline_to(dir);
+        RevokeResult {
+            durable,
+            warning: (!durable).then_some(REVOKE_WARNING),
+        }
+    }
+}
+
+/// Only an online-sourced lyric load is gated; local lyrics are always allowed.
+pub fn online_allowed_for_source(local: bool, gate: &OnlineLyricsGate) -> bool {
+    local || gate.allows_network()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -241,5 +299,239 @@ mod revoke_tests {
         assert_eq!(Consent::decline_to(Some(&d)), (Consent::Declined, true));
         assert_eq!(load_from(&d), Consent::Declined);
         assert_eq!(Consent::decline_to(None), (Consent::Declined, true));
+    }
+}
+
+#[cfg(test)]
+mod gate_tests {
+    use super::*;
+    use mg_media::lrclib::{HttpResponse, LrclibClient, Outcome, Query, Transport, TransportError};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    const BODY: &str = r#"{"id":1,"trackName":"Synthetic Song","artistName":"Test Artist","albumName":"","duration":180,"instrumental":false,"plainLyrics":"la la la\nna na","syncedLyrics":"[00:01.00]la la la\n[00:03.50]na na"}"#;
+
+    #[derive(Clone, Default)]
+    struct Mock {
+        calls: Arc<Mutex<u32>>,
+        block: bool,
+        saw_cancel: Arc<AtomicBool>,
+        started: Arc<AtomicBool>,
+    }
+    impl Mock {
+        fn n(&self) -> u32 {
+            *self.calls.lock().unwrap()
+        }
+    }
+    impl Transport for Mock {
+        fn get(
+            &self,
+            _: &str,
+            cancelled: &dyn Fn() -> bool,
+        ) -> Result<HttpResponse, TransportError> {
+            *self.calls.lock().unwrap() += 1;
+            self.started.store(true, Ordering::Release);
+            if self.block {
+                let end = Instant::now() + Duration::from_secs(10);
+                while Instant::now() < end {
+                    if cancelled() {
+                        self.saw_cancel.store(true, Ordering::Release);
+                        return Err(TransportError::Cancelled);
+                    }
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                return Err(TransportError::Timeout);
+            }
+            Ok(HttpResponse {
+                status: 200,
+                retry_after: None,
+                body: BODY.as_bytes().to_vec(),
+            })
+        }
+    }
+
+    fn q(t: &str) -> Query {
+        Query::new(t, "Test Artist", "", Some(180.0)).unwrap()
+    }
+    fn tdir(name: &str) -> PathBuf {
+        let d =
+            PathBuf::from(r"F:\musigraph\temp").join(format!("lc-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+    fn wait_until(mut f: impl FnMut() -> bool) -> bool {
+        let end = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < end {
+            if f() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        false
+    }
+    fn client(m: &Mock) -> LrclibClient {
+        let m2 = m.clone();
+        LrclibClient::start(move || Some(m2)).unwrap()
+    }
+    /// One engine tick: the gate is mirrored into the client, as the engine must do.
+    fn tick(c: &mut LrclibClient, g: &OnlineLyricsGate, t: Instant, q: &Query) -> Option<Outcome> {
+        c.set_consent(g.allows_network());
+        c.update(t, Some(q)).cloned()
+    }
+
+    #[test]
+    fn full_lifecycle_grant_revoke_restart() {
+        let d = tdir("gate");
+        let m = Mock::default();
+        let mut c = client(&m);
+        let t0 = Instant::now();
+        let song = q("Synthetic Song");
+        let mut g = OnlineLyricsGate::from_dir(&d);
+        // (a) unasked: nothing leaves
+        assert_eq!(g.consent(), Consent::Unasked);
+        for i in 0..200u64 {
+            assert!(tick(&mut c, &g, t0 + Duration::from_millis(i * 50), &song).is_none());
+        }
+        std::thread::sleep(Duration::from_millis(30));
+        assert_eq!(m.n(), 0);
+        // (b) grant -> one lookup -> lyrics
+        g.grant(Some(&d));
+        assert!(g.allows_network());
+        let t1 = t0 + Duration::from_secs(20);
+        tick(&mut c, &g, t1, &song);
+        let t2 = t1 + Duration::from_secs(2);
+        assert!(wait_until(|| matches!(
+            tick(&mut c, &g, t2, &song),
+            Some(Outcome::Synced(_))
+        )));
+        assert_eq!(m.n(), 1);
+        // (c) revoke: immediate, lyrics cleared, no more calls even after a track change
+        let r = g.revoke(Some(&d));
+        assert_eq!(
+            r,
+            RevokeResult {
+                durable: true,
+                warning: None
+            }
+        );
+        assert!(!g.allows_network());
+        assert!(tick(&mut c, &g, t2, &song).is_none());
+        for k in 0..30u64 {
+            let other = q(&format!("Other {k}"));
+            assert!(tick(&mut c, &g, t2 + Duration::from_secs(10 * (k + 1)), &other).is_none());
+        }
+        std::thread::sleep(Duration::from_millis(30));
+        assert_eq!(m.n(), 1);
+        // (d) restart after durable revoke
+        let g2 = OnlineLyricsGate::from_dir(&d);
+        assert_eq!(g2.consent(), Consent::Declined);
+        assert!(!g2.allows_network());
+        let m3 = Mock::default();
+        let mut c3 = client(&m3);
+        for i in 0..100u64 {
+            assert!(tick(&mut c3, &g2, t0 + Duration::from_millis(i * 100), &song).is_none());
+        }
+        std::thread::sleep(Duration::from_millis(30));
+        assert_eq!(m3.n(), 0);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn revoke_cancels_an_in_flight_request() {
+        let d = tdir("gate-inflight");
+        let m = Mock {
+            block: true,
+            ..Mock::default()
+        };
+        let mut c = client(&m);
+        let mut g = OnlineLyricsGate::from_dir(&d);
+        g.grant(Some(&d));
+        let t0 = Instant::now();
+        let song = q("Synthetic Song");
+        tick(&mut c, &g, t0, &song);
+        tick(&mut c, &g, t0 + Duration::from_secs(2), &song);
+        assert!(wait_until(|| m.started.load(Ordering::Acquire)));
+        g.revoke(Some(&d));
+        assert!(tick(&mut c, &g, t0 + Duration::from_secs(3), &song).is_none());
+        assert!(wait_until(|| m.saw_cancel.load(Ordering::Acquire)));
+        assert_eq!(m.n(), 1);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn write_fails_but_delete_works_is_durable_and_restarts_unasked() {
+        let d = tdir("gate-del");
+        let mut g = OnlineLyricsGate::from_dir(&d);
+        g.grant(Some(&d));
+        std::fs::create_dir(d.join(format!("{FILE}.tmp"))).unwrap();
+        let r = g.revoke(Some(&d));
+        assert!(r.durable && r.warning.is_none());
+        assert!(!g.allows_network());
+        let g2 = OnlineLyricsGate::from_dir(&d);
+        assert_eq!(g2.consent(), Consent::Unasked);
+        let m = Mock::default();
+        let mut c = client(&m);
+        let t0 = Instant::now();
+        for i in 0..50u64 {
+            tick(
+                &mut c,
+                &g2,
+                t0 + Duration::from_secs(i * 3),
+                &q("Synthetic Song"),
+            );
+        }
+        std::thread::sleep(Duration::from_millis(30));
+        assert_eq!(m.n(), 0);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn write_and_delete_both_fail_disables_this_session_and_warns() {
+        let d = tdir("gate-fail");
+        let m = Mock::default();
+        let mut c = client(&m);
+        let mut g = OnlineLyricsGate::from_dir(&d);
+        g.grant(Some(&d));
+        // the target path becomes a non-empty directory: rename onto it and remove_file both fail
+        std::fs::remove_file(d.join(FILE)).unwrap();
+        std::fs::create_dir(d.join(FILE)).unwrap();
+        std::fs::write(d.join(FILE).join("x"), b"x").unwrap();
+        let r = g.revoke(Some(&d));
+        assert!(!r.durable);
+        let w = r.warning.expect("warning");
+        assert!(w.contains("this session only") && w.contains("could not be saved"));
+        assert!(!w.contains("permanently") && !w.contains("has been saved"));
+        assert!(!g.allows_network());
+        let t0 = Instant::now();
+        for i in 0..100u64 {
+            assert!(
+                tick(
+                    &mut c,
+                    &g,
+                    t0 + Duration::from_secs(i * 3),
+                    &q("Synthetic Song")
+                )
+                .is_none()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(30));
+        assert_eq!(m.n(), 0);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn gate_only_governs_online_sources() {
+        let d = tdir("gate-local");
+        let mut g = OnlineLyricsGate::from_dir(&d);
+        assert!(online_allowed_for_source(true, &g)); // local lyrics: always
+        assert!(!online_allowed_for_source(false, &g)); // online while unasked
+        g.grant(Some(&d));
+        assert!(online_allowed_for_source(false, &g));
+        g.revoke(Some(&d));
+        assert!(online_allowed_for_source(true, &g));
+        assert!(!online_allowed_for_source(false, &g));
+        let _ = std::fs::remove_dir_all(&d);
     }
 }
