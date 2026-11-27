@@ -759,11 +759,16 @@ impl ScenePanel {
     /// rewritten in place, nothing is created).
     fn want_labels(&mut self) {
         let key = label_key(self.lay.scale);
-        if self.labels_have != Some(key) && self.labels_asked != Some(key) {
-            self.labels_asked = Some(key);
-            self.jobs.push(Job::PanelLabels {
-                scale: self.lay.scale,
-            });
+        if self.labels_have != Some(key) {
+            // labels of another scale would be too big or too small for these tiles: show none until the
+            // right ones arrive (a few frames), rather than mis-sized text
+            self.label_dims = [(0.0, 0.0, 0.0); LABEL_CELLS];
+            if self.labels_asked != Some(key) {
+                self.labels_asked = Some(key);
+                self.jobs.push(Job::PanelLabels {
+                    scale: self.lay.scale,
+                });
+            }
         }
     }
 
@@ -780,6 +785,9 @@ impl ScenePanel {
         let Ready::PanelLabels { scale, cells } = r else {
             return;
         };
+        if label_key(scale) != label_key(self.lay.scale) {
+            return; // rendered for a scale the window no longer has: a newer job is on its way
+        }
         self.labels_have = Some(label_key(scale));
         for (d, c) in self.label_dims.iter_mut().zip(cells.iter()) {
             *d = c.as_ref().map_or((0.0, 0.0, 0.0), |b| {
@@ -1468,5 +1476,90 @@ mod tests {
             p.advance(1.0 / 60.0);
         }
         assert!(p.frame([0.5; 3]).is_none());
+    }
+
+    fn labels_at(scale: f32) -> Ready {
+        let Ready::PanelLabels { cells, .. } = fake_labels() else {
+            unreachable!()
+        };
+        Ready::PanelLabels { scale, cells }
+    }
+
+    #[test]
+    fn a_scale_change_never_shows_mis_sized_labels_and_stale_results_are_dropped() {
+        let mut p = ScenePanel::new();
+        p.set_view(HD, 1.0);
+        p.open(Spectrum, false);
+        p.take_jobs();
+        p.on_ready(labels_at(1.0));
+        for _ in 0..40 {
+            p.advance(1.0 / 60.0);
+        }
+        assert!(p.frame([0.5; 3]).unwrap().tiles[0].label[2] > 0.0);
+        // open panel, DPI / window change: the labels are hidden (not wrong-sized) and new ones requested
+        p.set_view(UHD, 1.0);
+        assert!(matches!(p.take_jobs()[..], [Job::PanelLabels { .. }]));
+        let d = p.frame([0.5; 3]).unwrap();
+        assert!(
+            d.tiles[..5].iter().all(|t| t.label[2] == 0.0),
+            "no stale labels"
+        );
+        assert_eq!(d.heading[2], 0.0);
+        // the tiles stay usable meanwhile: hit test and selection use the layout, not the labels
+        let t = p.layout().tiles[2];
+        assert_eq!(
+            p.click((t.label.x + 5.0, t.label.y + 3.0)),
+            PanelEvent::Select(Orb)
+        );
+        // a result for the old scale arriving late is dropped; the right one restores the labels
+        p.take_ops();
+        p.on_ready(labels_at(1.0));
+        assert!(
+            p.take_ops()
+                .iter()
+                .all(|o| !matches!(o, GpuOp::SetPanelLabels(_)))
+        );
+        assert!(p.frame([0.5; 3]).unwrap().tiles[0].label[2] == 0.0);
+        p.on_ready(labels_at(2.0));
+        assert!(p.frame([0.5; 3]).unwrap().tiles[0].label[2] > 0.0);
+        // closed panel: the change is picked up when it opens
+        p.close();
+        for _ in 0..20 {
+            p.advance(1.0 / 60.0);
+        }
+        p.set_view(HD, 1.0);
+        assert!(p.take_jobs().is_empty(), "closed: nothing asked yet");
+        p.open(Spectrum, false);
+        assert!(matches!(p.take_jobs()[..], [Job::PanelLabels { .. }]));
+    }
+
+    #[test]
+    fn the_selector_works_without_any_thumbnail_or_label() {
+        // injected failure: generation produced nothing (e.g. an error-scoped GPU failure) and no text renderer
+        let mut p = ScenePanel::new();
+        p.set_view(HD, 1.0);
+        p.on_thumbs(Thumbs::default());
+        p.open(Spectrum, true);
+        for _ in 0..40 {
+            p.advance(1.0 / 60.0);
+        }
+        let d = p.frame([0.5; 3]).expect("drawn");
+        assert!(
+            d.tiles[..5]
+                .iter()
+                .all(|t| !t.has_thumb && t.label[2] == 0.0 && t.alpha == 1.0)
+        );
+        // navigate, select, escape: all still work
+        p.key(PanelKey::Tab);
+        p.key(PanelKey::Down);
+        assert_eq!(p.key(PanelKey::Enter), PanelEvent::Select(Fluid));
+        p.open(Fluid, true);
+        assert_eq!(p.key(PanelKey::Escape), PanelEvent::Close);
+        let t = p.layout().tiles[0];
+        p.open(Fluid, false);
+        assert_eq!(
+            p.click((t.rect.x + 3.0, t.rect.y + 3.0)),
+            PanelEvent::Select(Spectrum)
+        );
     }
 }

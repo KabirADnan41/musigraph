@@ -128,7 +128,6 @@ pub struct Headless {
 /// resource limit of the machine, not a defect to hide, so the devices are serialised instead.
 static HEADLESS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-
 /// Runs `f` inside Validation and OutOfMemory error scopes: an error raised by its GPU work comes back as `Err`
 /// instead of reaching the uncaptured-error handler (which ends the app). Blocks only to read the scope results.
 pub fn with_error_scope<T>(device: &Device, f: impl FnOnce() -> T) -> Result<T, String> {
@@ -142,7 +141,6 @@ pub fn with_error_scope<T>(device: &Device, f: impl FnOnce() -> T) -> Result<T, 
     }
 }
 
-
 /// Waits (at most 10 s) until the GPU finished everything submitted so far, so dropped resources are freed.
 /// For startup work only: never call it from the frame loop.
 pub fn wait_idle(device: &Device) {
@@ -150,6 +148,25 @@ pub fn wait_idle(device: &Device) {
         submission_index: None,
         timeout: Some(std::time::Duration::from_secs(10)),
     });
+}
+
+/// Test hook: provokes a wgpu validation error (a zero-sized texture), to prove an error scope catches it.
+#[doc(hidden)]
+pub fn invalid_texture(device: &Device) -> wgpu::Texture {
+    device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("invalid on purpose"),
+        size: wgpu::Extent3d {
+            width: 0,
+            height: 1,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    })
 }
 /// Live GPU allocations in bytes where the backend reports them (diagnostics and tests).
 pub fn allocated_bytes(device: &Device) -> Option<u64> {

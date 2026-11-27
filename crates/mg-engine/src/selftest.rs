@@ -1229,6 +1229,33 @@ fn panel_previews(failures: &mut Vec<String>) -> bool {
             }
             Err(_) => failures.push(format!("panel {tag}: placeholder render failed")),
         }
+        // rendered contrast of the real (DirectWrite) labels: the brightest ink pixel against the plate pixel in the
+        // label's own transparent margin, WCAG ratio on the linear target (the Orb sphere sits behind two labels)
+        let mut worst = f32::MAX;
+        for (i, t) in draw.tiles[..draw.count].iter().enumerate() {
+            if t.label[2] <= 0.0 {
+                continue;
+            }
+            let [lx, ly, lw, lh] = t.label.map(|v| v as u32);
+            let l = |x: u32, y: u32| {
+                let o = ((y.min(res.1 - 1) * res.0 + x.min(res.0 - 1)) * 4) as usize;
+                (0.2126 * f32::from(img[o])
+                    + 0.7152 * f32::from(img[o + 1])
+                    + 0.0722 * f32::from(img[o + 2]))
+                    / 255.0
+            };
+            let ink = (ly..ly + lh)
+                .flat_map(|y| (lx..lx + lw).map(move |x| (x, y)))
+                .map(|(x, y)| l(x, y))
+                .fold(0.0f32, f32::max);
+            let plate = l(lx + 1, ly + lh / 2);
+            let c = (ink + 0.05) / (plate + 0.05);
+            worst = worst.min(c);
+            if c < 4.5 {
+                failures.push(format!("panel {tag}: label {i} contrast {c:.2}:1 < 4.5:1"));
+            }
+        }
+        println!("PANEL {tag}: worst rendered 15 px label contrast {worst:.2}:1");
         if draw.caption[2] <= 0.0 {
             failures.push(format!(
                 "panel {tag}: no \"Representative previews\" caption"

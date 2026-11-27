@@ -125,13 +125,33 @@ enum EscRoute {
     App,
 }
 
-fn route_esc(panel_open: bool, panel_visible: bool, held_after_close: bool) -> EscRoute {
+/// `repeat` is the OS auto-repeat flag; `held_after_close` is true from the press that closed the panel until that
+/// key is released. A NEW press (not a repeat, not held) always reaches the app, even during the fade-out.
+fn route_esc(
+    panel_open: bool,
+    panel_visible: bool,
+    repeat: bool,
+    held_after_close: bool,
+) -> EscRoute {
     if panel_open {
         EscRoute::Panel
-    } else if panel_visible || held_after_close {
+    } else if held_after_close || (repeat && panel_visible) {
         EscRoute::Swallow
     } else {
         EscRoute::App
+    }
+}
+
+/// The `--auto-scenes` tour clock, pure so it can be tested with a fake clock: while the panel is up the timer is
+/// reset to `now` every frame (nothing is due, nothing accumulates), so closing it neither switches at once nor
+/// catches up. Returns (new last-switch time, a switch is due).
+fn tour_step(last: Instant, now: Instant, every_s: u64, panel_up: bool) -> (Instant, bool) {
+    if panel_up {
+        (now, false)
+    } else if now.duration_since(last).as_secs() >= every_s {
+        (now, true)
+    } else {
+        (last, false)
     }
 }
 
@@ -691,7 +711,12 @@ impl App {
         self.ctl.key_activity();
         self.keyboard_input = true;
         if code == KeyCode::Escape {
-            match route_esc(self.panel.is_open(), self.panel.visible(), self.esc_held) {
+            match route_esc(
+                self.panel.is_open(),
+                self.panel.visible(),
+                repeat,
+                self.esc_held,
+            ) {
                 EscRoute::Panel => {
                     self.esc_held = true;
                     let ev = self.panel.key(PanelKey::Escape);
@@ -948,12 +973,10 @@ impl App {
         // layout), the cover weights and the text pocket; the mapper owns the music fields.
         self.pres.merge_focus(&mut params.album);
         params.album.bar = bar_vis;
-        if self.panel.visible() {
-            self.last_auto_switch = now; // no tour while the panel is up, and no instant jump when it closes
-        }
         if let Some(every) = self.opts.auto_scenes {
-            if now.duration_since(self.last_auto_switch).as_secs() >= every {
-                self.last_auto_switch = now;
+            let (last, due) = tour_step(self.last_auto_switch, now, every, self.panel.visible());
+            self.last_auto_switch = last;
+            if due {
                 self.switch.request(self.switch.target().next());
             }
         }
@@ -1353,18 +1376,82 @@ mod tests {
     }
 
     #[test]
-    fn esc_never_exits_the_app_while_the_panel_is_up_or_its_closing_key_is_still_held() {
+    fn esc_distinguishes_the_press_that_closed_the_panel_from_a_new_press() {
         // open: Esc closes the panel, nothing else
-        assert_eq!(route_esc(true, true, false), EscRoute::Panel);
-        // the second Esc during the 150 ms fade, and the auto-repeat of the closing Esc after it, are swallowed
-        assert_eq!(route_esc(false, true, true), EscRoute::Swallow);
-        assert_eq!(route_esc(false, true, false), EscRoute::Swallow);
-        assert_eq!(route_esc(false, false, true), EscRoute::Swallow);
-        // panel gone and the key released: Esc exits as before
-        assert_eq!(route_esc(false, false, false), EscRoute::App);
+        assert_eq!(route_esc(true, true, false, false), EscRoute::Panel);
+        // the closing press is held: its auto-repeat (during or after the fade) never exits
+        assert_eq!(route_esc(false, true, true, true), EscRoute::Swallow);
+        assert_eq!(route_esc(false, false, true, true), EscRoute::Swallow);
+        // a repeat during the fade without the held flag is swallowed too
+        assert_eq!(route_esc(false, true, true, false), EscRoute::Swallow);
+        // a NEW press (not a repeat, key released) exits as before, also while the panel still fades
+        assert_eq!(route_esc(false, false, false, false), EscRoute::App);
+        assert_eq!(route_esc(false, true, false, false), EscRoute::App);
         assert_eq!(
             key_action(KeyCode::Escape, ModifiersState::empty(), false),
             Some(KeyAction::Exit)
+        );
+        // sequence: press (closes), repeats (swallowed), release, new press (exits)
+        let mut held = false;
+        let mut routes = Vec::new();
+        for (open, visible, repeat, release) in [
+            (true, true, false, false),
+            (false, true, true, false),
+            (false, false, true, false),
+            (false, false, false, true),
+            (false, false, false, false),
+        ] {
+            if release {
+                held = false;
+                continue;
+            }
+            let r = route_esc(open, visible, repeat, held);
+            if r == EscRoute::Panel {
+                held = true;
+            }
+            routes.push(r);
+        }
+        assert_eq!(
+            routes,
+            [
+                EscRoute::Panel,
+                EscRoute::Swallow,
+                EscRoute::Swallow,
+                EscRoute::App
+            ]
+        );
+    }
+
+    #[test]
+    fn the_auto_tour_never_runs_or_catches_up_while_or_after_the_panel_is_open() {
+        let t0 = Instant::now();
+        let at = |s: u64| t0 + Duration::from_secs(s);
+        assert_eq!(tour_step(t0, at(9), 10, false), (t0, false));
+        assert_eq!(tour_step(t0, at(10), 10, false), (at(10), true));
+        // 100 s with the panel up (60 fps): never due, the clock follows `now`
+        let mut last = t0;
+        let mut due_count = 0;
+        for f in 0..6000u64 {
+            let (l, d) = tour_step(last, t0 + Duration::from_millis(f * 1000 / 60), 10, true);
+            last = l;
+            due_count += u32::from(d);
+        }
+        assert_eq!(due_count, 0);
+        // the panel closes: no immediate switch and no burst; one switch per full period afterwards
+        let closed = t0 + Duration::from_millis(100_000);
+        let mut when = Vec::new();
+        for f in 0..(25 * 60u64) {
+            let now = closed + Duration::from_millis(f * 1000 / 60);
+            let (l, d) = tour_step(last, now, 10, false);
+            last = l;
+            if d {
+                when.push((now - closed).as_millis());
+            }
+        }
+        assert_eq!(when.len(), 2, "{when:?}");
+        assert!(
+            when[0] >= 9_900 && when[1] - when[0] >= 9_900,
+            "{when:?} ms after closing"
         );
     }
 

@@ -1369,6 +1369,80 @@ mod tests {
         }
     }
 
+    /// The contrast of the labels AS RENDERED: white text pixels against the plate pixels beside them, over bright,
+    /// pale, mid and dark backdrops (the render target is linear, so a byte / 255 is the relative luminance).
+    #[test]
+    fn panel_contrast_rendered_labels_headings_and_caption_reach_4_5_to_1_headless() {
+        let Ok(h) = init_headless() else {
+            eprintln!("SKIPPED (no hardware GPU)");
+            return;
+        };
+        let res = (640u32, 360u32);
+        let scene = SceneSet::new_headless(&h.device);
+        let mut ov = Overlay::new_headless(&h.device, &h.queue);
+        // an "ink" bitmap: transparent margins 10 px left and right, full coverage between (like glyph strokes)
+        let cov: Vec<u8> = (0..16)
+            .flat_map(|_| (0..40).map(|x| if (10..30).contains(&x) { 255 } else { 0 }))
+            .collect();
+        for cell in 0..LABEL_CELLS {
+            assert!(ov.set_panel_label(&h.device, &h.queue, cell, (40, 16), &cov));
+        }
+        let mut d = panel_draw(1.0);
+        d.caption = [20.0, 230.0, 40.0, 16.0];
+        d.heading = [20.0, 205.0, 40.0, 16.0];
+        let p = SceneParams::default();
+        let lum = |img: &[u8], x: u32, y: u32| f32::from(px(img, res.0, x, y)[0]) / 255.0;
+        let mut worst = f32::MAX;
+        for back in [1.0f64, 0.8, 0.5, 0.0] {
+            let op = OverlayParams {
+                res,
+                panel: Some(d.clone()),
+                ..Default::default()
+            };
+            let img = scene
+                .render_offscreen_with(&h.device, &h.queue, res, &p, &|enc, view| {
+                    drop(enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("backdrop"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view,
+                            depth_slice: None,
+                            resolve_target: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Clear(wgpu::Color {
+                                    r: back,
+                                    g: back,
+                                    b: back,
+                                    a: 1.0,
+                                }),
+                                store: wgpu::StoreOp::Store,
+                            },
+                        })],
+                        depth_stencil_attachment: None,
+                        timestamp_writes: None,
+                        occlusion_query_set: None,
+                        multiview_mask: None,
+                    }));
+                    ov.draw(&h.queue, enc, view, &op)
+                })
+                .expect("render");
+            // (name, ink pixel, plate pixel beside it, the text opacity the shader uses)
+            for (name, ink, bg) in [
+                ("label", (90, 183), (73, 183)),
+                ("heading", (40, 213), (23, 213)),
+                ("caption", (40, 238), (23, 238)),
+            ] {
+                let (l_ink, l_bg) = (lum(&img, ink.0, ink.1), lum(&img, bg.0, bg.1));
+                let c = (l_ink + 0.05) / (l_bg + 0.05);
+                eprintln!(
+                    "rendered {name} contrast over backdrop {back}: {c:.2}:1 (ink {l_ink:.3}, plate {l_bg:.3})"
+                );
+                worst = worst.min(c);
+                assert!(c >= 4.5, "{name} over {back}: {c:.2}");
+            }
+        }
+        eprintln!("worst rendered label contrast: {worst:.2}:1");
+    }
+
     #[test]
     fn panel_pack_matches_wgsl_and_the_atlas_constants_are_shared() {
         let d = panel_draw(1.0);

@@ -155,7 +155,11 @@ pub fn generate(device: &Device, queue: &Queue) -> Thumbs {
 /// `generate` inside error scopes: a validation or out-of-memory error yields no thumbnails (placeholders)
 /// instead of reaching the app's fatal uncaptured-error handler.
 pub fn generate_guarded(device: &Device, queue: &Queue) -> Thumbs {
-    let r = mg_gfx::context::with_error_scope(device, || generate(device, queue));
+    guarded(device, || generate(device, queue))
+}
+
+fn guarded(device: &Device, work: impl FnOnce() -> Thumbs) -> Thumbs {
+    let r = mg_gfx::context::with_error_scope(device, work);
     mg_gfx::context::wait_idle(device); // the throwaway scene set is dropped: let the GPU free it now
     match r {
         Ok(t) => t,
@@ -181,6 +185,26 @@ mod tests {
             .sum::<f32>()
             / (img.len() / 4) as f32
             / 3.0
+    }
+
+    #[test]
+    fn a_gpu_error_during_generation_is_caught_and_yields_placeholders_not_an_app_exit() {
+        let Ok(h) = init_headless() else {
+            eprintln!("SKIPPED (no hardware GPU)");
+            return;
+        };
+        // inject a real wgpu validation error inside the generation work: a zero-sized texture
+        let t = guarded(&h.device, || {
+            let _ = mg_gfx::context::invalid_texture(&h.device);
+            generate(&h.device, &h.queue)
+        });
+        assert!(
+            t.iter().all(Option::is_none),
+            "the scoped error discards the thumbnails"
+        );
+        // and the device is still usable afterwards (nothing escaped to the fatal handler)
+        let ok = guarded(&h.device, || generate(&h.device, &h.queue));
+        assert!(ok.iter().all(Option::is_some));
     }
 
     #[test]
