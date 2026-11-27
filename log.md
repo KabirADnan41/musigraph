@@ -660,3 +660,9 @@ The mg-media test count there should read 33 for commit 3eb9341 (36 included 3 u
 - Pre-merge: independent Sonnet High publication security/privacy review PASS WITH SUGGESTIONS (4 LOW, tracked in BACKLOG as PR-L1..L4). No GitHub workflows configured (no GitHub checks).
 - Post-merge on 84fa3ad: scripts\verify.cmd VERIFY OK incl. release tests (audio 10, dsp 41, engine 193, gfx 38, media 93, text 8 in debug and release); release scene self-test ok on Vulkan, DX12, GL.
 - Next: feature/scene-selector (this branch).
+
+## 2026-11-28 - Scene selector S1: SceneKind label and panel groups
+- Branch feature/scene-selector. Files: crates/mg-gfx/src/scene.rs.
+- Changes: `SceneKind::label()`, `panel_main()` (= `selector()`), `panel_experimental()` (lifecycle Experimental, gated by `EXPERIMENTAL_SELECTABLE`, Q-010 placeholder = true). Selector, next/prev and --auto-scenes untouched.
+- Impact: none at runtime yet. Promoting a scene in `lifecycle()` moves it between groups automatically.
+- Verification (run): clippy -D warnings on mg-gfx clean; mg-gfx tests pass incl. new `panel_groups_derive_from_lifecycle_and_partition_all_scenes`.

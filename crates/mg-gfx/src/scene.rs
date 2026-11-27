@@ -464,6 +464,9 @@ pub enum Lifecycle {
     Accepted,
 }
 
+/// Q-010 placeholder (OWNER-QUESTIONS.md): whether Experimental scenes appear in the scene panel at all.
+pub const EXPERIMENTAL_SELECTABLE: bool = true;
+
 /// The visual styles. Each has its own composition and animation algorithm; all read the same `SceneParams`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SceneKind {
@@ -510,6 +513,30 @@ impl SceneKind {
 
     pub fn index(self) -> usize {
         self as usize
+    }
+
+    /// Display name for the scene panel (`name()` stays the CLI id).
+    pub fn label(self) -> &'static str {
+        match self {
+            SceneKind::Spectrum => "Spectrum",
+            SceneKind::Aurora => "Aurora",
+            SceneKind::Focus => "Focus",
+            SceneKind::Orb => "Orb",
+            SceneKind::Fluid => "Fluid",
+        }
+    }
+
+    /// The panel's main group: the selector scenes in declared order.
+    pub fn panel_main() -> impl Iterator<Item = SceneKind> {
+        Self::selector()
+    }
+
+    /// The panel's Experimental group; empty unless `EXPERIMENTAL_SELECTABLE`. Mouse and Enter only:
+    /// keys, cycling and `--auto-scenes` never reach these.
+    pub fn panel_experimental() -> impl Iterator<Item = SceneKind> {
+        Self::ALL
+            .into_iter()
+            .filter(|k| EXPERIMENTAL_SELECTABLE && k.lifecycle() == Lifecycle::Experimental)
     }
 
     /// Next selector scene (an experimental scene continues at the first selector scene).
@@ -1161,6 +1188,31 @@ mod tests {
             (y(above) - y(above_before)).abs() < 0.004,
             "the rest does not"
         );
+    }
+
+    #[test]
+    fn panel_groups_derive_from_lifecycle_and_partition_all_scenes() {
+        use SceneKind::*;
+        assert_eq!(
+            SceneKind::panel_main().collect::<Vec<_>>(),
+            [Spectrum, Focus, Orb]
+        );
+        assert_eq!(
+            SceneKind::panel_experimental().collect::<Vec<_>>(),
+            [Aurora, Fluid]
+        );
+        let mut all: Vec<_> = SceneKind::panel_main()
+            .chain(SceneKind::panel_experimental())
+            .collect();
+        all.sort_by_key(|k| k.index());
+        assert_eq!(all, SceneKind::ALL, "every scene is in exactly one group");
+        for k in SceneKind::ALL {
+            assert!(!k.label().is_empty());
+            assert!(SceneKind::parse(k.name()) == Some(k));
+        }
+        assert_eq!(Fluid.label(), "Fluid");
+        // experimental scenes never enter keys / cycling / auto rotation
+        assert!(SceneKind::panel_experimental().all(|k| !k.in_selector()));
     }
 
     #[test]
