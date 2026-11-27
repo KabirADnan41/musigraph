@@ -246,6 +246,125 @@ impl ControlsDraw {
     }
 }
 
+/// Tiles the scene panel can draw (one per scene).
+pub const PANEL_TILES: usize = THUMB_CELLS;
+/// Label cells with a fixed meaning in the atlas (cells 0..4 are the scene labels, `SceneKind::index()`).
+pub const LABEL_CURRENT: usize = 5;
+pub const LABEL_EXPERIMENTAL_PILL: usize = 6;
+pub const LABEL_EXPERIMENTAL_HEADING: usize = 7;
+const PANEL_BYTES: usize = (5 + PANEL_TILES * 6) * 16;
+
+/// One scene tile, final surface pixels. `(cx, cy, hw, hh)` is the thumbnail rectangle after the CPU applied
+/// the hover scale and the rise; text rectangles are integer-aligned and drawn 1:1 from the atlas label cells.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct PanelTileDraw {
+    pub rect: [f32; 4],
+    pub alpha: f32,
+    /// 0..1 hover amount (brightness 0.80 -> 1.0, stroke 0.12 -> 0.35).
+    pub hover: f32,
+    /// This is the current scene: accent outline and the "Current" pill.
+    pub selected: bool,
+    /// Keyboard focus ring (white ring with a black keyline, so it reads on any scene).
+    pub focus: bool,
+    pub experimental: bool,
+    /// The thumbnail exists in the atlas (cell = scene index); false draws a clean placeholder.
+    pub has_thumb: bool,
+    /// Atlas cell of the thumbnail and of the scene label (`SceneKind::index()`).
+    pub cell: usize,
+    /// Label text rectangle (left, top, w, h); w 0 = no label yet.
+    pub label: [f32; 4],
+    /// Pill rectangles (cx, cy, half w, half h): "Current" top-left, "EXPERIMENTAL" top-right.
+    pub cur_pill: [f32; 4],
+    pub exp_pill: [f32; 4],
+}
+
+/// The scene panel (a third, full-surface draw of the overlay pass; every pixel is computed from this).
+#[derive(Clone, Debug, PartialEq)]
+pub struct PanelDraw {
+    /// Scrim opacity multiplier 0..1 (the draw is skipped at 0).
+    pub alpha: f32,
+    /// Pixels per design pixel.
+    pub scale: f32,
+    /// Album/theme accent (linear RGB) of the selection outline and the "Current" pill.
+    pub accent: [f32; 3],
+    pub count: usize,
+    pub tiles: [PanelTileDraw; PANEL_TILES],
+    /// "EXPERIMENTAL" heading text rectangle (left, top, w, h); w 0 = none.
+    pub heading: [f32; 4],
+    pub heading_alpha: f32,
+    /// Bitmap sizes (w, h) of the pill texts, centred in their pills by the shader.
+    pub cur_text: [f32; 2],
+    pub exp_text: [f32; 2],
+}
+
+impl PanelDraw {
+    /// Packs the WGSL `P` layout (public for tests).
+    pub fn pack(&self, surface: (u32, u32)) -> Vec<u8> {
+        let mut o = Vec::with_capacity(PANEL_BYTES);
+        put(
+            &mut o,
+            &[
+                surface.0 as f32,
+                surface.1 as f32,
+                self.alpha.clamp(0.0, 1.0),
+                self.scale.max(0.01),
+            ],
+        );
+        put(
+            &mut o,
+            &[
+                self.accent[0],
+                self.accent[1],
+                self.accent[2],
+                self.heading_alpha.clamp(0.0, 1.0),
+            ],
+        );
+        put(
+            &mut o,
+            &[
+                self.cur_text[0].max(0.0),
+                self.cur_text[1].max(0.0),
+                self.exp_text[0].max(0.0),
+                self.exp_text[1].max(0.0),
+            ],
+        );
+        put(&mut o, &self.heading.map(|v| v.max(0.0)));
+        put(&mut o, &[self.count.min(PANEL_TILES) as f32, 0.0, 0.0, 0.0]);
+        let flag = |b: bool| if b { 1.0 } else { 0.0 };
+        for t in &self.tiles {
+            put(&mut o, &t.rect.map(|v| v.max(0.0)));
+            put(
+                &mut o,
+                &[
+                    t.alpha.clamp(0.0, 1.0),
+                    t.hover.clamp(0.0, 1.0),
+                    flag(t.selected),
+                    flag(t.focus),
+                ],
+            );
+            put(
+                &mut o,
+                &[
+                    flag(t.experimental),
+                    flag(t.has_thumb),
+                    t.cell.min(THUMB_CELLS - 1) as f32,
+                    0.0,
+                ],
+            );
+            put(&mut o, &t.label.map(|v| v.max(0.0)));
+            put(&mut o, &t.cur_pill.map(|v| v.max(0.0)));
+            put(&mut o, &t.exp_pill.map(|v| v.max(0.0)));
+        }
+        debug_assert_eq!(o.len(), PANEL_BYTES);
+        o
+    }
+
+    /// The panel dims the whole picture, so its scissor is the whole surface (never empty).
+    pub fn scissor(&self, surface: (u32, u32)) -> (u32, u32, u32, u32) {
+        (0, 0, surface.0.max(1), surface.1.max(1))
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct OverlayParams {
     pub res: (u32, u32),
@@ -271,6 +390,8 @@ pub struct OverlayParams {
     pub accent: [f32; 3],
     /// The control bar when visible (None or alpha 0 = nothing drawn, zero cost).
     pub controls: Option<ControlsDraw>,
+    /// The scene panel when open or fading (None or alpha 0 = nothing drawn, zero cost).
+    pub panel: Option<PanelDraw>,
 }
 
 fn put(out: &mut Vec<u8>, vals: &[f32]) {
@@ -359,6 +480,11 @@ impl OverlayParams {
         self.controls.as_ref().filter(|c| c.alpha > 0.002)
     }
 
+    /// The scene panel, when it would change pixels.
+    fn visible_panel(&self) -> Option<&PanelDraw> {
+        self.panel.as_ref().filter(|p| p.alpha > 0.002)
+    }
+
     /// True when the artwork/text part would change no pixel (nothing present or fully transparent).
     pub fn is_empty(&self) -> bool {
         let vis = |a: f32| a > 0.002;
@@ -375,10 +501,12 @@ impl OverlayParams {
 pub struct Overlay {
     pipeline: wgpu::RenderPipeline,
     controls_pipeline: wgpu::RenderPipeline,
+    panel_pipeline: wgpu::RenderPipeline,
     bgl: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
     uniform: wgpu::Buffer,
     controls_uniform: wgpu::Buffer,
+    panel_uniform: wgpu::Buffer,
     /// Current artwork and the previous one (crossfade source), see `shift_art`.
     art: Option<wgpu::TextureView>,
     art_prev: Option<wgpu::TextureView>,
@@ -521,6 +649,16 @@ impl Overlay {
                 tex_entry(12),
                 tex_entry(13),
                 wgpu::BindGroupLayoutEntry {
+                    binding: 14,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: wgpu::BufferSize::new(PANEL_BYTES as u64),
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
                     binding: 10,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Buffer {
@@ -584,6 +722,7 @@ impl Overlay {
         };
         let pipeline = make_pipeline("overlay", "fs");
         let controls_pipeline = make_pipeline("overlay controls", "fs_controls");
+        let panel_pipeline = make_pipeline("overlay panel", "fs_panel");
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("overlay"),
             address_mode_u: wgpu::AddressMode::ClampToEdge,
@@ -603,6 +742,12 @@ impl Overlay {
         let controls_uniform = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("overlay controls"),
             size: CONTROLS_BYTES as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let panel_uniform = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("overlay panel"),
+            size: PANEL_BYTES as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -630,7 +775,7 @@ impl Overlay {
             bind_group: Self::group(
                 device,
                 &bgl,
-                [&uniform, &controls_uniform],
+                [&uniform, &controls_uniform, &panel_uniform],
                 [&blank_rgba, &blank_rgba],
                 [&blank_r8; TEXT_SLOTS],
                 &blank_rgba,
@@ -638,10 +783,12 @@ impl Overlay {
             ),
             pipeline,
             controls_pipeline,
+            panel_pipeline,
             bgl,
             sampler,
             uniform,
             controls_uniform,
+            panel_uniform,
             art: None,
             art_prev: None,
             texts: Default::default(),
@@ -658,7 +805,7 @@ impl Overlay {
     fn group(
         device: &wgpu::Device,
         bgl: &wgpu::BindGroupLayout,
-        uniforms: [&wgpu::Buffer; 2],
+        uniforms: [&wgpu::Buffer; 3],
         art: [&wgpu::TextureView; 2],
         texts: [&wgpu::TextureView; TEXT_SLOTS],
         atlas: &wgpu::TextureView,
@@ -687,6 +834,10 @@ impl Overlay {
                 wgpu::BindGroupEntry {
                     binding: 10,
                     resource: uniforms[1].as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 14,
+                    resource: uniforms[2].as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 8,
@@ -732,7 +883,7 @@ impl Overlay {
         self.bind_group = Self::group(
             device,
             &self.bgl,
-            [&self.uniform, &self.controls_uniform],
+            [&self.uniform, &self.controls_uniform, &self.panel_uniform],
             [
                 self.art.as_ref().unwrap_or(&self.blank_rgba),
                 self.art_prev.as_ref().unwrap_or(&self.blank_rgba),
@@ -957,11 +1108,15 @@ impl Overlay {
     ) {
         let main = !p.is_empty();
         let controls = p.visible_controls();
-        if !main && controls.is_none() {
+        let panel = p.visible_panel();
+        if !main && controls.is_none() && panel.is_none() {
             return;
         }
         if main {
             queue.write_buffer(&self.uniform, 0, &p.pack());
+        }
+        if let Some(pn) = panel {
+            queue.write_buffer(&self.panel_uniform, 0, &pn.pack(p.res));
         }
         if let Some(c) = controls {
             queue.write_buffer(&self.controls_uniform, 0, &c.pack(p.res));
@@ -985,6 +1140,13 @@ impl Overlay {
         pass.set_bind_group(0, &self.bind_group, &[]);
         if main {
             pass.set_pipeline(&self.pipeline);
+            pass.draw(0..3, 0..1);
+        }
+        if let Some(pn) = panel {
+            // the panel dims the whole picture: a full-surface draw, under the control bar
+            let (x, y, w, h) = pn.scissor(p.res);
+            pass.set_scissor_rect(x, y, w, h);
+            pass.set_pipeline(&self.panel_pipeline);
             pass.draw(0..3, 0..1);
         }
         if let Some(c) = controls {
@@ -1084,6 +1246,167 @@ mod tests {
             fg: [0.9, 0.9, 0.9],
             accent: [0.2, 0.5, 1.0],
         }
+    }
+
+    fn panel_tile(i: usize, selected: bool) -> PanelTileDraw {
+        let cx = 90.0 + 100.0 * i as f32;
+        PanelTileDraw {
+            rect: [cx, 140.0, 40.0, 22.5],
+            alpha: 1.0,
+            selected,
+            has_thumb: true,
+            cell: i,
+            label: [cx - 20.0, 175.0, 40.0, 16.0],
+            cur_pill: [cx - 25.0, 125.0, 14.0, 6.0],
+            exp_pill: [cx + 20.0, 125.0, 14.0, 6.0],
+            ..Default::default()
+        }
+    }
+
+    fn panel_draw(alpha: f32) -> PanelDraw {
+        let mut tiles = [PanelTileDraw::default(); PANEL_TILES];
+        for (i, t) in tiles.iter_mut().enumerate() {
+            *t = panel_tile(i, i == 1);
+        }
+        tiles[3].experimental = true;
+        tiles[4].has_thumb = false;
+        PanelDraw {
+            alpha,
+            scale: 0.5,
+            accent: [0.9, 0.3, 0.1],
+            count: PANEL_TILES,
+            tiles,
+            heading: [20.0, 205.0, 40.0, 10.0],
+            heading_alpha: 1.0,
+            cur_text: [20.0, 8.0],
+            exp_text: [20.0, 8.0],
+        }
+    }
+
+    fn srgb_to_linear(c: u8) -> f32 {
+        let c = f32::from(c) / 255.0;
+        if c <= 0.04045 {
+            c / 12.92
+        } else {
+            ((c + 0.055) / 1.055).powf(2.4)
+        }
+    }
+
+    #[test]
+    fn panel_pack_matches_wgsl_and_the_atlas_constants_are_shared() {
+        let d = panel_draw(1.0);
+        assert_eq!(d.pack((640, 360)).len(), PANEL_BYTES);
+        let src = include_str!("overlay.wgsl");
+        assert!(src.contains("t: array<vec4<f32>, 30>") && src.contains("fn fs_panel"));
+        assert!(src.contains(&format!(
+            "const ATLAS_SIZE = vec2<f32>({}.0, {}.0);",
+            ATLAS_SIZE.0, ATLAS_SIZE.1
+        )));
+        assert!(src.contains(&format!(
+            "const THUMB_SIZE = vec2<f32>({}.0, {}.0);",
+            THUMB_SIZE.0, THUMB_SIZE.1
+        )));
+        assert!(src.contains(&format!("const LABEL_ORIGIN_Y = {LABEL_ORIGIN_Y}.0;")));
+        assert_eq!((LABEL_SIZE.0, LABEL_SIZE.1), (256, 48), "shader cell size");
+        assert_eq!(PANEL_BYTES, (5 + 30) * 16);
+        assert_eq!(d.scissor((640, 360)), (0, 0, 640, 360));
+        assert_eq!(d.scissor((0, 0)), (0, 0, 1, 1));
+        let mut h = d.clone();
+        h.alpha = f32::NAN;
+        h.tiles[0].rect = [f32::INFINITY; 4];
+        assert!(
+            h.pack((640, 360))
+                .chunks_exact(4)
+                .all(|b| f32::from_ne_bytes([b[0], b[1], b[2], b[3]]).is_finite())
+        );
+    }
+
+    #[test]
+    fn the_panel_dims_the_picture_shows_tiles_and_labels_and_alpha_zero_draws_nothing_headless() {
+        let Ok(h) = init_headless() else {
+            eprintln!("SKIPPED (no hardware GPU)");
+            return;
+        };
+        let res = (640u32, 360u32);
+        let scene = SceneSet::new_headless(&h.device);
+        let mut ov = Overlay::new_headless(&h.device, &h.queue);
+        let colors: [[u8; 3]; 5] = [
+            [200, 60, 40],
+            [40, 200, 60],
+            [40, 60, 200],
+            [200, 200, 40],
+            [200, 40, 200],
+        ];
+        for (i, c) in colors.iter().enumerate() {
+            let px: Vec<u8> = (0..THUMB_SIZE.0 * THUMB_SIZE.1)
+                .flat_map(|_| [c[0], c[1], c[2], 255])
+                .collect();
+            assert!(ov.set_panel_thumb(&h.device, &h.queue, i, &px));
+        }
+        for cell in 0..LABEL_CELLS {
+            assert!(ov.set_panel_label(&h.device, &h.queue, cell, (40, 16), &[255; 40 * 16]));
+        }
+        let p = SceneParams::default();
+        let render = |panel: Option<PanelDraw>| {
+            let op = OverlayParams {
+                res,
+                panel,
+                ..Default::default()
+            };
+            scene
+                .render_offscreen_with(&h.device, &h.queue, res, &p, &|enc, view| {
+                    ov.draw(&h.queue, enc, view, &op)
+                })
+                .expect("render")
+        };
+        let bare = render(None);
+        assert_eq!(render(Some(panel_draw(0.0))), bare, "alpha 0 draws nothing");
+        let img = render(Some(panel_draw(1.0)));
+        // scrim: black 0.45 at the top, so the linear value falls to 0.55 of the scene
+        let (b, a) = (px(&bare, res.0, 5, 5), px(&img, res.0, 5, 5));
+        for k in 0..3 {
+            let want = f32::from(b[k]) * 0.55;
+            assert!(
+                (f32::from(a[k]) - want).abs() <= 3.0,
+                "scrim channel {k}: {} vs {want}",
+                a[k]
+            );
+        }
+        // tile 0 centre: its thumbnail at rest brightness 0.80 (linear value, the headless target is linear)
+        let t = px(&img, res.0, 90, 140);
+        for k in 0..3 {
+            let want = srgb_to_linear(colors[0][k]) * 0.80 * 255.0;
+            assert!(
+                (f32::from(t[k]) - want).abs() <= 4.0,
+                "tile channel {k}: {} vs {want}",
+                t[k]
+            );
+        }
+        // the selected tile (1) shows a 2 px accent outline just inside its edge
+        let e = px(&img, res.0, 190 - 40, 140);
+        assert!(e[0] > 150 && e[0] > e[2] * 2, "accent outline, got {e:?}");
+        // the missing thumbnail (tile 4) is the neutral placeholder, not another tile's colour
+        let m = px(&img, res.0, 490, 140);
+        assert!(
+            m.iter().take(3).all(|v| *v < 60) && m[0].abs_diff(m[2]) < 12,
+            "placeholder, got {m:?}"
+        );
+        // a label (white coverage box) is drawn below tile 0
+        let l = px(&img, res.0, 90, 183);
+        assert!(l[0] > 150 && l[1] > 150 && l[2] > 150, "label, got {l:?}");
+        // far from every tile only the scrim changed (the draw stays where it belongs)
+        let far = px(&img, res.0, 600, 20);
+        let far_b = px(&bare, res.0, 600, 20);
+        assert!((f32::from(far[0]) - f32::from(far_b[0]) * 0.55).abs() <= 3.0);
+        // keyboard focus: a white ring 3 px outside the tile that the unfocused draw does not have
+        let mut d = panel_draw(1.0);
+        d.tiles[0].focus = true;
+        let f = render(Some(d));
+        let ring = px(&f, res.0, 90 - 40 - 2, 140);
+        assert!(
+            f != img && ring != px(&img, res.0, 90 - 40 - 2, 140),
+            "focus ring drawn"
+        );
     }
 
     #[test]
