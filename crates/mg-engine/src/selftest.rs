@@ -42,40 +42,6 @@ fn srgb_view(img: &[u8]) -> Vec<u8> {
         .collect()
 }
 
-/// Applies one presentation GPU op the way the live loop does: the overlay gets the cover (with its mips) and the
-/// scene gets its room-light colours.
-fn apply_gpu_op(
-    op: crate::presentation::GpuOp,
-    ov: &mut mg_gfx::overlay::Overlay,
-    scene: &mut SceneSet,
-    h: &Headless,
-) {
-    use crate::presentation::GpuOp;
-    match op {
-        GpuOp::SetArt(a, extra) => {
-            let mips = extra.as_ref().map_or(&[][..], |e| e.mips.as_slice());
-            ov.set_art_mips(&h.device, &h.queue, (a.width, a.height), &a.rgba, mips);
-            scene.set_focus_art(&h.queue, extra.map(|e| *e.light));
-        }
-        GpuOp::ShiftArt => {
-            ov.shift_art(&h.device);
-            scene.shift_focus_art(&h.queue);
-        }
-        GpuOp::ClearArt => {
-            ov.clear_art(&h.device);
-            scene.set_focus_art(&h.queue, None);
-        }
-        GpuOp::ClearPrevArt => {
-            ov.clear_prev_art(&h.device);
-            scene.clear_prev_focus_art(&h.queue);
-        }
-        GpuOp::SetText(k, b) => {
-            ov.set_text(&h.device, &h.queue, k, (b.width, b.height), &b.coverage);
-        }
-        GpuOp::ClearText(k) => ov.clear_text(&h.device, k),
-    }
-}
-
 fn mean(v: &[f32]) -> f32 {
     v.iter().sum::<f32>() / v.len().max(1) as f32
 }
@@ -223,7 +189,7 @@ fn presentation_previews(failures: &mut Vec<String>) -> bool {
                 }
                 last = Some(pres.update(1.0 / 60.0, res, base_params.energy, base_params.swell));
                 for op in pres.take_ops() {
-                    apply_gpu_op(op, &mut ov, &mut scene, &h);
+                    op.apply(&mut ov, &mut scene, &h.device, &h.queue);
                 }
             }
             let op = last.expect("frames");
@@ -387,7 +353,7 @@ fn album_previews(failures: &mut Vec<String>) -> bool {
                 }
                 last = Some(pres.update(1.0 / 60.0, res, base_params.energy, base_params.swell));
                 for op in pres.take_ops() {
-                    apply_gpu_op(op, &mut ov, &mut scene, &h);
+                    op.apply(&mut ov, &mut scene, &h.device, &h.queue);
                 }
             }
             let op = last.expect("frames");
@@ -581,6 +547,11 @@ fn controls_previews(failures: &mut Vec<String>) -> bool {
         if d(&images[0].1, &images[1].1) < 500 || d(&images[0].1, &images[2].1) < 200 {
             failures.push("controls: enabled/disabled/focus states do not differ".into());
         }
+    } else {
+        failures.push(format!(
+            "controls: expected 3 rendered states, got {} (a render failed)",
+            images.len()
+        ));
     }
     true
 }
@@ -989,7 +960,7 @@ fn focus_checks(failures: &mut Vec<String>) -> bool {
                 }
                 last = Some(pres.update(1.0 / 60.0, res, loud.energy, loud.swell));
                 for op in pres.take_ops() {
-                    apply_gpu_op(op, &mut ov, &mut scene, &h);
+                    op.apply(&mut ov, &mut scene, &h.device, &h.queue);
                 }
             }
             let op = last.expect("frames");

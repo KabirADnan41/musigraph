@@ -209,9 +209,11 @@ impl ControlsDraw {
         let mut y0 = self.bar[1] - self.bar[3] - m;
         let y1 = self.bar[1] + self.bar[3] + m;
         if let Some(p) = &self.progress {
-            x0 = x0.min(p.x0 - 12.0 * s); // focus ring
-            x1 = x1.max(p.x1 + 12.0 * s);
-            y0 = y0.min(p.y - 14.0 * s);
+            // the focused backing: hover thickness 3s + pad 7s + 3rw (rw = max(1, s), see `fs_controls`), +1 px
+            let reach = 10.0 * s + 3.0 * s.max(1.0) + 1.0;
+            x0 = x0.min(p.x0 - reach);
+            x1 = x1.max(p.x1 + reach);
+            y0 = y0.min(p.y - reach);
         }
         for t in [&self.elapsed, &self.duration].into_iter().flatten() {
             x0 = x0.min(t.x - 4.0 * s);
@@ -961,6 +963,40 @@ mod tests {
         }
         let (x, y, w, h) = c.scissor(res); // NaN/inf geometry still yields a legal rectangle
         assert!(w >= 1 && h >= 1 && x + w <= res.0 && y + h <= res.1);
+    }
+
+    /// The scissor covers the focused progress backing (track half thickness at hover + pad 7s + 3rw, rw = max(1, s))
+    /// at every UI scale, including below 1 where the ring's 1 px floor outgrows multiples of s.
+    #[test]
+    fn the_scissor_covers_the_focused_progress_backing_at_every_scale() {
+        for s in [0.5f32, 0.75, 1.0, 1.5, 2.0] {
+            let res = (1920u32, 1080u32);
+            let mut c = bar(res);
+            c.scale = s;
+            c.bar = [960.0, 900.0, 280.0 * s, 32.0 * s];
+            c.progress = Some(ProgressDraw {
+                x0: 700.0,
+                x1: 1220.0,
+                y: 800.0,
+                half_thick: 3.0 * s,
+                frac: 0.4,
+                hover: 1.0,
+                focus: true,
+            });
+            let (x, y, w, _) = c.scissor(res);
+            let reach = 3.0 * s + 7.0 * s + 3.0 * s.max(1.0); // beyond the track centre line / the track end
+            assert!(
+                y as f32 <= 800.0 - reach,
+                "scale {s}: top {y} vs {}",
+                800.0 - reach
+            );
+            assert!(x as f32 <= 700.0 - (reach - 3.0 * s), "scale {s}: left {x}");
+            assert!(
+                (x + w) as f32 >= 1220.0 + (reach - 3.0 * s),
+                "scale {s}: right {}",
+                x + w
+            );
+        }
     }
 
     #[test]

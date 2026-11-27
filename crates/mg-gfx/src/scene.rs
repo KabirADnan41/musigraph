@@ -160,7 +160,8 @@ const ART_SLOT_VEC4S: usize = ART_GRID * ART_GRID + 1;
 #[derive(Clone, Debug, PartialEq)]
 pub struct FocusParams {
     /// Light source: centre x, centre y, half width, half height (the cover, or the empty cover slot of the
-    /// text-led composition). A zero size means a soft default source mid-screen.
+    /// text-led composition). A zero size means a soft default source mid-screen: `pack` then replaces the centre
+    /// by (0.5 x aspect, 0.5), so the shader never sees a point at the top-left corner.
     pub rect: [f32; 4],
     /// Spill intensity I and radius scale k.
     pub spill: f32,
@@ -203,28 +204,38 @@ impl Default for FocusParams {
 }
 
 impl FocusParams {
-    /// Packs the WGSL `FU` layout for a render target of `res` pixels (finite values only). `res` only sets the dust
-    /// cell: about 147 motes at any aspect.
-    pub fn pack(&self, res: (u32, u32)) -> Vec<u8> {
+    /// Packs the WGSL `FU` layout for a render target of `res` pixels (finite values only), without allocating.
+    /// `res` sets the dust cell (about 147 motes at any aspect) and the mid-screen centre of a zero-size `rect`.
+    pub fn pack(&self, res: (u32, u32)) -> [u8; FOCUS_BYTES] {
         let aspect = res.0.max(1) as f32 / res.1.max(1) as f32;
         let inv_cell = 1.0 / (0.11 * (aspect / (16.0 / 9.0)).sqrt());
-        let mut o = Vec::with_capacity(FOCUS_BYTES);
-        put(&mut o, &self.rect);
-        put(
-            &mut o,
-            &[self.spill, self.radius, self.art_w[0], self.art_w[1]],
-        );
-        put(
-            &mut o,
-            &[self.flow[0], self.flow[1], self.warp, self.twinkle],
-        );
-        put(&mut o, &[self.hue, self.bar, 0.0, inv_cell]);
-        for r in &self.ink {
-            put(&mut o, r);
+        let mut rect = self.rect;
+        if !(rect[2] > 0.0 || rect[3] > 0.0) {
+            (rect[0], rect[1]) = (0.5 * aspect, 0.5);
         }
-        put(&mut o, &self.ink_cap);
-        put(&mut o, &self.ink_on);
-        debug_assert_eq!(o.len(), FOCUS_BYTES);
+        let mut vals = [0.0f32; FOCUS_BYTES / 4];
+        let mut n = 0;
+        let mut put = |v: &[f32]| {
+            for x in v {
+                // Never let a NaN/inf reach the shader.
+                vals[n] = if x.is_finite() { *x } else { 0.0 };
+                n += 1;
+            }
+        };
+        put(&rect);
+        put(&[self.spill, self.radius, self.art_w[0], self.art_w[1]]);
+        put(&[self.flow[0], self.flow[1], self.warp, self.twinkle]);
+        put(&[self.hue, self.bar, 0.0, inv_cell]);
+        for r in &self.ink {
+            put(r);
+        }
+        put(&self.ink_cap);
+        put(&self.ink_on);
+        debug_assert_eq!(n, vals.len());
+        let mut o = [0u8; FOCUS_BYTES];
+        for (c, v) in o.chunks_exact_mut(4).zip(vals) {
+            c.copy_from_slice(&v.to_ne_bytes());
+        }
         o
     }
 }
@@ -250,11 +261,37 @@ struct FocusRes {
     bgl: wgpu::BindGroupLayout,
     uniform: wgpu::Buffer,
     art: wgpu::Buffer,
-    group: wgpu::BindGroup,
-    /// Same buffers with a 1x1 stand-in for the room texture, bound while the room pass itself draws.
+    sampler: wgpu::Sampler,
+    /// Same buffers with a 1x1 stand-in for the room texture, bound while the room pass itself draws (and by the
+    /// scene while the room is released).
     pre_group: wgpu::BindGroup,
-    room: wgpu::TextureView,
+    /// The room texture and the group that samples it; None while Focus is off screen (about 1 MB released).
+    room: Option<(wgpu::TextureView, wgpu::BindGroup)>,
     slots: [Option<ArtLight>; 2],
+}
+
+fn room_texture(
+    device: &wgpu::Device,
+    label: &str,
+    (w, h): (u32, u32),
+    usage: wgpu::TextureUsages,
+) -> wgpu::TextureView {
+    device
+        .create_texture(&wgpu::TextureDescriptor {
+            label: Some(label),
+            size: wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: ROOM_FORMAT,
+            usage,
+            view_formats: &[],
+        })
+        .create_view(&wgpu::TextureViewDescriptor::default())
 }
 
 impl FocusRes {
@@ -302,30 +339,8 @@ impl FocusRes {
         };
         let uniform = buf("focus", FOCUS_BYTES);
         let art = buf("focus-art", 2 * ART_SLOT_VEC4S * 16);
-        let tex = |label, (w, h): (u32, u32), usage| {
-            device
-                .create_texture(&wgpu::TextureDescriptor {
-                    label: Some(label),
-                    size: wgpu::Extent3d {
-                        width: w,
-                        height: h,
-                        depth_or_array_layers: 1,
-                    },
-                    mip_level_count: 1,
-                    sample_count: 1,
-                    dimension: wgpu::TextureDimension::D2,
-                    format: ROOM_FORMAT,
-                    usage,
-                    view_formats: &[],
-                })
-                .create_view(&wgpu::TextureViewDescriptor::default())
-        };
-        let room = tex(
-            "focus-room",
-            ROOM_SIZE,
-            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
-        );
-        let stand_in = tex(
+        let stand_in = room_texture(
+            device,
             "focus-room-1x1",
             (1, 1),
             wgpu::TextureUsages::TEXTURE_BINDING,
@@ -338,41 +353,87 @@ impl FocusRes {
             min_filter: wgpu::FilterMode::Linear,
             ..Default::default()
         });
-        let group_with = |label, view: &wgpu::TextureView| {
-            device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some(label),
-                layout: &bgl,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: uniform.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: art.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: wgpu::BindingResource::TextureView(view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 3,
-                        resource: wgpu::BindingResource::Sampler(&sampler),
-                    },
-                ],
-            })
-        };
-        let group = group_with("focus", &room);
-        let pre_group = group_with("focus-room-pass", &stand_in);
-        Self {
+        let mut me = Self {
+            pre_group: Self::bind(
+                device,
+                &bgl,
+                &uniform,
+                &art,
+                &sampler,
+                "focus-room-pass",
+                &stand_in,
+            ),
             bgl,
             uniform,
             art,
-            group,
-            pre_group,
-            room,
+            sampler,
+            room: None,
             slots: [None, None],
+        };
+        me.acquire(device);
+        me
+    }
+
+    fn bind(
+        device: &wgpu::Device,
+        bgl: &wgpu::BindGroupLayout,
+        uniform: &wgpu::Buffer,
+        art: &wgpu::Buffer,
+        sampler: &wgpu::Sampler,
+        label: &str,
+        view: &wgpu::TextureView,
+    ) -> wgpu::BindGroup {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some(label),
+            layout: bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: uniform.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: art.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::Sampler(sampler),
+                },
+            ],
+        })
+    }
+
+    /// Creates the room texture when it is not there; returns its view when it was just created.
+    fn acquire(&mut self, device: &wgpu::Device) -> Option<wgpu::TextureView> {
+        if self.room.is_some() {
+            return None;
         }
+        let view = room_texture(
+            device,
+            "focus-room",
+            ROOM_SIZE,
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        );
+        let group = Self::bind(
+            device,
+            &self.bgl,
+            &self.uniform,
+            &self.art,
+            &self.sampler,
+            "focus",
+            &view,
+        );
+        self.room = Some((view.clone(), group));
+        Some(view)
+    }
+
+    /// The group the Focus scene draws with: the room texture, or the stand-in while released.
+    fn group(&self) -> &wgpu::BindGroup {
+        self.room.as_ref().map_or(&self.pre_group, |r| &r.1)
     }
 
     /// Uploads both slots (2 KB, only when a cover changes). An empty slot is black; its weight is 0 anyway.
@@ -540,7 +601,7 @@ impl SceneSet {
             SceneKind::Focus.index(),
             crate::fullscreen::PrePass {
                 pipeline: room_pipe,
-                target: focus.room.clone(),
+                target: focus.room.as_ref().map(|r| r.0.clone()),
                 group1: focus.pre_group.clone(),
             },
         );
@@ -562,7 +623,7 @@ impl SceneSet {
     ) -> [(usize, &'a wgpu::BindGroup); 2] {
         queue.write_buffer(&focus.uniform, 0, &p.album.pack(res));
         [
-            (SceneKind::Focus.index(), &focus.group),
+            (SceneKind::Focus.index(), focus.group()),
             (SceneKind::Fluid.index(), fluid.render_group()),
         ]
     }
@@ -611,6 +672,27 @@ impl SceneSet {
         )
     }
 
+    /// Creates the Focus room texture if it was released (what the live loop does when Focus enters the screen).
+    pub fn focus_acquire(&mut self, device: &wgpu::Device) {
+        if let Some(view) = self.focus.acquire(device) {
+            self.inner
+                .set_prepass_target(SceneKind::Focus.index(), Some(view));
+        }
+    }
+
+    /// Drops the Focus room texture (what the live loop does when Focus is neither shown nor crossfading); the
+    /// cover colours and the buffers stay. Acquire it again before drawing Focus.
+    pub fn focus_release(&mut self) {
+        self.focus.room = None;
+        self.inner
+            .set_prepass_target(SceneKind::Focus.index(), None);
+    }
+
+    /// Whether the Focus room texture exists.
+    pub fn focus_room_alive(&self) -> bool {
+        self.focus.room.is_some()
+    }
+
     /// Fluid quality tier 0..=3 (grid 256x144 .. 768x432 at 16:9); a change restarts the field.
     pub fn set_fluid_tier(&mut self, tier: u8) {
         self.fluid.set_tier(tier);
@@ -618,7 +700,8 @@ impl SceneSet {
 
     /// Draws `scene` (or a crossfade `scene -> to` at blend `t`), then `post` records overlays.
     /// The Fluid simulation advances (fixed steps, from `p.time`) only while Fluid is one of the two scenes;
-    /// otherwise its textures are released, so the next entry starts from a clear field.
+    /// otherwise its textures are released, so the next entry starts from a clear field. Focus's room texture
+    /// likewise exists only while Focus is one of the two scenes (it is redrawn every frame, so nothing is lost).
     pub fn render_scenes<F: FnOnce(&mut wgpu::CommandEncoder, &wgpu::TextureView)>(
         &mut self,
         gpu: &mut Gpu,
@@ -633,6 +716,11 @@ impl SceneSet {
                 .advance(&gpu.device, &gpu.queue, res, &p.fluid, p.time);
         } else {
             self.fluid.release();
+        }
+        if scene == SceneKind::Focus || xfade.is_some_and(|(k, _)| k == SceneKind::Focus) {
+            self.focus_acquire(&gpu.device);
+        } else {
+            self.focus_release();
         }
         let queue = gpu.queue.clone();
         self.inner.render_scenes(
@@ -912,6 +1000,68 @@ mod tests {
         );
     }
 
+    /// Like Fluid's textures, Focus's room texture is released while Focus is off screen and recreated on re-entry,
+    /// drawing exactly the same room again (the room pass renders it from scratch every frame).
+    #[test]
+    fn focus_room_texture_is_released_off_screen_and_returns_identical_headless() {
+        let Some((h, mut scene)) = headless() else {
+            return;
+        };
+        let res = (320u32, 180u32);
+        let mut p = SceneParams {
+            mode: SceneMode::Live,
+            ..Default::default()
+        };
+        p.album.rect = [0.5 * 320.0 / 180.0, 0.46, 0.25, 0.25];
+        p.album.spill = 0.9;
+        p.album.art_w = [1.0, 0.0];
+        scene.set_focus_art(&h.queue, Some(light([1.0, 0.0, 0.0], [0.0, 0.0, 1.0])));
+        let draw = |s: &SceneSet| {
+            s.render_offscreen_scenes(
+                &h.device,
+                &h.queue,
+                res,
+                &p,
+                SceneKind::Focus,
+                None,
+                &|_, _| {},
+            )
+            .unwrap()
+        };
+        let maxd = |x: &[u8], y: &[u8]| x.iter().zip(y).map(|(p, q)| p.abs_diff(*q)).max().unwrap();
+        assert!(scene.focus_room_alive());
+        let before = draw(&scene);
+        scene.focus_release();
+        scene.focus_release();
+        assert!(!scene.focus_room_alive());
+        assert!(
+            maxd(&draw(&scene), &before) > 8,
+            "a released room is not drawn"
+        );
+        scene.focus_acquire(&h.device);
+        scene.focus_acquire(&h.device);
+        assert!(scene.focus_room_alive());
+        assert!(maxd(&draw(&scene), &before) <= 1, "back as it was");
+        assert_eq!(scene.focus_art_slots(), [true, false], "cover colours stay");
+    }
+
+    /// A zero-size source rectangle is the documented soft default mid-screen, not a point at the top-left.
+    #[test]
+    fn a_zero_size_focus_rect_packs_as_a_mid_screen_source() {
+        let d = FocusParams::default();
+        let b = d.pack((1280, 720));
+        assert_eq!((f32_at(&b, 0), f32_at(&b, 4)), (0.5 * 1280.0 / 720.0, 0.5));
+        let real = FocusParams {
+            rect: [0.3, 0.4, 0.2, 0.1],
+            ..d
+        };
+        let b = real.pack((1280, 720));
+        assert_eq!(
+            [f32_at(&b, 0), f32_at(&b, 4), f32_at(&b, 8), f32_at(&b, 12)],
+            [0.3, 0.4, 0.2, 0.1]
+        );
+    }
+
     #[test]
     fn focus_room_is_lit_by_the_cover_it_follows_the_slots_and_never_shows_a_slot_headless() {
         let Some((h, mut scene)) = headless() else {
@@ -966,9 +1116,10 @@ mod tests {
         p.album.art_w = [0.0, 1.0];
         let prev = render(&scene, &p);
         let g = box_rgb(&prev, res.0, 190, 225, 150, 210);
+        // slot 1 holds the previous (red-left) cover, the current slot 0 is green: only the previous cover may show
         assert!(
-            g[1] > 4.0 * g[0].max(g[2]) || g[0] > 4.0 * g[1],
-            "previous slot lights the room: {g:?}"
+            g[0] > 4.0 * g[1],
+            "previous slot lights the room (red, not the current green): {g:?}"
         );
         scene.clear_prev_focus_art(&h.queue);
         scene.set_focus_art(&h.queue, None);

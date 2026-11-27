@@ -5,7 +5,7 @@ use crate::report::block_on;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-pub use wgpu::PresentMode;
+pub use wgpu::{Device, PresentMode, Queue};
 
 /// Backend requested by the caller. Explicit on purpose: no silent fallback between backends.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

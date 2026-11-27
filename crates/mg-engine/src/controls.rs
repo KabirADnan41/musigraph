@@ -51,7 +51,7 @@ const DISABLED_OPACITY: f32 = 0.35;
 /// Above this alpha the bar counts as visible for clicks and keys. Contrast targets (4.5:1 icons, 3:1 lines and
 /// rings) are checked at the steady alpha 1 only: the fade-in (SHOW_FADE_S) and fade-out (HIDE_FADE_S) are
 /// transitional and exempt by design, any input during either fades the bar back in, and focus rings are drawn
-/// only at steady alpha.
+/// only at steady alpha and while fading out (never during the fade-in).
 const INTERACTIVE_ALPHA: f32 = 0.5;
 /// Keyboard seek steps on the focused progress line (Shift: the long step).
 pub const SEEK_STEP_S: f64 = 5.0;
@@ -879,9 +879,11 @@ impl ControlsUi {
             HOVER_S,
         );
         let dy = self.vis.rise() * g.scale;
-        // focus rings only at steady alpha, where their contrast is checked (see INTERACTIVE_ALPHA)
-        let steady = a >= 1.0;
-        let ring = self.focus.ring().filter(|_| steady);
+        // focus rings only at steady alpha, where their contrast is checked (see INTERACTIVE_ALPHA), and while the
+        // bar fades out (the shader scales the ring by the bar alpha, so it leaves with the bar instead of popping
+        // off); not during the fade-in
+        let rings = a >= 1.0 || !self.vis.wants_visible();
+        let ring = self.focus.ring().filter(|_| rings);
         let buttons = std::array::from_fn(|k| {
             let id = ButtonId::ALL[k];
             let ok = enabled(id, &i.av);
@@ -930,7 +932,7 @@ impl ControlsUi {
                 half_thick: (1.5 + 1.5 * self.prog_hover) * s,
                 frac: (i.position.unwrap_or(0.0) / d).clamp(0.0, 1.0) as f32,
                 hover: self.prog_hover,
-                focus: steady && self.focus.progress_ring(),
+                focus: rings && self.focus.progress_ring(),
             }
         });
         let text_rect = |slot: usize, right_aligned: bool| {
@@ -1678,6 +1680,51 @@ mod tests {
         assert!(d.alpha >= 1.0 && d.buttons[0].focus, "ring once steady");
     }
 
+    /// The ring is drawn at steady alpha and while the bar fades OUT (the shader multiplies it by the bar alpha, so
+    /// it fades with the bar instead of popping off on the first frame below 1); only the fade-in has no ring.
+    #[test]
+    fn focus_rings_fade_out_with_the_bar_instead_of_popping_off() {
+        for to_progress in [false, true] {
+            let a = all();
+            let mut u = ui_visible();
+            for _ in 0..if to_progress {
+                ButtonId::ALL.len() + 1
+            } else {
+                1
+            } {
+                u.tab(false, &a);
+            }
+            let ring = |d: &ControlsDraw| {
+                if to_progress {
+                    d.progress.unwrap().focus
+                } else {
+                    d.buttons[0].focus
+                }
+            };
+            let mut d = u.frame(&input(a)).unwrap();
+            for _ in 0..30 {
+                d = u.frame(&input(a)).unwrap();
+            }
+            assert!(
+                d.alpha >= 1.0 && ring(&d),
+                "steady ring (progress {to_progress})"
+            );
+            let mut fading = 0;
+            for _ in 0..600 {
+                let Some(d) = u.frame(&input(a)) else { break };
+                if d.alpha < 1.0 {
+                    fading += 1;
+                    assert!(
+                        ring(&d),
+                        "ring popped off at alpha {} (progress {to_progress})",
+                        d.alpha
+                    );
+                }
+            }
+            assert!(fading > 10, "the bar faded out ({fading} frames)");
+        }
+    }
+
     #[test]
     fn time_texts_are_requested_once_per_change_and_superseded_results_are_dropped() {
         let mut u = ui_visible();
@@ -2056,11 +2103,31 @@ mod tests {
         }
     }
 
+    /// The ring's width has a 1 px floor (`rw = max(1, s)`), so at a UI scale below 1 a pad made of multiples of `s`
+    /// alone would end inside the ring's anti-aliased edge: the focused backing keeps at least 1 px beyond the ring at
+    /// every scale (the shader constants are mirrored here and checked in its source).
+    #[test]
+    fn the_focused_backing_contains_the_progress_ring_at_every_ui_scale() {
+        let src = include_str!("../../mg-gfx/src/overlay.wgsl");
+        assert!(src.contains("let rw = max(1.0, s);"));
+        assert!(src.contains("let pad = 3.0 * s + step(0.5, c.prog_p.w) * (4.0 * s + 3.0 * rw);"));
+        for s in [0.5f32, 0.75, 1.0, 1.5, 2.0] {
+            let rw = s.max(1.0);
+            let ring_outer = 7.0 * s + 2.0 * rw; // from the track edge
+            let pad = 3.0 * s + (4.0 * s + 3.0 * rw);
+            assert!(
+                pad - ring_outer >= 1.0 - 1e-5,
+                "scale {s}: backing margin {} px",
+                pad - ring_outer
+            );
+        }
+    }
+
     #[test]
     fn progress_focus_ring_sits_on_its_backing_at_3_to_1_over_white_and_black_scenes() {
         let src = include_str!("../../mg-gfx/src/overlay.wgsl");
-        // ring spans 7s..7s+2rw from the track; the focused backing pad is 8s+2rw
-        assert!(src.contains("let pad = 3.0 * s + step(0.5, c.prog_p.w) * (5.0 * s + 2.0 * rw);"));
+        // ring spans 7s..7s+2rw from the track; the focused backing pad is 7s+3rw (see the scales test below)
+        assert!(src.contains("let pad = 3.0 * s + step(0.5, c.prog_p.w) * (4.0 * s + 3.0 * rw);"));
         assert!(
             src.contains("vec2<f32>(hl, ht) + vec2<f32>(7.0 * s + rw), ht + 7.0 * s + rw)) - rw")
         );

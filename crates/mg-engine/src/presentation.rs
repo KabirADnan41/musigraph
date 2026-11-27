@@ -428,6 +428,45 @@ pub enum GpuOp {
     ClearText(usize),
 }
 
+impl GpuOp {
+    /// Applies the op to the overlay and the scene set: the ONE place that does it, for the live loop and the
+    /// self-test alike. The scene's room-light colours follow the overlay's cover: a cover the overlay refuses
+    /// (malformed pixels or mips) is drawn nowhere and lights nothing, so Focus never glows from an invisible cover.
+    pub fn apply(
+        self,
+        ov: &mut mg_gfx::overlay::Overlay,
+        scene: &mut mg_gfx::scene::SceneSet,
+        device: &mg_gfx::context::Device,
+        queue: &mg_gfx::context::Queue,
+    ) {
+        match self {
+            GpuOp::SetArt(img, extra) => {
+                let mips = extra.as_ref().map_or(&[][..], |e| e.mips.as_slice());
+                let accepted =
+                    ov.set_art_mips(device, queue, (img.width, img.height), &img.rgba, mips);
+                let light = extra.filter(|_| accepted).map(|e| *e.light);
+                scene.set_focus_art(queue, light);
+            }
+            GpuOp::ShiftArt => {
+                ov.shift_art(device);
+                scene.shift_focus_art(queue);
+            }
+            GpuOp::ClearPrevArt => {
+                ov.clear_prev_art(device);
+                scene.clear_prev_focus_art(queue);
+            }
+            GpuOp::ClearArt => {
+                ov.clear_art(device);
+                scene.set_focus_art(queue, None);
+            }
+            GpuOp::SetText(i, b) => {
+                ov.set_text(device, queue, i, (b.width, b.height), &b.coverage);
+            }
+            GpuOp::ClearText(i) => ov.clear_text(device, i),
+        }
+    }
+}
+
 // ---- palette ----------------------------------------------------------------------------------------
 
 fn peak(c: [f32; 3]) -> f32 {
@@ -1630,15 +1669,10 @@ pub fn focus_feed(out: &OverlayParams, slot: [f32; 3]) -> FocusParams {
     }
     // the lyric column: x from the drawn lines, y from the column mask when there is one (the slide moves lines
     // inside it); the cap serves the strictest role in it (current 7:1, context 3:1)
-    let lines: Vec<&TextDraw> = out
-        .lyrics
-        .iter()
-        .flatten()
-        .filter(|d| d.alpha > 0.002)
-        .collect();
-    if let Some(first) = lines.first() {
+    let lines = || out.lyrics.iter().flatten().filter(|d| d.alpha > 0.002);
+    if let Some(first) = lines().next() {
         let mut r = rect(first);
-        for d in &lines[1..] {
+        for d in lines().skip(1) {
             let q = rect(d);
             r = [
                 r[0].min(q[0]),
@@ -1654,10 +1688,7 @@ pub fn focus_feed(out: &OverlayParams, slot: [f32; 3]) -> FocusParams {
         f.ink[n] = r;
         f.ink_cap[n] = pocket_cap(rel_lum(c.lyric), RATIO_TITLE)
             .min(pocket_cap(rel_lum(c.context), RATIO_CONTEXT));
-        f.ink_on[n] = lines
-            .iter()
-            .fold(0.0f32, |m, d| m.max(d.alpha))
-            .clamp(0.0, 1.0);
+        f.ink_on[n] = lines().fold(0.0f32, |m, d| m.max(d.alpha)).clamp(0.0, 1.0);
     }
     f
 }
@@ -3531,5 +3562,39 @@ mod tests {
         let mut z = FocusParams::default();
         r.merge_focus(&mut z);
         assert_eq!(z.ink_on, [0.0; 4]);
+    }
+}
+
+#[cfg(test)]
+mod gpu_op_tests {
+    use super::*;
+    use mg_gfx::context::init_headless;
+    use mg_gfx::overlay::Overlay;
+    use mg_gfx::scene::SceneSet;
+
+    fn image() -> ArtImage {
+        ArtImage {
+            width: 8,
+            height: 8,
+            rgba: (0..64).flat_map(|_| [200, 40, 40, 255]).collect(),
+        }
+    }
+
+    /// The scene's room light follows the overlay's cover: a cover the overlay refuses lights nothing.
+    #[test]
+    fn a_refused_cover_does_not_light_the_room() {
+        let Ok(h) = init_headless() else {
+            eprintln!("SKIPPED (no hardware GPU in this environment)");
+            return;
+        };
+        let mut scene = SceneSet::new_headless(&h.device);
+        let mut ov = Overlay::new_headless(&h.device, &h.queue);
+        let good = art_extra(&image(), ART_MIP_LEVELS).expect("extra");
+        GpuOp::SetArt(image(), Some(good)).apply(&mut ov, &mut scene, &h.device, &h.queue);
+        assert_eq!(scene.focus_art_slots(), [true, false], "accepted cover");
+        let mut bad = art_extra(&image(), ART_MIP_LEVELS).expect("extra");
+        bad.mips[0].pop(); // a malformed mip level: the overlay refuses the cover
+        GpuOp::SetArt(image(), Some(bad)).apply(&mut ov, &mut scene, &h.device, &h.queue);
+        assert_eq!(scene.focus_art_slots(), [false, false], "refused cover");
     }
 }

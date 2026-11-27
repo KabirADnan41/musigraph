@@ -27,7 +27,8 @@ struct MixTargets {
 /// shared group 0 and its own `group1`. Created and owned by the scene set, drawn only when that scene is drawn.
 pub struct PrePass {
     pub pipeline: wgpu::RenderPipeline,
-    pub target: wgpu::TextureView,
+    /// None while the target is released: the pass is then skipped (the scene is not drawn in that state).
+    pub target: Option<wgpu::TextureView>,
     pub group1: wgpu::BindGroup,
 }
 
@@ -268,6 +269,13 @@ impl FullscreenRenderer {
         self.prepass.push((scene, p));
     }
 
+    /// Sets or drops the target of the pass registered for `scene` (see `PrePass::target`).
+    pub fn set_prepass_target(&mut self, scene: usize, target: Option<wgpu::TextureView>) {
+        if let Some((_, pp)) = self.prepass.iter_mut().find(|(i, _)| *i == scene) {
+            pp.target = target;
+        }
+    }
+
     /// Internal render resolution for the given surface size.
     pub fn render_size(&self, surface: (u32, u32)) -> (u32, u32) {
         scaled_size(surface, self.scale)
@@ -412,8 +420,13 @@ impl FullscreenRenderer {
         scene: usize,
         group1: &[(usize, &wgpu::BindGroup)],
     ) {
-        if let Some((_, pp)) = self.prepass.iter().find(|(i, _)| *i == scene) {
-            let mut pre = begin_color_pass(enc, "scene prepass", &pp.target);
+        if let Some((target, pp)) = self
+            .prepass
+            .iter()
+            .find(|(i, _)| *i == scene)
+            .and_then(|(_, pp)| pp.target.as_ref().map(|t| (t, pp)))
+        {
+            let mut pre = begin_color_pass(enc, "scene prepass", target);
             pre.set_pipeline(&pp.pipeline);
             pre.set_bind_group(0, &self.bind_group, &[]);
             pre.set_bind_group(1, &pp.group1, &[]);

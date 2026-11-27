@@ -315,10 +315,11 @@ fn fs_controls(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
         let pp = p - vec2<f32>(mid, c.prog.z);
         // backing: the pill fill at the pill opacity, a thin capsule just around the track, so the line keeps
         // its contrast over a bright scene (TRACK_ALPHA / PLAYED_ALPHA in overlay.rs; checked in controls.rs)
-        // while focused the backing also covers the focus ring (4 px gap, 2 px ring, 1 px margin), so the ring
-        // never sits on the raw scene
+        // while focused the backing also covers the focus ring (4 px gap, 2 px ring), so the ring never sits on the
+        // raw scene: the ring ends 7s + 2rw from the track and the pad is 7s + 3rw, a margin of rw >= 1 px at any
+        // scale (rw has a 1 px floor, so a margin made of multiples of s alone would vanish below scale 1)
         let rw = max(1.0, s);
-        let pad = 3.0 * s + step(0.5, c.prog_p.w) * (5.0 * s + 2.0 * rw);
+        let pad = 3.0 * s + step(0.5, c.prog_p.w) * (4.0 * s + 3.0 * rw);
         let under = cov(sd_round_box(pp, vec2<f32>(hl, ht) + vec2<f32>(pad), ht + pad), 0.75);
         o = over(o, c.bg.rgb, c.bg.w * under * al);
         let trk = cov(sd_round_box(pp, vec2<f32>(hl, ht), ht), 0.75);

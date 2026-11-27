@@ -861,35 +861,7 @@ impl App {
                 .chain(self.ctl.take_ops())
                 .collect();
             for op in ops {
-                match op {
-                    GpuOp::SetArt(img, extra) => {
-                        let mips = extra.as_ref().map_or(&[][..], |e| e.mips.as_slice());
-                        ov.set_art_mips(
-                            &g.device,
-                            &g.queue,
-                            (img.width, img.height),
-                            &img.rgba,
-                            mips,
-                        );
-                        scene.set_focus_art(&g.queue, extra.map(|e| *e.light));
-                    }
-                    GpuOp::ShiftArt => {
-                        ov.shift_art(&g.device);
-                        scene.shift_focus_art(&g.queue);
-                    }
-                    GpuOp::ClearPrevArt => {
-                        ov.clear_prev_art(&g.device);
-                        scene.clear_prev_focus_art(&g.queue);
-                    }
-                    GpuOp::ClearArt => {
-                        ov.clear_art(&g.device);
-                        scene.set_focus_art(&g.queue, None);
-                    }
-                    GpuOp::SetText(i, b) => {
-                        ov.set_text(&g.device, &g.queue, i, (b.width, b.height), &b.coverage);
-                    }
-                    GpuOp::ClearText(i) => ov.clear_text(&g.device, i),
-                }
+                op.apply(ov, scene, &g.device, &g.queue);
             }
         }
         let ops_ms = t_ops.elapsed().as_secs_f64() * 1000.0;

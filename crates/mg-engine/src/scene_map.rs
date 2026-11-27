@@ -140,6 +140,8 @@ struct FluidMap {
     onset_str: f32,
     /// Seconds since the last real onset.
     onset_age: f32,
+    /// Leak-free bass level from the band spectrum (see `BassSkirt`).
+    skirt: BassSkirt,
 }
 
 /// Lissajous periods (s) and phase offsets per emitter (bass, mid, treble), y/x frequency ratios (irrational).
@@ -160,9 +162,120 @@ pub const FLUID_VORTEX_GAP_S: f32 = 0.25;
 const FL_VORTEX_LIFE_S: f32 = 2.0;
 /// How long an onset may wait for its accent to confirm it (the features trail the onset by a frame or two).
 const FL_ONSET_WAIT_S: f32 = 0.1;
-/// Fraction of the 250-500 Hz group (absolute, dB-normalised) that shows up in the 60-250 Hz group as skirt
-/// leakage (measured on a 262 Hz chord fixture: 0.645 vs 0.991).
-const FL_BASS_LEAK: f32 = 0.65;
+/// Edge between the bass group and the low-mid group (Hz); the analyzer's 60-250 Hz group sees the window skirt
+/// of anything just above it.
+const FL_BASS_TOP_HZ: f32 = 250.0;
+/// Bass group lower edge (Hz): below it is sub-bass, which always counts in full.
+const FL_BASS_BOTTOM_HZ: f32 = 60.0;
+/// The band spectrum sits up to ~6% below the group level for the same bass note (its tilt compensation is
+/// steeper at the bottom); this factor gives it back so a real bass is not weakened. A pad stays at exactly 0.
+const FL_BASS_BAND_TILT: f32 = 1.1;
+
+/// Hann-window leakage (dB below the tone) at `gap` FFT bins from a tone: the main lobe, then the sidelobe
+/// envelope (-31 dB at 2.5 bins, -18 dB per octave beyond). The null at 2 bins is not used: a band keeps the
+/// envelope so a leak is never mistaken for bass.
+fn hann_leak_db(gap: f32) -> f32 {
+    const PTS: [(f32, f32); 6] = [
+        (0.0, 0.0),
+        (0.5, 1.4),
+        (1.0, 6.0),
+        (1.5, 15.0),
+        (2.0, 31.0),
+        (2.5, 31.5),
+    ];
+    if gap >= 2.5 {
+        return 31.5 + 18.0 * (gap / 2.5).log2();
+    }
+    let i = PTS
+        .iter()
+        .rposition(|p| p.0 <= gap)
+        .unwrap_or(0)
+        .min(PTS.len() - 2);
+    let (a, b) = (PTS[i], PTS[i + 1]);
+    a.1 + (b.1 - a.1) * ((gap - a.0) / (b.0 - a.0)).clamp(0.0, 1.0)
+}
+
+/// Bass level (0..1, the analyzer's band scale) with the skirt of louder content above 250 Hz removed.
+///
+/// The analyzer's 60-250 Hz group is its loudest FFT bin, so a 262 Hz pad note reads there as "bass". The band
+/// spectrum shows where that energy comes from: leakage from above can never exceed the Hann skirt of the
+/// bands above 250 Hz (`hann_leak_db` at the gap between them), so a band in the group counts only by the
+/// amount it rises over that bound. A real bass sits far below any skirt and counts in full whatever its level
+/// relative to the loud low-mids; a pad's top bands fall under the bound and count for nothing. Known limit: a
+/// real note within about 2 bins (~50 Hz) below 250 Hz under a much louder tone just above it is taken for
+/// leakage. Assumes the default analysis layout (the only one the app runs), else the group level stands.
+struct BassSkirt {
+    sample_rate: u32,
+    bands: usize,
+    /// Per band: lower and upper edge in FFT bins.
+    span: Vec<(f32, f32)>,
+    /// The bass-group bands and the first band above 250 Hz.
+    group: std::ops::Range<usize>,
+    first_above: usize,
+    range_db: f32,
+    /// The medium group smoothing, so the level follows the group's attack and release.
+    smooth: mg_dsp::smooth::Smoother,
+}
+
+impl BassSkirt {
+    fn new() -> Self {
+        let (a, r) = mg_dsp::AnalysisParams::default().medium;
+        Self {
+            sample_rate: 0,
+            bands: 0,
+            span: Vec::new(),
+            group: 0..0,
+            first_above: 0,
+            range_db: 45.0,
+            smooth: mg_dsp::smooth::Smoother::new(a, r),
+        }
+    }
+
+    fn layout(&mut self, sample_rate: u32, bands: usize) {
+        let p = mg_dsp::AnalysisParams::default();
+        let edges = mg_dsp::bands::log_edges_hz(bands, p.f_min, p.f_max);
+        let bin_hz = sample_rate.max(1) as f32 / mg_dsp::FFT_SIZE as f32;
+        self.span = edges
+            .windows(2)
+            .map(|w| (w[0] / bin_hz, w[1] / bin_hz))
+            .collect();
+        let centre = |k: usize| (edges[k] * edges[k + 1]).sqrt();
+        self.group = (0..bands)
+            .filter(|&k| (FL_BASS_BOTTOM_HZ..FL_BASS_TOP_HZ).contains(&centre(k)))
+            .fold(bands..0, |g, k| g.start.min(k)..g.end.max(k + 1));
+        self.first_above = (0..bands)
+            .find(|&k| edges[k] >= FL_BASS_TOP_HZ)
+            .unwrap_or(bands);
+        self.range_db = p.range_db;
+        (self.sample_rate, self.bands) = (sample_rate, bands);
+    }
+
+    /// The smoothed leak-free bass level for this frame, or `None` when the frame has no usable layout.
+    fn level(&mut self, f: &AudioFrame, silent: bool, dt: f32) -> Option<f32> {
+        let bands = f.band_count.min(mg_dsp::MAX_BANDS);
+        if bands != mg_dsp::AnalysisParams::default().band_count {
+            return None;
+        }
+        if (self.sample_rate, self.bands) != (f.sample_rate, bands) {
+            self.layout(f.sample_rate, bands);
+        }
+        let c = |v: f32| fin(v).clamp(0.0, 1.0);
+        let mut best = 0.0f32;
+        for k in self.group.clone() {
+            let lk = c(f.bands[k]);
+            let mut bound = 0.0f32;
+            for j in self.first_above..bands {
+                let drop = hann_leak_db((self.span[j].0 - self.span[k].1).max(0.0)) / self.range_db;
+                if drop >= 1.0 {
+                    break;
+                }
+                bound = bound.max(c(f.bands[j]) - drop);
+            }
+            best = best.max(lk * smoothstep(0.0, 0.1, lk - bound));
+        }
+        Some(self.smooth.step(if silent { 0.0 } else { best }, dt))
+    }
+}
 /// Emitter CENTRES stay in this uv box (y down), above artwork, lyrics and the control bar. Splats can spread
 /// past its sides (the wide treble veil reaches about 0.22 of the width at 16:9; the edge sink absorbs it); the
 /// bottom 38% is protected by the shader zone mask and the sigma clamp, not by this box.
@@ -204,31 +317,35 @@ impl FluidMap {
             onset_wait: 0.0,
             onset_str: 0.0,
             onset_age: 100.0,
+            skirt: BassSkirt::new(),
         }
     }
 
-    /// `silent`: no fresh audio or the analyzer's silence flag. `absolute`: the frame's absolute group levels
-    /// (`AudioFrame::group_medium`, 0..1). `dt` is already sanitised by the caller.
+    /// `silent`: no fresh audio or the analyzer's silence flag. `frame`: its absolute group levels
+    /// (`group_medium`, 0..1) and band spectrum. `dt` is already sanitised by the caller.
     fn update(
         &mut self,
         m: &MusicFeatures,
-        absolute: &[f32; mg_dsp::GROUPS],
+        frame: &AudioFrame,
         silent: bool,
         onsets: u32,
         onset_strength: f32,
         dt: f32,
     ) -> mg_gfx::fluid::FluidParams {
         let c = |v: f32| fin(v).clamp(0.0, 1.0);
+        let absolute = &frame.group_medium;
         let band = |a: &[f32; mg_dsp::GROUPS], i: usize| c(a[2 * i]).max(c(a[2 * i + 1]));
         // AGC normalises every band to its own recent range, so it cannot tell a bass-heavy song from a bright
         // one; the absolute band level gates each emitter (presence) and AGC shapes it within that.
-        // The analyzer's 60-250 Hz group also catches the skirt of a strong 250-500 Hz group (a 262 Hz chord
-        // reads ~0.65 there while the group above reads ~0.99, i.e. leakage ~0.65x the group above). The bass group
-        // counts only to the extent it rises above that leakage estimate, then in full: a pad does not drive the
-        // bass emitter, while a real bass line under loud low-mids keeps its level (it sits well above the
-        // estimate). Sub-bass (< 60 Hz) always counts in full.
-        let leak_excess = c(absolute[1]) - FL_BASS_LEAK * c(absolute[2]);
-        let low_abs = c(absolute[0]).max(c(absolute[1]) * smoothstep(0.0, 0.15, leak_excess));
+        // The analyzer's 60-250 Hz group also catches the skirt of content just above 250 Hz (a 262 Hz chord reads
+        // 0.65 there): the group counts only up to the leak-free level the band spectrum shows (`BassSkirt`), so
+        // a pad does not drive the bass emitter while a real bass line keeps its level under any low-mids.
+        // Sub-bass (< 60 Hz) always counts in full.
+        let bass = match self.skirt.level(frame, silent, dt) {
+            Some(clean) => c(absolute[1]).min(clean * FL_BASS_BAND_TILT),
+            None => c(absolute[1]),
+        };
+        let low_abs = c(absolute[0]).max(bass);
         let presence = |i: usize| (2.0 * if i == 0 { low_abs } else { band(absolute, i) }).min(1.0);
         let drive = |i: usize| 0.4 * band(&m.long, i) + 0.6 * band(&m.short, i);
         let level = if silent { 0.0 } else { c(m.level) };
@@ -836,7 +953,7 @@ impl SceneMapper {
         // Fluid: its own block (never packed into the shared uniform); uses last frame's music features.
         let fluid = self.fluid.update(
             &self.music,
-            &f.group_medium,
+            f,
             silent,
             if live { input.onsets } else { 0 },
             input.onset_strength,
@@ -1351,10 +1468,8 @@ pub(crate) mod fluid_tests {
         }
     }
 
-    /// FL1: kick, pad, sub-bass drone, hats and a 9 kHz tone move differently because their spectral and temporal
-    /// features differ (crest, onsets, low end, centroid), not because of noise or a louder global intensity.
-    /// The pad bass-leak correction subtracts part of the band above 250 Hz: a real bass line under loud
-    /// low-mids must be weakened at most moderately, never hidden (review 2026-11-27 measured about 0.77x).
+    /// A bass line at the same level as loud low-mids keeps most of its strength (the quieter cases are in
+    /// `a_quieter_bass_survives_loud_low_mids`).
     #[test]
     fn a_bass_line_under_loud_low_mids_keeps_most_of_its_strength() {
         let alone = synth::sine(120.0, 0.4, SR, n(8.0));
@@ -1381,6 +1496,150 @@ pub(crate) mod fluid_tests {
         );
     }
 
+    // ---- bass-leak gate fixtures (review A, 2026-11-28) ----------------------------------------
+
+    fn tone(f: f32, a: f32) -> Vec<f32> {
+        synth::sine(f, a, SR, n(8.0))
+    }
+
+    /// Sawtooth-like bass: harmonics 1..=12 at amplitude `a / h` (harmonic-rich, one partial near 250 Hz).
+    fn saw(f0: f32, a: f32) -> Vec<f32> {
+        mix(&(1..=12)
+            .map(|h| tone(f0 * h as f32, a / h as f32))
+            .collect::<Vec<_>>())
+    }
+
+    fn mix(parts: &[Vec<f32>]) -> Vec<f32> {
+        (0..parts[0].len())
+            .map(|i| parts.iter().map(|p| p[i]).sum())
+            .collect()
+    }
+
+    /// `a` lowered by `db` dB.
+    fn under(a: f32, db: f32) -> f32 {
+        a * 10f32.powf(-db / 20.0)
+    }
+
+    /// Loud 300-500 Hz content: one 350 Hz tone, and a 300/400/480 Hz chord.
+    fn loud_tone() -> Vec<f32> {
+        tone(350.0, 0.4)
+    }
+
+    fn loud_chord() -> Vec<f32> {
+        mix(&[tone(300.0, 0.3), tone(400.0, 0.3), tone(480.0, 0.3)])
+    }
+
+    /// Sung-vocal-like partials over a 280 Hz fundamental (just above the 250 Hz group edge).
+    fn vocal() -> Vec<f32> {
+        mix(&[
+            tone(280.0, 0.15),
+            tone(560.0, 0.12),
+            tone(840.0, 0.1),
+            tone(1120.0, 0.08),
+            tone(1400.0, 0.06),
+        ])
+    }
+
+    fn bass_emit(x: &[f32]) -> f32 {
+        char_of(x).bass_emit
+    }
+
+    /// Prints one table row (name, alone, with the loud content) and returns (alone, mixed).
+    fn row(name: &str, alone: &[f32], mixed: &[f32]) -> (f32, f32) {
+        let (a, m) = (bass_emit(alone), bass_emit(mixed));
+        eprintln!(
+            "FLUID bass-gate {name:34} alone {a:.3} mixed {m:.3} kept {:.2}x",
+            m / a.max(1e-6)
+        );
+        (a, m)
+    }
+
+    #[test]
+    fn the_hann_skirt_only_falls_with_distance() {
+        let d: Vec<f32> = (0..80).map(|i| hann_leak_db(i as f32 * 0.1)).collect();
+        assert!(d[0] == 0.0 && d.windows(2).all(|w| w[1] >= w[0]), "{d:?}");
+    }
+
+    /// The pad and any lone tone just above the group edge are skirt leakage, not bass.
+    #[test]
+    fn a_pad_or_lone_tone_above_250_hz_is_not_bass() {
+        let pad_be = bass_emit(&pad(8.0));
+        eprintln!("FLUID bass-gate pad {pad_be:.3}");
+        assert!(pad_be <= 0.05, "pad bass_emit {pad_be}");
+        for f in [262.0, 270.0, 280.0, 300.0] {
+            let b = bass_emit(&tone(f, 0.4));
+            eprintln!("FLUID bass-gate lone {f} Hz {b:.3}");
+            assert!(b <= 0.05, "lone {f} Hz tone bass_emit {b}");
+        }
+    }
+
+    /// A real bass keeps its strength under loud 300-500 Hz content, 6/12/18 dB below it.
+    #[test]
+    fn a_quieter_bass_survives_loud_low_mids() {
+        for (name, loud) in [
+            ("350 Hz tone", loud_tone()),
+            ("300/400/480 chord", loud_chord()),
+        ] {
+            for db in [6.0, 12.0, 18.0] {
+                let b = tone(80.0, under(0.4, db));
+                let m = mix(&[b.clone(), loud.clone()]);
+                let (a, k) = row(&format!("80 Hz -{db} dB under {name}"), &b, &m);
+                assert!(a > 0.3, "bass alone drives the emitter: {a}");
+                assert!(
+                    k >= 0.5 * a,
+                    "80 Hz -{db} dB under {name}: {k} vs alone {a}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_harmonic_rich_bass_and_a_sub_tone_survive_loud_low_mids() {
+        for (name, b) in [
+            ("saw 65 Hz", saw(65.0, 0.1)),
+            ("saw 98 Hz", saw(98.0, 0.1)),
+            ("sub 55 Hz", tone(55.0, 0.1)),
+        ] {
+            let m = mix(&[b.clone(), loud_tone()]);
+            let (a, k) = row(&format!("{name} under a 350 Hz tone"), &b, &m);
+            assert!(a > 0.3, "{name} alone drives the emitter: {a}");
+            assert!(k >= 0.5 * a, "{name} under a 350 Hz tone: {k} vs alone {a}");
+        }
+    }
+
+    /// Maps the skirt curve: lone tones from 100 to 300 Hz. Real bass notes up to the group edge count; the
+    /// tone just above the edge does not.
+    #[test]
+    fn a_tone_sweep_across_the_group_edge_maps_the_skirt() {
+        let curve: Vec<(f32, f32)> = [
+            100.0, 150.0, 200.0, 220.0, 235.0, 250.0, 262.0, 280.0, 300.0,
+        ]
+        .iter()
+        .map(|&f| (f, bass_emit(&tone(f, 0.4))))
+        .collect();
+        eprintln!("FLUID bass-gate skirt {curve:?}");
+        for &(f, b) in &curve {
+            if f <= 200.0 {
+                assert!(b > 0.3, "{f} Hz is bass: {b}");
+            }
+            if f >= 262.0 {
+                assert!(b <= 0.05, "{f} Hz is not bass: {b}");
+            }
+        }
+    }
+
+    /// Kick + bass line + vocal: the vocal (just above the edge) must not take the bass emitter away.
+    #[test]
+    fn a_vocal_over_kick_and_bass_does_not_hide_the_bass() {
+        let base = mix(&[kick(8.0), tone(82.0, 0.22)]);
+        let with = mix(&[base.clone(), vocal()]);
+        let (a, k) = row("kick + bass 82 Hz + vocal", &base, &with);
+        assert!(a > 0.3, "kick + bass alone: {a}");
+        assert!(k >= 0.5 * a, "with vocal {k} vs without {a}");
+    }
+
+    /// FL1: kick, pad, sub-bass drone, hats and a 9 kHz tone move differently because their spectral and temporal
+    /// features differ (crest, onsets, low end, centroid), not because of noise or a louder global intensity.
     #[test]
     fn fluid_motion_character_follows_the_music_features() {
         let [kick, pad, drone, hats, treble] =
