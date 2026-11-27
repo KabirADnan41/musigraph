@@ -654,3 +654,9 @@ The mg-media test count there should read 33 for commit 3eb9341 (36 included 3 u
 - Why: the has_variable_cuts pointer-compare bug passed debug tests and failed only in release (`mg-text` test `fallback...`).
 - Trade-off: the gate is slower (a second full compile of the workspace in release profile).
 - Verification (actual, on 7e79575): scriptserify.cmd VERIFY OK, EXIT 0: fmt, clippy -D warnings, debug tests (audio 10, dsp 41, engine 193, gfx 38, media 93, text 8), RELEASE tests (same counts, all pass, incl. mg-text fallback tests that failed in release before 6cf635b), debug and release builds, skeleton run, dependency sources, privacy gate, allow-list, gitleaks working+history, OSV. Release --scene-selftest: Vulkan, DX12, GL all SELFTEST RESULT ok. Independent Sonnet High review: PASS (4 LOW notes, none actionable). Publication check: all 30 outgoing commits by the noreply identity; no personal paths/emails/keys, no Weyv strings or binaries tracked.
+
+## 2026-11-28 - Milestone: PR #1 merged (baseline)
+- PR https://github.com/KabirADnan41/musigraph/pull/1 merged as a normal merge commit 84fa3ad0252b7cc02d23a8386e80876312ff8f9a (parents a6da0d5 + 8edec50; tree identical to the approved head). Feature branch preserved.
+- Pre-merge: independent Sonnet High publication security/privacy review PASS WITH SUGGESTIONS (4 LOW, tracked in BACKLOG as PR-L1..L4). No GitHub workflows configured (no GitHub checks).
+- Post-merge on 84fa3ad: scripts\verify.cmd VERIFY OK incl. release tests (audio 10, dsp 41, engine 193, gfx 38, media 93, text 8 in debug and release); release scene self-test ok on Vulkan, DX12, GL.
+- Next: feature/scene-selector (this branch).
