@@ -14,7 +14,7 @@ const RES: (u32, u32) = (160, 90);
 
 /// Hardware device for the measurements. `MG_SELFTEST_BACKEND=vulkan|dx12|gl` restricts it to one backend
 /// (to verify the shader on every backend); default is the automatic order.
-fn headless() -> Result<Headless, String> {
+pub(crate) fn headless() -> Result<Headless, String> {
     match std::env::var("MG_SELFTEST_BACKEND")
         .ok()
         .as_deref()
@@ -27,7 +27,7 @@ fn headless() -> Result<Headless, String> {
 
 /// The headless target is a linear `Rgba8Unorm` image while the live surface is sRGB (the hardware encodes on write):
 /// preview PNGs of the Album Focus scene are encoded the same way so they look as they do on screen.
-fn srgb_view(img: &[u8]) -> Vec<u8> {
+pub(crate) fn srgb_view(img: &[u8]) -> Vec<u8> {
     let enc = |v: u8| {
         let l = f32::from(v) / 255.0;
         let c = if l <= 0.003_130_8 {
@@ -1475,6 +1475,7 @@ pub fn run(allow_no_gpu: bool) -> i32 {
     gpu_seen |= fluid_checks(&mut failures);
     gpu_seen |= focus_checks(&mut failures);
     gpu_seen |= panel_previews(&mut failures);
+    gpu_seen |= crate::selftest_transition::transition_checks(&mut failures);
     if !gpu_seen {
         println!(
             "NOTE: no hardware GPU device available; rendered-pixel checks were NOT run (parameter checks ran)."

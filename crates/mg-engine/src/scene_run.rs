@@ -1013,7 +1013,7 @@ impl App {
         );
         let tr = self
             .switch
-            .update(dt as f32, |_| scene_luma(&params.palette));
+            .update(dt as f32, |k| scene_luma(k, &params.palette));
         params.fx = tr.fx();
         let label = self.label(fresh);
         if label != self.title {

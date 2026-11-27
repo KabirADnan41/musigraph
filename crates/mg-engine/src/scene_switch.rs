@@ -140,10 +140,19 @@ pub fn bridge_target(l_src: f32, l_dst: f32) -> f32 {
         .clamp(BRIDGE_MIN, BRIDGE_MAX)
 }
 
-/// Relative-luminance estimate of a scene lit by `palette` (no GPU readback): the scenes share the palette.
-pub fn scene_luma(palette: &[[f32; 3]; 4]) -> f32 {
+/// Relative-luminance estimate of a scene lit by `palette` (no GPU readback; the scenes share the palette). The
+/// per-scene factor is measured: mean idle luminance of each scene over the palette estimate, on the demo fixture
+/// (Spectrum 0.111, Aurora 0.098, Focus 0.024 without cover art, Orb 0.124, Fluid 0.059 against 0.120).
+pub fn scene_luma(kind: SceneKind, palette: &[[f32; 3]; 4]) -> f32 {
     let y = |c: &[f32; 3]| 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
-    0.3 * palette.iter().map(y).sum::<f32>() / 4.0
+    let scale = match kind {
+        SceneKind::Spectrum => 0.93,
+        SceneKind::Aurora => 0.82,
+        SceneKind::Focus => 0.20,
+        SceneKind::Orb => 1.03,
+        SceneKind::Fluid => 0.49,
+    };
+    0.3 * scale * palette.iter().map(y).sum::<f32>() / 4.0
 }
 
 /// Phase shortening factor for `n` requests in the trailing window (1 = none).
