@@ -1,7 +1,8 @@
 //! `--scene` (LIVE system audio) and `--scene-synth NAME` (explicitly labelled SYNTHETIC fixture):
 //! the fullscreen Cinematic Spectrum scene.
 //!
-//! Keys (see `key_action`): Space play/pause, Left/Right previous/next TRACK, `[` `]` previous/next scene,
+//! Keys (see `key_action`): Space play/pause, Left/Right previous/next TRACK (they seek -/+5 s, Shift 15 s,
+//! while the bar's progress line has keyboard focus; Home/End then jump to the start/end), `[` `]` previous/next scene,
 //! 1-9 scene by selector position, L lyrics, A artwork layout, F fullscreen, Esc exit.
 //!
 //! Live path: WASAPI loopback -> capture thread -> central `Analyzer` -> shared latest frame ->
@@ -10,7 +11,8 @@
 //! window title says so. Samples are never stored or logged (ADR-0003).
 
 use crate::controls::{
-    Availability, ButtonId, Click, ControlsUi, FrameInput, Toggles, seek_seconds,
+    Availability, ButtonId, Click, ControlsUi, FrameInput, SEEK_STEP_LONG_S, SEEK_STEP_S, Toggles,
+    key_seek_seconds, seek_seconds,
 };
 use crate::lyric_view::LyricSource;
 use crate::media_feed::MediaFeed;
@@ -105,6 +107,20 @@ fn button_action(b: ButtonId) -> KeyAction {
         ButtonId::Artwork => KeyAction::CycleArtwork,
         ButtonId::Fullscreen => KeyAction::ToggleFullscreen,
         ButtonId::Exit => KeyAction::Exit,
+    }
+}
+
+/// Seek delta (seconds) for a key while the progress line has keyboard focus: Left/Right step 5 s back/forward
+/// (Shift: 15 s), Home/End jump to the start/end (infinite deltas, clamped by `key_seek_seconds`). Only then do
+/// these keys seek; otherwise Left/Right keep their global meaning (previous/next TRACK, `key_action`).
+fn progress_key_delta(code: KeyCode, shift: bool) -> Option<f64> {
+    let step = if shift { SEEK_STEP_LONG_S } else { SEEK_STEP_S };
+    match code {
+        KeyCode::ArrowLeft => Some(-step),
+        KeyCode::ArrowRight => Some(step),
+        KeyCode::Home => Some(f64::NEG_INFINITY),
+        KeyCode::End => Some(f64::INFINITY),
+        _ => None,
     }
 }
 
@@ -349,6 +365,13 @@ struct App {
     timed_out: bool,
     result: Result<(), String>,
     exit_reason: &'static str,
+    /// The window has keyboard focus (an unfocused window never hides the cursor).
+    focused: bool,
+}
+
+/// Immersive mode hides the cursor together with the bar, but never while the window is in the background.
+fn hide_cursor(fullscreen: bool, focused: bool, bar_wanted: bool) -> bool {
+    fullscreen && focused && !bar_wanted
 }
 
 impl App {
@@ -435,7 +458,14 @@ impl ApplicationHandler for App {
                 el.exit()
             }
             WindowEvent::ModifiersChanged(m) => self.mods = m.state(),
-            WindowEvent::Focused(false) => self.mods = ModifiersState::empty(),
+            WindowEvent::Focused(focused) => {
+                self.focused = focused;
+                if !focused {
+                    // alt-tab while a button is held: no release event will come, so nothing may stay pressed
+                    self.mods = ModifiersState::empty();
+                    self.ctl.focus_lost();
+                }
+            }
             WindowEvent::KeyboardInput {
                 event:
                     KeyEvent {
@@ -470,7 +500,11 @@ impl ApplicationHandler for App {
 
     fn about_to_wait(&mut self, el: &ActiveEventLoop) {
         // Immersive mode: the cursor hides together with the control bar (one idle timer, `Visibility`).
-        let hide = self.opts.fullscreen && !self.ctl.vis.wants_visible();
+        let hide = hide_cursor(
+            self.opts.fullscreen,
+            self.focused,
+            self.ctl.vis.wants_visible(),
+        );
         if hide != self.cursor_hidden {
             if let Some(w) = &self.window {
                 w.set_cursor_visible(!hide);
@@ -563,13 +597,27 @@ impl App {
     fn on_key(&mut self, el: &ActiveEventLoop, code: KeyCode, repeat: bool) {
         self.sync_view();
         self.ctl.key_activity();
+        // the focused progress line takes Left/Right/Home/End (key repeat allowed: holding an arrow keeps seeking)
+        if toggle_allowed(self.mods)
+            && self.ctl.progress_focused(&self.availability())
+            && let Some(delta) = progress_key_delta(code, self.mods.shift_key())
+        {
+            let now = Instant::now();
+            let target = self.last_np.as_ref().and_then(|n| {
+                key_seek_seconds(n.position_now(now).unwrap_or(0.0), delta, n.duration_s?)
+            });
+            if let Some(t) = target {
+                self.media.send(MediaCommand::SeekTo(t), now);
+            }
+            return;
+        }
         if !repeat && toggle_allowed(self.mods) {
             let av = self.availability();
             match code {
                 KeyCode::Tab => return self.ctl.tab(self.mods.shift_key(), &av),
                 KeyCode::Enter | KeyCode::NumpadEnter | KeyCode::Space => {
                     if let Some(b) = self.ctl.activate_focused(&av) {
-                        return self.run_action(el, button_action(b));
+                        return self.run_button(el, b);
                     }
                 }
                 _ => {}
@@ -580,11 +628,19 @@ impl App {
         }
     }
 
+    /// A bar button (click or keyboard activation): the same action as its key, but its own exit reason.
+    fn run_button(&mut self, el: &ActiveEventLoop, b: ButtonId) {
+        self.run_action(el, button_action(b));
+        if b == ButtonId::Exit {
+            self.exit_reason = "Exit button";
+        }
+    }
+
     fn on_left_button(&mut self, el: &ActiveEventLoop, down: bool) {
         self.sync_view();
         let av = self.availability();
         match self.ctl.mouse_left(down, &av) {
-            Some(Click::Button(b)) => self.run_action(el, button_action(b)),
+            Some(Click::Button(b)) => self.run_button(el, b),
             Some(Click::Seek(f)) => {
                 if let Some(d) = self.last_np.as_ref().and_then(|n| n.duration_s) {
                     // same command path as the keys: capability-gated, rate-limited, never blocks
@@ -690,9 +746,11 @@ impl App {
             SceneKind::Focus if self.pres.layout() == Layout::Center => 0.80,
             SceneKind::Focus => 0.72,
         };
-        // While the bar is visible the lyrics ride above it (eased by the bar's own 250 ms lift ramp).
-        self.pres
-            .set_lyric_anchor(anchor - self.ctl.lyric_lift(anchor));
+        // While the bar is visible the lyrics ride above it. The bar advances first so the lift follows this
+        // frame's bar alpha (applied after the lyric easing: no lag, no overlap with a visible bar).
+        self.ctl.advance(dt as f32);
+        self.pres.set_lyric_anchor(anchor);
+        self.pres.set_lyric_lift(self.ctl.lyric_lift(anchor));
         let mut overlay_params = self
             .pres
             .update(dt as f32, surface, params.energy, params.swell);
@@ -966,6 +1024,7 @@ pub fn run(opts: SceneOpts) -> i32 {
         timed_out: false,
         result: Ok(()),
         exit_reason: "event loop ended",
+        focused: true,
     };
     if let Err(e) = event_loop.run_app(&mut app) {
         eprintln!("event loop error: {e}");
@@ -1028,6 +1087,43 @@ mod tests {
 
     fn a(s: &[&str]) -> Vec<String> {
         s.iter().map(|x| x.to_string()).collect()
+    }
+
+    #[test]
+    fn progress_keys_seek_and_only_they_do() {
+        assert_eq!(progress_key_delta(KeyCode::ArrowLeft, false), Some(-5.0));
+        assert_eq!(progress_key_delta(KeyCode::ArrowRight, false), Some(5.0));
+        assert_eq!(progress_key_delta(KeyCode::ArrowRight, true), Some(15.0));
+        assert_eq!(progress_key_delta(KeyCode::ArrowLeft, true), Some(-15.0));
+        assert_eq!(
+            progress_key_delta(KeyCode::Home, false),
+            Some(f64::NEG_INFINITY)
+        );
+        assert_eq!(progress_key_delta(KeyCode::End, false), Some(f64::INFINITY));
+        for k in [
+            KeyCode::Space,
+            KeyCode::Enter,
+            KeyCode::Tab,
+            KeyCode::Escape,
+            KeyCode::KeyF,
+        ] {
+            assert_eq!(
+                progress_key_delta(k, false),
+                None,
+                "{k:?} keeps its meaning"
+            );
+        }
+    }
+
+    #[test]
+    fn the_cursor_hides_only_in_focused_fullscreen_with_the_bar_away() {
+        assert!(hide_cursor(true, true, false));
+        assert!(
+            !hide_cursor(true, false, false),
+            "alt-tabbed away: cursor stays"
+        );
+        assert!(!hide_cursor(true, true, true));
+        assert!(!hide_cursor(false, true, false));
     }
 
     #[test]

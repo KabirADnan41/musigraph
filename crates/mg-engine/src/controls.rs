@@ -39,7 +39,10 @@ pub const IDLE_S: f32 = 2.5;
 /// Pointer must travel this far (px) from where it last counted as activity to show the bar.
 pub const MOVE_PX: f32 = 4.0;
 const RISE_PX: f32 = 8.0;
-const LIFT_S: f32 = 0.25;
+/// The lyrics are fully lifted whenever the bar's alpha is at least this (they never overlap a visible bar).
+const LIFT_FULL_ALPHA: f32 = 0.05;
+/// Once the bar is (nearly) gone the lyrics settle back down with this time constant instead of snapping.
+const LIFT_SETTLE_S: f32 = 0.09;
 /// Lyrics rise at least this much of the surface height while the bar is visible.
 pub const LYRIC_LIFT: f32 = 0.067;
 const HOVER_S: f32 = 0.12;
@@ -47,6 +50,19 @@ const PRESS_S: f32 = 0.08;
 const DISABLED_OPACITY: f32 = 0.35;
 /// Above this alpha the bar counts as visible for clicks and keys.
 const INTERACTIVE_ALPHA: f32 = 0.5;
+/// Keyboard seek steps on the focused progress line (Shift: the long step).
+pub const SEEK_STEP_S: f64 = 5.0;
+pub const SEEK_STEP_LONG_S: f64 = 15.0;
+
+// ---- contrast (WCAG 2.x relative luminance; linear-light compositing like the shader) ------------------------
+/// Pill fill (also the progress backing and the time-text scrims): the palette tint, darkened.
+const BG_BASE: f32 = 0.003;
+const BG_TINT: f32 = 0.03;
+/// Pill / backing opacity: the smallest that keeps resting icons and the time texts >= 4.5:1 even over a white
+/// scene (derived in `contrast_tests`).
+pub const PILL_ALPHA: f32 = 0.88;
+/// Icons, times and the progress line never get darker than this per channel (palette text colours vary).
+const FG_MIN: f32 = 0.85;
 
 // ---- buttons ------------------------------------------------------------------------------------------------
 
@@ -307,18 +323,38 @@ pub fn lyric_lift(anchor: f32, surface: (u32, u32), dpi: f32) -> f32 {
     ((lowest - zone_top + clearance) / h).clamp(LYRIC_LIFT, 0.30)
 }
 
-/// "m:ss" (or "h:mm:ss"); unknown or negative values show 0:00.
-pub fn fmt_time(secs: f64) -> String {
-    let t = if secs.is_finite() && secs > 0.0 {
+/// Whole seconds shown for a time; unknown or negative values are 0.
+fn whole_secs(secs: f64) -> u64 {
+    if secs.is_finite() && secs > 0.0 {
         secs as u64
     } else {
         0
-    };
+    }
+}
+
+/// Seek target for a key on the focused progress line: `delta` seconds from `position` (Home/End pass
+/// `f64::NEG_INFINITY` / `f64::INFINITY`), clamped to 0..=duration-0.25 like a click (never rolls over).
+pub fn key_seek_seconds(position: f64, delta: f64, duration: f64) -> Option<f64> {
+    if !(duration.is_finite() && duration > 0.0) || delta.is_nan() {
+        return None;
+    }
+    let p = if position.is_finite() { position } else { 0.0 };
+    Some((p + delta).clamp(0.0, (duration - 0.25).max(0.0)))
+}
+
+/// "m:ss" (or "h:mm:ss"); unknown or negative values show 0:00.
+pub fn fmt_time(secs: f64) -> String {
+    let t = whole_secs(secs);
     if t >= 3600 {
         format!("{}:{:02}:{:02}", t / 3600, t % 3600 / 60, t % 60)
     } else {
         format!("{}:{:02}", t / 60, t % 60)
     }
+}
+
+/// Pill fill (linear RGB) for a palette tint: the tint, darkened (also the progress backing and time scrims).
+fn pill_bg(tint: [f32; 3]) -> [f32; 3] {
+    tint.map(|c| BG_BASE + BG_TINT * c.clamp(0.0, 1.0))
 }
 
 // ---- visibility state machine --------------------------------------------------------------------------------
@@ -334,7 +370,7 @@ pub struct Visibility {
     hovering: bool,
     pressed: bool,
     always: bool,
-    lift_p: f32,
+    lift: f32,
 }
 
 fn smoothstep(p: f32) -> f32 {
@@ -351,7 +387,7 @@ impl Visibility {
             hovering: false,
             pressed: false,
             always,
-            lift_p: 0.0,
+            lift: 0.0,
         }
     }
 
@@ -400,9 +436,14 @@ impl Visibility {
             let u = (u + dt / HIDE_FADE_S).min(1.0);
             self.alpha = 1.0 - u * u;
         }
-        let target = if self.wants { 1.0 } else { 0.0 };
-        let step = dt / LIFT_S;
-        self.lift_p += (target - self.lift_p).clamp(-step, step);
+        // The lift follows the bar's real alpha: never below what the bar needs (full from LIFT_FULL_ALPHA up);
+        // only once the bar is nearly gone does it settle back down, smoothly.
+        let need = smoothstep((self.alpha / LIFT_FULL_ALPHA).clamp(0.0, 1.0));
+        self.lift = if need >= self.lift {
+            need
+        } else {
+            need.max(self.lift * (-dt / LIFT_SETTLE_S).exp())
+        };
     }
 
     pub fn alpha(&self) -> f32 {
@@ -423,9 +464,9 @@ impl Visibility {
         self.alpha >= INTERACTIVE_ALPHA
     }
 
-    /// 0..1: how far the lyrics have risen (smooth, interruptible, 250 ms).
+    /// 0..1: how far the lyrics have risen (1 whenever the bar's alpha is >= `LIFT_FULL_ALPHA`).
     pub fn lift(&self) -> f32 {
-        smoothstep(self.lift_p.clamp(0.0, 1.0))
+        self.lift.clamp(0.0, 1.0)
     }
 
     /// 8 px rise (towards the bottom while hidden), in design px.
@@ -436,30 +477,56 @@ impl Visibility {
 
 // ---- keyboard focus -----------------------------------------------------------------------------------------
 
-/// Keyboard focus across the enabled buttons. The ring is shown only when focus came from the keyboard.
+/// Keyboard focus across the progress line (when seeking is possible) and the enabled buttons. The ring is
+/// shown only when focus came from the keyboard.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Focus {
     cur: Option<ButtonId>,
+    /// The progress line has focus (then `cur` is `None`).
+    prog: bool,
     keyboard: bool,
 }
 
 impl Focus {
-    /// Tab (`back` = Shift+Tab): next/previous enabled button in visual order, wrapping around.
+    /// Tab (`back` = Shift+Tab) over the buttons only (see `tab_with`).
+    #[cfg(test)]
     pub fn tab(&mut self, back: bool, ok: impl Fn(ButtonId) -> bool) {
-        let n = ButtonId::ALL.len();
-        let start = match (self.cur, back) {
-            (Some(c), false) => c.index() + 1,
-            (Some(c), true) => c.index() + n - 1,
+        self.tab_with(back, ok, false);
+    }
+
+    /// Tab (`back` = Shift+Tab): next/previous focusable, wrapping around: the enabled buttons left to right,
+    /// then the progress line (only when `prog_ok`; last, so Tab from nothing still starts at the transport).
+    pub fn tab_with(&mut self, back: bool, ok: impl Fn(ButtonId) -> bool, prog_ok: bool) {
+        let nb = ButtonId::ALL.len();
+        let n = nb + 1; // slot i < nb = button i, slot nb = progress
+        let cur = if self.prog {
+            Some(nb)
+        } else {
+            self.cur.map(ButtonId::index)
+        };
+        let start = match (cur, back) {
+            (Some(c), false) => c + 1,
+            (Some(c), true) => c + n - 1,
             (None, false) => 0,
             (None, true) => n - 1,
         };
-        self.cur = (0..n)
-            .map(|k| {
-                let i = if back { start + n - k } else { start + k } % n;
-                ButtonId::ALL[i]
-            })
-            .find(|b| ok(*b));
-        self.keyboard = self.cur.is_some();
+        let slot = (0..n)
+            .map(|k| if back { start + n - k } else { start + k } % n)
+            .find(|&i| {
+                if i == nb {
+                    prog_ok
+                } else {
+                    ok(ButtonId::ALL[i])
+                }
+            });
+        self.prog = slot == Some(nb);
+        self.cur = slot.filter(|&i| i < nb).map(|i| ButtonId::ALL[i]);
+        self.keyboard = slot.is_some();
+    }
+
+    /// The progress line has keyboard focus (draw its ring; arrows seek).
+    pub fn progress_ring(&self) -> bool {
+        self.prog && self.keyboard
     }
 
     pub fn clear(&mut self) {
@@ -469,6 +536,13 @@ impl Focus {
     /// Drops focus when its button has become disabled.
     pub fn retain(&mut self, ok: impl Fn(ButtonId) -> bool) {
         if self.cur.is_some_and(|b| !ok(b)) {
+            self.clear();
+        }
+    }
+
+    /// Drops progress focus when seeking has become unavailable.
+    fn retain_progress(&mut self, ok: bool) {
+        if self.prog && !ok {
             self.clear();
         }
     }
@@ -485,7 +559,9 @@ impl Focus {
 /// (so once per second for the elapsed time), only while the bar is shown.
 #[derive(Default)]
 struct Clock {
-    asked: [Option<String>; 2],
+    /// Whole seconds last requested per slot (the string is formatted only when this changes: no per-frame
+    /// allocation).
+    asked: [Option<u64>; 2],
     px: f32,
     serial: [u64; 2],
     dims: [Option<(u32, u32, u32)>; 2],
@@ -494,7 +570,7 @@ struct Clock {
 impl Clock {
     fn want(
         &mut self,
-        texts: [Option<String>; 2],
+        texts: [Option<u64>; 2],
         px: f32,
         jobs: &mut Vec<Job>,
         ops: &mut Vec<GpuOp>,
@@ -505,11 +581,11 @@ impl Clock {
                 continue;
             }
             self.serial[i] += 1;
-            match &text {
+            match text {
                 Some(t) => jobs.push(Job::Clock {
                     serial: self.serial[i],
                     slot: i,
-                    text: t.clone(),
+                    text: fmt_time(t as f64),
                     px,
                 }),
                 None => {
@@ -587,6 +663,8 @@ pub struct ControlsUi {
     clock: Clock,
     jobs: Vec<Job>,
     ops: Vec<GpuOp>,
+    /// `advance` already ran for this frame (so `frame` does not tick a second time).
+    advanced: bool,
 }
 
 fn step_to(v: &mut f32, target: f32, dt: f32, dur: f32) {
@@ -611,7 +689,32 @@ impl ControlsUi {
             clock: Clock::default(),
             jobs: Vec::new(),
             ops: Vec::new(),
+            advanced: false,
         }
+    }
+
+    /// Advances the visibility by `dt` ahead of `frame`, so the lyric lift of this frame already follows this
+    /// frame's bar alpha (the lyrics are laid out before the bar is drawn). Optional: `frame` ticks otherwise.
+    pub fn advance(&mut self, dt: f32) {
+        let hover_area = self.cursor.is_some_and(|p| self.geom.area.contains(p));
+        self.vis.set_hovering(hover_area);
+        self.vis.tick(dt);
+        self.advanced = true;
+    }
+
+    /// The window lost focus: the same as the pointer leaving (no mouse button can stay held, so an alt-tab
+    /// while pressing cannot pin the bar), and keyboard focus mode ends.
+    pub fn focus_lost(&mut self) {
+        self.pointer_left();
+        self.vis.set_hovering(false);
+        self.focus.clear();
+        self.press = [0.0; CONTROL_BUTTONS];
+    }
+
+    /// The progress line has keyboard focus while the bar is visible and seeking works: Left/Right/Home/End
+    /// seek instead of changing tracks.
+    pub fn progress_focused(&self, av: &Availability) -> bool {
+        self.vis.interactive() && self.focus.progress_ring() && av.can_seek()
     }
 
     /// Current surface and DPI factor; recomputes the layout when they changed.
@@ -657,6 +760,8 @@ impl ControlsUi {
         if far {
             self.anchor = Some(pos);
             self.vis.activity();
+            // real mouse use ends keyboard focus mode (focus-visible): the ring hides, Space is global again
+            self.focus.clear();
         }
     }
 
@@ -699,10 +804,11 @@ impl ControlsUi {
         }
     }
 
-    /// Tab / Shift+Tab: shows the bar and moves the focus ring across enabled buttons.
+    /// Tab / Shift+Tab: shows the bar and moves the focus ring across the enabled buttons and (when seeking
+    /// works) the progress line.
     pub fn tab(&mut self, back: bool, av: &Availability) {
         self.vis.activity();
-        self.focus.tab(back, |b| enabled(b, av));
+        self.focus.tab_with(back, |b| enabled(b, av), av.can_seek());
     }
 
     /// Enter / Space: the focused button, when the bar is visible, focus came from the keyboard and the
@@ -718,9 +824,10 @@ impl ControlsUi {
     /// Advances all state by `dt` and returns what to draw (`None` while hidden: zero draw cost).
     pub fn frame(&mut self, i: &FrameInput) -> Option<ControlsDraw> {
         let g = self.geom;
-        let hover_area = self.cursor.is_some_and(|p| g.area.contains(p));
-        self.vis.set_hovering(hover_area);
-        self.vis.tick(i.dt);
+        if !std::mem::take(&mut self.advanced) {
+            self.advance(i.dt);
+            self.advanced = false;
+        }
         if self.vis.fully_hidden() {
             self.focus.clear();
             self.pressed = None;
@@ -729,10 +836,13 @@ impl ControlsUi {
             self.prog_hover = 0.0;
         }
         let want_texts = !self.vis.fully_hidden() && i.av.has_timeline;
+        let duration = i.duration.filter(|d| *d > 0.0);
         let texts = if want_texts {
             [
-                i.position.map(fmt_time),
-                i.duration.filter(|d| *d > 0.0).map(fmt_time),
+                // elapsed never shows more than the duration (positions can overshoot at the end of a track)
+                i.position
+                    .map(|p| whole_secs(duration.map_or(p, |d| p.min(d)))),
+                duration.map(whole_secs),
             ]
         } else {
             [None, None]
@@ -744,6 +854,7 @@ impl ControlsUi {
             return None;
         }
         self.focus.retain(|b| enabled(b, &i.av));
+        self.focus.retain_progress(i.av.can_seek());
         let live = self.vis.interactive();
         let over = self.cursor.and_then(|p| hit_test(&g, p)).filter(|_| live);
         let prog_over =
@@ -804,6 +915,7 @@ impl ControlsUi {
                 half_thick: (1.5 + 1.5 * self.prog_hover) * s,
                 frac: (i.position.unwrap_or(0.0) / d).clamp(0.0, 1.0) as f32,
                 hover: self.prog_hover,
+                focus: self.focus.progress_ring(),
             }
         });
         let text_rect = |slot: usize, right_aligned: bool| {
@@ -835,10 +947,9 @@ impl ControlsUi {
             elapsed: text_rect(0, true),
             duration: text_rect(1, false),
             time_alpha: 1.0,
-            // palette bg, darkened to roughly OKLab L 0.12
-            bg: tint.map(|c| 0.004 + 0.06 * c),
-            bg_alpha: 0.62,
-            fg: i.fg,
+            bg: pill_bg(tint),
+            bg_alpha: PILL_ALPHA,
+            fg: i.fg.map(|c| c.max(FG_MIN)),
             // accent: the palette tint lifted to a readable brightness
             accent: tint.map(|c| (0.30 + 0.70 * c / peak).min(1.0)),
         })
@@ -1011,11 +1122,12 @@ mod tests {
         assert!(v.alpha() > 0.999 && v.wants_visible());
         let mut v = Visibility::new(false);
         v.activity();
-        run(&mut v, 0.125, 1000.0);
-        let half = v.lift();
+        // (requirement changed in the review fixes: the lift follows the bar's alpha, not its own 250 ms ramp)
+        v.tick(0.001);
+        let early = v.lift();
         assert!(
-            half > 0.3 && half < 0.7,
-            "mid-way after half of 250 ms: {half}"
+            early > 0.0 && early < 1.0 && v.alpha() < LIFT_FULL_ALPHA,
+            "eases in with the first alpha: {early}"
         );
         run(&mut v, 0.2, 1000.0);
         assert!((v.lift() - 1.0).abs() < 1e-6);
@@ -1609,5 +1721,258 @@ mod tests {
         assert!((u.lyric_lift(0.72) - lyric_lift(0.72, HD, 1.0)).abs() < 1e-3);
         run(&mut u.vis, 5.0, 60.0);
         assert!(u.lyric_lift(0.72) < 1e-6, "no lift when hidden");
+    }
+
+    #[test]
+    fn lyric_lift_is_full_while_the_bar_is_visible_and_settles_only_once_it_is_nearly_gone() {
+        for fps in [30.0f32, 60.0, 144.0] {
+            let dt = 1.0 / fps;
+            let mut v = Visibility::new(false);
+            v.activity();
+            for _ in 0..(0.5 * fps) as usize {
+                v.tick(dt);
+                if v.alpha() >= LIFT_FULL_ALPHA {
+                    assert!(
+                        v.lift() > 0.999,
+                        "show {fps}: alpha {} lift {}",
+                        v.alpha(),
+                        v.lift()
+                    );
+                }
+            }
+            // hide: held at 1 while the bar is still at least faintly there, then settles smoothly
+            let mut prev = v.lift();
+            let mut t = 0.0;
+            while t < IDLE_S + HIDE_FADE_S + 1.0 {
+                v.tick(dt);
+                t += dt;
+                if v.alpha() >= 0.1 {
+                    assert!(
+                        v.lift() > 0.999,
+                        "hide {fps}: alpha {} lift {}",
+                        v.alpha(),
+                        v.lift()
+                    );
+                }
+                assert!(
+                    v.lift() <= prev + 1e-6,
+                    "never bounces back up while hiding"
+                );
+                assert!(prev - v.lift() < 0.5, "no snap: {prev} -> {}", v.lift());
+                prev = v.lift();
+            }
+            assert!(v.lift() < 1e-3 && v.fully_hidden());
+        }
+    }
+
+    #[test]
+    fn focus_loss_releases_a_held_button_so_the_bar_can_hide() {
+        let a = all();
+        let mut u = ui_visible();
+        u.pointer_moved(centre(&u, ButtonId::Next));
+        u.mouse_left(true, &a); // alt-tab now: the release never arrives
+        u.focus_lost();
+        let mut i = input(a);
+        i.dt = 0.05;
+        for _ in 0..((IDLE_S + HIDE_FADE_S + 0.5) / 0.05) as usize {
+            u.frame(&i);
+        }
+        assert!(
+            u.vis.fully_hidden(),
+            "a press held across focus loss does not pin the bar"
+        );
+        assert_eq!(
+            u.mouse_left(false, &a),
+            None,
+            "the late release clicks nothing"
+        );
+        // keyboard focus mode ends too
+        let mut u = ui_visible();
+        u.tab(false, &a);
+        u.focus_lost();
+        assert_eq!(u.activate_focused(&a), None);
+    }
+
+    #[test]
+    fn the_progress_line_is_last_in_the_tab_order_only_when_seeking_works() {
+        let a = all();
+        let mut u = ui_visible();
+        for b in ButtonId::ALL {
+            u.tab(false, &a);
+            assert_eq!(u.activate_focused(&a), Some(b));
+            assert!(!u.progress_focused(&a));
+        }
+        u.tab(false, &a);
+        assert!(u.progress_focused(&a), "after Exit");
+        assert_eq!(
+            u.activate_focused(&a),
+            None,
+            "Space on the progress line stays global"
+        );
+        let d = u.frame(&input(a)).unwrap();
+        assert!(d.progress.unwrap().focus && d.buttons.iter().all(|b| !b.focus));
+        u.tab(false, &a);
+        assert_eq!(u.activate_focused(&a), Some(ButtonId::Previous), "wraps");
+        u.tab(true, &a);
+        assert!(u.progress_focused(&a), "Shift+Tab back onto it");
+        // read-only session or no timeline: never focusable, and focus on it is dropped
+        let ro = av(
+            Capabilities {
+                can_seek: false,
+                ..Capabilities::all()
+            },
+            PlaybackState::Playing,
+            true,
+        );
+        assert!(!u.progress_focused(&ro));
+        u.frame(&input(ro));
+        assert!(!u.progress_focused(&a), "dropped once seeking went away");
+        let mut u = ui_visible();
+        u.tab(true, &ro);
+        assert_eq!(u.activate_focused(&ro), Some(ButtonId::Exit));
+        let nt = av(Capabilities::all(), PlaybackState::Playing, false);
+        let mut u = ui_visible();
+        u.tab(true, &nt);
+        assert_eq!(u.activate_focused(&nt), Some(ButtonId::Exit));
+    }
+
+    #[test]
+    fn key_seeks_step_from_the_position_and_clamp_like_a_click() {
+        assert_eq!(key_seek_seconds(30.0, -SEEK_STEP_S, 120.0), Some(25.0));
+        assert_eq!(key_seek_seconds(30.0, SEEK_STEP_LONG_S, 120.0), Some(45.0));
+        assert_eq!(key_seek_seconds(3.0, -SEEK_STEP_S, 120.0), Some(0.0));
+        assert_eq!(
+            key_seek_seconds(118.0, SEEK_STEP_S, 120.0),
+            Some(119.75),
+            "never the very end"
+        );
+        assert_eq!(
+            key_seek_seconds(60.0, f64::NEG_INFINITY, 120.0),
+            Some(0.0),
+            "Home"
+        );
+        assert_eq!(
+            key_seek_seconds(60.0, f64::INFINITY, 120.0),
+            Some(119.75),
+            "End"
+        );
+        assert_eq!(key_seek_seconds(f64::NAN, SEEK_STEP_S, 120.0), Some(5.0));
+        assert_eq!(key_seek_seconds(10.0, 5.0, 0.0), None);
+        assert_eq!(key_seek_seconds(10.0, 5.0, f64::NAN), None);
+        assert_eq!(key_seek_seconds(10.0, f64::NAN, 100.0), None);
+    }
+
+    #[test]
+    fn real_pointer_movement_ends_keyboard_focus_mode() {
+        let a = all();
+        let mut u = ui_visible();
+        u.pointer_moved((10.0, 10.0));
+        u.tab(false, &a);
+        u.pointer_moved((11.0, 11.0)); // jitter below the threshold keeps it
+        assert_eq!(u.activate_focused(&a), Some(ButtonId::Previous));
+        u.pointer_moved((40.0, 40.0));
+        assert_eq!(
+            u.activate_focused(&a),
+            None,
+            "Space is the global shortcut again"
+        );
+        assert!(u.frame(&input(a)).unwrap().buttons.iter().all(|b| !b.focus));
+    }
+
+    #[test]
+    fn elapsed_text_never_exceeds_the_duration() {
+        let mut u = ui_visible();
+        let mut i = input(all());
+        i.position = Some(125.4);
+        u.frame(&i);
+        let texts: Vec<_> = u
+            .take_jobs()
+            .into_iter()
+            .filter_map(|j| match j {
+                Job::Clock { slot, text, .. } => Some((slot, text)),
+                _ => None,
+            })
+            .collect();
+        assert!(texts.contains(&(0, "2:00".to_string())), "{texts:?}");
+        assert!(texts.contains(&(1, "2:00".to_string())), "{texts:?}");
+    }
+
+    // ---- contrast --------------------------------------------------------------------------------------------
+
+    /// WCAG contrast ratio of two relative luminances.
+    fn ratio(a: f32, b: f32) -> f32 {
+        (a.max(b) + 0.05) / (a.min(b) + 0.05)
+    }
+
+    /// Relative luminance of linear RGB.
+    fn lum(c: [f32; 3]) -> f32 {
+        0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2]
+    }
+
+    /// `src` at `a` over `dst` (luminance is linear, so compositing luminances is exact).
+    fn over(dst: f32, src: f32, a: f32) -> f32 {
+        src * a + dst * (1.0 - a)
+    }
+
+    /// Worst-case backing luminance (pill fill at `alpha` over every scene luminance 0..=1 and every tint).
+    fn backings(alpha: f32) -> impl Iterator<Item = f32> {
+        let tints = [
+            [0.0; 3],
+            [1.0; 3],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.2, 0.4, 0.8],
+        ];
+        (0..=100).flat_map(move |k| {
+            tints
+                .into_iter()
+                .map(move |t| over(k as f32 / 100.0, lum(pill_bg(t)), alpha))
+        })
+    }
+
+    /// Darkest icon / text colour the bar can draw.
+    fn fg_lum() -> f32 {
+        lum([FG_MIN; 3])
+    }
+
+    fn icons_ok(alpha: f32) -> bool {
+        backings(alpha).all(|b| ratio(over(b, fg_lum(), 1.0), b) >= 4.5)
+    }
+
+    #[test]
+    fn pill_alpha_is_the_smallest_that_keeps_icons_and_times_at_4_5_to_1_over_any_scene() {
+        let min = (0..=1000)
+            .map(|k| k as f32 / 1000.0)
+            .find(|a| icons_ok(*a))
+            .expect("some opacity works");
+        assert!(
+            icons_ok(PILL_ALPHA),
+            "icons and the time texts (same scrim) >= 4.5:1"
+        );
+        assert!(
+            PILL_ALPHA <= min + 0.02,
+            "restrained: {PILL_ALPHA} vs the minimum {min}"
+        );
+        // the times use the same fill and opacity as their scrim, and the shader really draws those scrims
+        let src = include_str!("../../mg-gfx/src/overlay.wgsl");
+        assert!(src.contains("o = over(o, c.bg.rgb, c.bg.w * scrim * ta);"));
+        assert!(src.contains("o = over(o, c.bg.rgb, c.bg.w * under * al);"));
+    }
+
+    #[test]
+    fn progress_line_keeps_3_to_1_over_its_backing_on_any_scene() {
+        use mg_gfx::overlay::{PLAYED_ALPHA, TRACK_ALPHA};
+        let src = include_str!("../../mg-gfx/src/overlay.wgsl");
+        assert_eq!((TRACK_ALPHA, PLAYED_ALPHA), (0.12, 0.95));
+        assert!(
+            src.contains("trk * (0.12 + 0.83 * played)"),
+            "shader mirrors the constants"
+        );
+        for b in backings(PILL_ALPHA) {
+            let played = over(b, fg_lum(), PLAYED_ALPHA);
+            let rest = over(b, fg_lum(), TRACK_ALPHA);
+            assert!(ratio(played, b) >= 3.0, "played vs backing {b}");
+            assert!(ratio(played, rest) >= 3.0, "played vs unplayed {b}");
+        }
     }
 }

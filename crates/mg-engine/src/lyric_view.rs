@@ -31,6 +31,10 @@ const FADE_OUT_S: f32 = 0.30;
 const NEXT_ALPHA: f32 = 0.35;
 /// Distance between the previous, current and next line, in line heights.
 const BAND: f32 = 1.35;
+/// Lyric text size as a fraction of the window height, line height and rendered bitmap height in text sizes.
+const TEXT_FRAC: f32 = 0.036;
+const LINE_H: f32 = 1.4;
+const BITMAP_H: f32 = 1.6;
 /// First text-texture slot used by lyrics (0 and 1 are title and artist).
 pub const FIRST_TEXT_SLOT: usize = 2;
 
@@ -58,20 +62,23 @@ pub struct LyricView {
     slots: [Slot; 3],
     /// Vertical position of the current line as a fraction of the window height (set per scene).
     anchor: f32,
+    /// Extra rise (fraction of the window height) while the control                         let step = |bar shows. Applied after the position
+    /// easing, so the lines follow the bar's alpha exactly instead of lagging behind it.
+    lift: f32,
     /// Window size the cached line bitmaps were rendered for.
     for_size: (u32, u32),
 }
 
 /// Pixel size of lyric text for a window height.
 pub fn lyric_px(h: f32) -> f32 {
-    0.036 * h
+    TEXT_FRAC * h
 }
 
 /// Lowest ink the lyric stack can reach (as a fraction of the window height) when the current line sits at
 /// `anchor`: a line that slides in starts one band below the "next" position (two bands under the current line)
 /// and its bitmap is about 1.6 text sizes tall. Used to keep the lyrics clear of the control bar.
 pub fn lowest_ink_frac(anchor: f32) -> f32 {
-    anchor + (2.0 * BAND * 1.4 + 1.6) * 0.036 + 0.002
+    anchor + (2.0 * BAND * LINE_H + BITMAP_H) * TEXT_FRAC + 0.002
 }
 
 fn lyric_max_width(w: f32) -> u32 {
@@ -90,6 +97,7 @@ impl LyricView {
             requested: HashSet::new(),
             slots: Default::default(),
             anchor: 0.72,
+            lift: 0.0,
             for_size: (0, 0),
         }
     }
@@ -98,6 +106,15 @@ impl LyricView {
         if frac.is_finite() {
             self.anchor = frac.clamp(0.3, 0.92);
         }
+    }
+
+    /// Rise above the anchor for the control bar (see `controls::ControlsUi::lyric_lift`).
+    pub fn set_lift(&mut self, frac: f32) {
+        self.lift = if frac.is_finite() {
+            frac.clamp(0.0, 0.3)
+        } else {
+            0.0
+        };
     }
 
     /// Latest playback position in seconds (`None` when the session reports no timeline: no lyrics shown).
@@ -236,7 +253,7 @@ impl LyricView {
             }
         }
         // fades and positions by role
-        let lh = lyric_px(h) * 1.4;
+        let lh = lyric_px(h) * LINE_H;
         let base_y = self.anchor * h;
         // lines that left (seek, track change) fade out first: a hidden line waits instead of crossfading on top
         let on_stage = |s: &Slot| {
@@ -281,7 +298,7 @@ impl LyricView {
             if slot.alpha > 0.002 {
                 out[s] = Some(TextDraw {
                     x,
-                    y,
+                    y: y - self.lift * h,
                     w: tw as f32,
                     h: th as f32,
                     alpha: slot.alpha,
@@ -744,6 +761,65 @@ mod overlap_tests {
                     // the check is not vacuous: where the unlifted lines reach the zone, the lift is what clears it
                     if worst_plain > zone_top {
                         assert!(worst_lifted < worst_plain);
+                    }
+                }
+            }
+        }
+    }
+
+    /// The whole chain the engine runs each frame (bar visibility -> lift -> real LyricView layout), sampled every
+    /// 20 ms through the 180 ms show and the 400 ms hide: whenever the bar is visible (alpha >= 0.05) no lyric
+    /// ink reaches its zone, at several sizes, DPI factors, anchors and lyric positions (incl. line changes).
+    #[test]
+    fn lyrics_clear_the_bar_at_every_alpha_through_show_and_hide() {
+        use crate::controls::{HIDE_FADE_S, IDLE_S, Visibility, lyric_lift, ui_scale};
+        const DT: f32 = 0.02;
+        for s in [(1920u32, 1080u32), (1280, 720), (720, 1280), (800, 600)] {
+            for dpi in [1.0f32, 1.5, 2.0] {
+                for anchor in [0.70f32, 0.72, 0.80] {
+                    let zone_top = s.1 as f32 - 128.0 * ui_scale(s, dpi);
+                    let need = lyric_lift(anchor, s, dpi);
+                    // positions just before demo line changes (2, 6, 10 s) and mid-line
+                    for start in [1.9f64, 5.95, 8.0, 9.9] {
+                        let mut v = LyricView::new(LyricSource::Demo);
+                        v.set_anchor(anchor);
+                        v.on_track(Some(1), "T", "A", &mut Vec::new());
+                        v.on_ready(Ready::Lyrics {
+                            track_id: 1,
+                            lyrics: Some(lyr()),
+                        });
+                        let mut t = start - 1.5;
+                        while t < start {
+                            frame(&mut v, t, s);
+                            t += 1.0 / 60.0;
+                        }
+                        let mut bar = Visibility::new(false);
+                        let step = |bar: &mut Visibility, v: &mut LyricView, t: &mut f64| {
+                            bar.tick(DT);
+                            v.set_lift(need * bar.lift());
+                            // (the lyric animation advances 1/60 s per sample, the song clock 20 ms: harmless here)
+                            let o = frame(v, *t, s);
+                            *t += f64::from(DT);
+                            (bar.alpha(), lowest(&o, 2.0))
+                        };
+                        let mut samples = Vec::new();
+                        bar.activity();
+                        for _ in 0..=((0.18 / DT) as usize + 1) {
+                            samples.push(step(&mut bar, &mut v, &mut t));
+                        }
+                        // idle until the fade-out starts, then sample the whole 400 ms hide
+                        while bar.wants_visible() || bar.alpha() > 0.0 {
+                            samples.push(step(&mut bar, &mut v, &mut t));
+                            assert!(samples.len() < ((IDLE_S + HIDE_FADE_S + 1.0) / DT) as usize);
+                        }
+                        let visible: Vec<_> = samples.iter().filter(|(a, _)| *a >= 0.05).collect();
+                        assert!(visible.len() > 10, "sampled the transitions");
+                        for (a, low) in visible {
+                            assert!(
+                                *low <= zone_top,
+                                "{s:?} dpi {dpi} anchor {anchor} start {start}: alpha {a:.3} ink {low:.1} > zone {zone_top:.1}"
+                            );
+                        }
                     }
                 }
             }

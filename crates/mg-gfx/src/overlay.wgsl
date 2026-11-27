@@ -35,7 +35,7 @@ struct C {
     fg: vec4<f32>,        // icon / text rgb
     accent: vec4<f32>,    // toggle / focus accent rgb
     prog: vec4<f32>,      // track x0, x1, centre y, half thickness (px); x1 <= x0 = no timeline
-    prog_p: vec4<f32>,    // played fraction, hover 0..1 (knob), time text alpha, unused
+    prog_p: vec4<f32>,    // played fraction, hover 0..1 (knob), time text alpha, keyboard focus (1 = ring)
     sep: vec4<f32>,       // divider x, centre y, half height, unused
     t_el: vec4<f32>,      // elapsed text rect (left, top, w, h); w 0 = absent
     t_du: vec4<f32>,      // duration text rect
@@ -211,6 +211,14 @@ fn icon_cov(id: u32, u: vec2<f32>, fw: f32) -> f32 {
     return cov(d, fw);
 }
 
+// Rounded scrim behind a text quad (0 when the quad is absent), soft 2 px edge.
+fn text_scrim(rect: vec4<f32>, p: vec2<f32>, s: f32) -> f32 {
+    if (rect.z <= 0.0) { return 0.0; }
+    let half = 0.5 * rect.zw + vec2<f32>(3.0 * s, 2.0 * s);
+    let d = sd_round_box(p - rect.xy - 0.5 * rect.zw, half, min(half.x, half.y));
+    return 1.0 - smoothstep(-2.0 * s, 0.0, d);
+}
+
 // premultiplied "over": `src` is a straight colour with alpha `sa`
 fn over(dst: vec4<f32>, src: vec3<f32>, sa: f32) -> vec4<f32> {
     return vec4<f32>(src * sa + dst.rgb * (1.0 - sa), sa + dst.a * (1.0 - sa));
@@ -273,17 +281,28 @@ fn fs_controls(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
         let hl = 0.5 * (c.prog.y - c.prog.x);
         let ht = c.prog.w;
         let pp = p - vec2<f32>(mid, c.prog.z);
-        let under = cov(sd_round_box(pp, vec2<f32>(hl, ht) + vec2<f32>(1.5 * s), ht + 1.5 * s), 0.75);
-        o = over(o, vec3<f32>(0.0), 0.30 * under * al);
+        // backing: the pill fill at the pill opacity, a thin capsule just around the track, so the line keeps
+        // its contrast over a bright scene (TRACK_ALPHA / PLAYED_ALPHA in overlay.rs; checked in controls.rs)
+        let under = cov(sd_round_box(pp, vec2<f32>(hl, ht) + vec2<f32>(3.0 * s), ht + 3.0 * s), 0.75);
+        o = over(o, c.bg.rgb, c.bg.w * under * al);
         let trk = cov(sd_round_box(pp, vec2<f32>(hl, ht), ht), 0.75);
         let xp = c.prog.x + clamp(c.prog_p.x, 0.0, 1.0) * (c.prog.y - c.prog.x);
         let played = 1.0 - smoothstep(-0.5, 0.5, p.x - xp);
-        o = over(o, c.fg.rgb, trk * (0.28 + 0.67 * played) * al);
+        o = over(o, c.fg.rgb, trk * (0.12 + 0.83 * played) * al);
         let knob = cov(length(p - vec2<f32>(xp, c.prog.z)) - 6.0 * s * c.prog_p.y, 0.75);
         o = over(o, c.fg.rgb, knob * c.prog_p.y * al);
+        // keyboard focus ring: 2 px, 4 px outside the backing capsule (same style as the buttons)
+        if (c.prog_p.w > 0.5) {
+            let rw = max(1.0, s);
+            let fr = cov(abs(sd_round_box(pp, vec2<f32>(hl, ht) + vec2<f32>(7.0 * s + rw), ht + 7.0 * s + rw)) - rw, 0.75);
+            o = over(o, vec3<f32>(1.0), fr * al);
+        }
         // times: shadow first, then the text, same technique as the title
         let toff = vec2<f32>(0.0, max(1.0, 1.2 * s));
         let ta = c.prog_p.z * al;
+        // soft local scrims (pill fill and opacity) so the times read on any scene
+        let scrim = max(text_scrim(c.t_el, p, s), text_scrim(c.t_du, p, s));
+        o = over(o, c.bg.rgb, c.bg.w * scrim * ta);
         let sh = max(text_cov(tex_el, c.t_el, p - toff), text_cov(tex_du, c.t_du, p - toff)) * 0.7 * ta;
         o = over(o, vec3<f32>(0.0), sh);
         let te = max(text_cov(tex_el, c.t_el, p), text_cov(tex_du, c.t_du, p));

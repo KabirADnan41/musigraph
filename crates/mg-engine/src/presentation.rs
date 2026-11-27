@@ -367,6 +367,11 @@ impl Presentation {
         self.lyrics.set_anchor(frac);
     }
 
+    /// Extra rise of the lyrics above the anchor while the control bar shows (follows the bar's alpha, unlagged).
+    pub fn set_lyric_lift(&mut self, frac: f32) {
+        self.lyrics.set_lift(frac);
+    }
+
     pub fn take_ops(&mut self) -> Vec<GpuOp> {
         std::mem::take(&mut self.ops)
     }

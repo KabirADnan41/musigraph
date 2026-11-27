@@ -79,7 +79,14 @@ pub struct ProgressDraw {
     pub half_thick: f32,
     pub frac: f32,
     pub hover: f32,
+    /// Keyboard focus ring around the track.
+    pub focus: bool,
 }
+
+/// Opacity of the unplayed and the played part of the progress track (mirrors `fs_controls`; the control bar
+/// checks their contrast over the backing).
+pub const TRACK_ALPHA: f32 = 0.12;
+pub const PLAYED_ALPHA: f32 = 0.95;
 
 /// The temporary on-screen control bar (drawn as a second, scissored draw of the overlay pass).
 #[derive(Clone, Debug, PartialEq)]
@@ -141,7 +148,7 @@ impl ControlsDraw {
                         p.frac.clamp(0.0, 1.0),
                         p.hover.clamp(0.0, 1.0),
                         self.time_alpha.clamp(0.0, 1.0),
-                        0.0,
+                        if p.focus { 1.0 } else { 0.0 },
                     ],
                 );
             }
@@ -184,8 +191,8 @@ impl ControlsDraw {
         let mut y0 = self.bar[1] - self.bar[3] - m;
         let y1 = self.bar[1] + self.bar[3] + m;
         if let Some(p) = &self.progress {
-            x0 = x0.min(p.x0 - 8.0 * s);
-            x1 = x1.max(p.x1 + 8.0 * s);
+            x0 = x0.min(p.x0 - 12.0 * s); // focus ring
+            x1 = x1.max(p.x1 + 12.0 * s);
             y0 = y0.min(p.y - 14.0 * s);
         }
         for t in [&self.elapsed, &self.duration].into_iter().flatten() {
@@ -812,6 +819,7 @@ mod tests {
                 half_thick: 1.5 * s,
                 frac: 0.4,
                 hover: 0.0,
+                focus: false,
             }),
             elapsed: None,
             duration: None,
