@@ -48,7 +48,10 @@ pub const LYRIC_LIFT: f32 = 0.067;
 const HOVER_S: f32 = 0.12;
 const PRESS_S: f32 = 0.08;
 const DISABLED_OPACITY: f32 = 0.35;
-/// Above this alpha the bar counts as visible for clicks and keys.
+/// Above this alpha the bar counts as visible for clicks and keys. Contrast targets (4.5:1 icons, 3:1 lines and
+/// rings) are checked at the steady alpha 1 only: the fade-in (SHOW_FADE_S) and fade-out (HIDE_FADE_S) are
+/// transitional and exempt by design, any input during either fades the bar back in, and focus rings are drawn
+/// only at steady alpha.
 const INTERACTIVE_ALPHA: f32 = 0.5;
 /// Keyboard seek steps on the focused progress line (Shift: the long step).
 pub const SEEK_STEP_S: f64 = 5.0;
@@ -333,9 +336,13 @@ fn whole_secs(secs: f64) -> u64 {
 }
 
 /// Seek target for a key on the focused progress line: `delta` seconds from `position` (Home/End pass
-/// `f64::NEG_INFINITY` / `f64::INFINITY`), clamped to 0..=duration-0.25 like a click (never rolls over).
+/// `f64::NEG_INFINITY` / `f64::INFINITY`), clamped to 0..=duration-0.25 like a click (never rolls over). An
+/// unknown (non-finite) position makes a relative step `None`; Home/End still work.
 pub fn key_seek_seconds(position: f64, delta: f64, duration: f64) -> Option<f64> {
-    if !(duration.is_finite() && duration > 0.0) || delta.is_nan() {
+    if !(duration.is_finite() && duration > 0.0)
+        || delta.is_nan()
+        || (delta.is_finite() && !position.is_finite())
+    {
         return None;
     }
     let p = if position.is_finite() { position } else { 0.0 };
@@ -355,6 +362,12 @@ pub fn fmt_time(secs: f64) -> String {
 /// Pill fill (linear RGB) for a palette tint: the tint, darkened (also the progress backing and time scrims).
 fn pill_bg(tint: [f32; 3]) -> [f32; 3] {
     tint.map(|c| BG_BASE + BG_TINT * c.clamp(0.0, 1.0))
+}
+
+/// Toggled icon / dot colour: the palette tint lifted to a readable brightness (drawn on the opaque plate).
+fn accent(tint: [f32; 3]) -> [f32; 3] {
+    let peak = tint.iter().copied().fold(0.0f32, f32::max).max(1e-3);
+    tint.map(|c| (0.30 + 0.70 * c / peak).min(1.0))
 }
 
 // ---- visibility state machine --------------------------------------------------------------------------------
@@ -866,7 +879,9 @@ impl ControlsUi {
             HOVER_S,
         );
         let dy = self.vis.rise() * g.scale;
-        let ring = self.focus.ring();
+        // focus rings only at steady alpha, where their contrast is checked (see INTERACTIVE_ALPHA)
+        let steady = a >= 1.0;
+        let ring = self.focus.ring().filter(|_| steady);
         let buttons = std::array::from_fn(|k| {
             let id = ButtonId::ALL[k];
             let ok = enabled(id, &i.av);
@@ -915,7 +930,7 @@ impl ControlsUi {
                 half_thick: (1.5 + 1.5 * self.prog_hover) * s,
                 frac: (i.position.unwrap_or(0.0) / d).clamp(0.0, 1.0) as f32,
                 hover: self.prog_hover,
-                focus: self.focus.progress_ring(),
+                focus: steady && self.focus.progress_ring(),
             }
         });
         let text_rect = |slot: usize, right_aligned: bool| {
@@ -936,7 +951,6 @@ impl ControlsUi {
             })
         };
         let tint = i.tint;
-        let peak = tint.iter().copied().fold(0.0f32, f32::max).max(1e-3);
         Some(ControlsDraw {
             alpha: a,
             scale: s,
@@ -950,8 +964,7 @@ impl ControlsUi {
             bg: pill_bg(tint),
             bg_alpha: PILL_ALPHA,
             fg: i.fg.map(|c| c.max(FG_MIN)),
-            // accent: the palette tint lifted to a readable brightness
-            accent: tint.map(|c| (0.30 + 0.70 * c / peak).min(1.0)),
+            accent: accent(tint),
         })
     }
 }
@@ -1646,6 +1659,26 @@ mod tests {
     }
 
     #[test]
+    fn focus_rings_appear_only_at_steady_alpha() {
+        let a = all();
+        let mut u = ControlsUi::new(false);
+        u.set_view(HD, 1.0);
+        u.key_activity();
+        while u.vis.alpha() < 0.8 {
+            u.vis.tick(1.0 / 240.0);
+        }
+        u.tab(false, &a);
+        let d = u.frame(&input(a)).unwrap();
+        assert!(d.alpha < 1.0, "still fading in: {}", d.alpha);
+        assert!(d.buttons.iter().all(|b| !b.focus), "no ring mid-fade");
+        let mut d = d;
+        for _ in 0..30 {
+            d = u.frame(&input(a)).unwrap();
+        }
+        assert!(d.alpha >= 1.0 && d.buttons[0].focus, "ring once steady");
+    }
+
+    #[test]
     fn time_texts_are_requested_once_per_change_and_superseded_results_are_dropped() {
         let mut u = ui_visible();
         let mut i = input(all());
@@ -1856,7 +1889,17 @@ mod tests {
             Some(119.75),
             "End"
         );
-        assert_eq!(key_seek_seconds(f64::NAN, SEEK_STEP_S, 120.0), Some(5.0));
+        // unknown position (NaN): arrows do nothing (no jump to 0+step), Home/End still work
+        assert_eq!(key_seek_seconds(f64::NAN, SEEK_STEP_S, 120.0), None);
+        assert_eq!(key_seek_seconds(f64::NAN, -SEEK_STEP_LONG_S, 120.0), None);
+        assert_eq!(
+            key_seek_seconds(f64::NAN, f64::NEG_INFINITY, 120.0),
+            Some(0.0)
+        );
+        assert_eq!(
+            key_seek_seconds(f64::NAN, f64::INFINITY, 120.0),
+            Some(119.75)
+        );
         assert_eq!(key_seek_seconds(10.0, 5.0, 0.0), None);
         assert_eq!(key_seek_seconds(10.0, 5.0, f64::NAN), None);
         assert_eq!(key_seek_seconds(10.0, f64::NAN, 100.0), None);
@@ -1973,6 +2016,60 @@ mod tests {
             let rest = over(b, fg_lum(), TRACK_ALPHA);
             assert!(ratio(played, b) >= 3.0, "played vs backing {b}");
             assert!(ratio(played, rest) >= 3.0, "played vs unplayed {b}");
+        }
+    }
+
+    /// Tints on a 0..=1 grid (5 steps per channel), including the darkest accents (pure blue, black).
+    fn tint_grid() -> impl Iterator<Item = [f32; 3]> {
+        (0..125).map(|k| [k % 5, k / 5 % 5, k / 25].map(|v| v as f32 / 4.0))
+    }
+
+    #[test]
+    fn hovered_and_toggled_buttons_keep_icons_at_4_5_and_the_hover_ring_at_3_to_1() {
+        let src = include_str!("../../mg-gfx/src/overlay.wgsl");
+        assert!(
+            src.contains("o = over(o, c.bg.rgb, max(v1.y, v1.z) * plate * op * al);"),
+            "opaque pill-fill plate for hover and toggled"
+        );
+        assert!(src.contains("o = over(o, c.fg.rgb, 0.7 * v1.y * hring * op * al);"));
+        assert!(src.contains("o = over(o, mix(c.fg.rgb, c.accent.rgb, v1.z), ic * op * al);"));
+        const RING_ALPHA: f32 = 0.7;
+        for t in tint_grid() {
+            let plate = lum(pill_bg(t)); // opaque: the scene no longer shows through
+            let ring = over(plate, fg_lum(), RING_ALPHA);
+            // hover (fg icon), toggled and hover+toggled (accent icon and dot): same opaque plate
+            assert!(ratio(fg_lum(), plate) >= 4.5, "hover icon {t:?}");
+            assert!(
+                ratio(lum(accent(t)), plate) >= 4.5,
+                "toggled icon {t:?}: {}",
+                ratio(lum(accent(t)), plate)
+            );
+            assert!(ratio(ring, plate) >= 3.0, "hover ring vs plate {t:?}");
+            for k in 0..=100 {
+                let pill = over(k as f32 / 100.0, lum(pill_bg(t)), PILL_ALPHA);
+                assert!(
+                    ratio(ring, pill) >= 3.0,
+                    "hover ring vs pill {t:?} scene {k}: {}",
+                    ratio(ring, pill)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn progress_focus_ring_sits_on_its_backing_at_3_to_1_over_white_and_black_scenes() {
+        let src = include_str!("../../mg-gfx/src/overlay.wgsl");
+        // ring spans 7s..7s+2rw from the track; the focused backing pad is 8s+2rw
+        assert!(src.contains("let pad = 3.0 * s + step(0.5, c.prog_p.w) * (5.0 * s + 2.0 * rw);"));
+        assert!(
+            src.contains("vec2<f32>(hl, ht) + vec2<f32>(7.0 * s + rw), ht + 7.0 * s + rw)) - rw")
+        );
+        assert!(src.contains("o = over(o, vec3<f32>(1.0), fr * al);"));
+        for t in tint_grid() {
+            for scene in [0.0, 1.0] {
+                let b = over(scene, lum(pill_bg(t)), PILL_ALPHA);
+                assert!(ratio(1.0, b) >= 3.0, "ring vs backing {t:?} scene {scene}");
+            }
         }
     }
 }

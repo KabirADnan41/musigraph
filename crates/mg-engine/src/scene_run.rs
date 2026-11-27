@@ -363,7 +363,9 @@ struct App {
     mods: ModifiersState,
     last_unsupported_note: Option<Instant>,
     title: String,
-    last_frame: Option<Instant>,
+    /// Start of the last presented frame with its section times (poll+jobs, gpu_ops, render ms) and cross-fade
+    /// flag: a HITCH interval ends at the next frame's start, so it is attributed to these.
+    last_frame: Option<(Instant, [f64; 3], bool)>,
     intervals_ms: Vec<f64>,
     /// Attribution lines for rare long frames (see HITCH_MS); bounded.
     hitches: Vec<String>,
@@ -612,7 +614,11 @@ impl App {
         {
             let now = Instant::now();
             let target = self.last_np.as_ref().and_then(|n| {
-                key_seek_seconds(n.position_now(now).unwrap_or(0.0), delta, n.duration_s?)
+                key_seek_seconds(
+                    n.position_now(now).unwrap_or(f64::NAN),
+                    delta,
+                    n.duration_s?,
+                )
             });
             if let Some(t) = target {
                 self.media.send(MediaCommand::SeekTo(t), now);
@@ -858,20 +864,20 @@ impl App {
             }
         }) {
             Ok(FrameStatus::Presented) => {
-                if let Some(prev) = self.last_frame {
+                let render_ms = t_render.elapsed().as_secs_f64() * 1000.0;
+                if let Some((prev, [p_poll, p_ops, p_render], p_xfade)) = self.last_frame {
                     let interval = now.duration_since(prev).as_secs_f64() * 1000.0;
                     self.intervals_ms.push(interval);
-                    // Attribution of rare long frames (CPU time per section; no track data is recorded).
+                    // Rare long frames: [prev start, this start) is the previous frame's sections (CPU time; no
+                    // track data is recorded) plus the event-loop wait before this frame.
                     if interval > HITCH_MS && self.hitches.len() < 24 {
                         self.hitches.push(format!(
-                            "HITCH t={:.1}s interval={interval:.0}ms poll+jobs={poll_ms:.1} gpu_ops={ops_ms:.1} render={:.1} xfade={}",
+                            "HITCH t={:.1}s interval={interval:.0}ms prev: poll+jobs={p_poll:.1} gpu_ops={p_ops:.1} render={p_render:.1} xfade={p_xfade}",
                             self.start.elapsed().as_secs_f64(),
-                            t_render.elapsed().as_secs_f64() * 1000.0,
-                            xfade.is_some()
                         ));
                     }
                 }
-                self.last_frame = Some(now);
+                self.last_frame = Some((now, [poll_ms, ops_ms, render_ms], xfade.is_some()));
                 self.presented += 1;
                 self.skip_since = None;
             }

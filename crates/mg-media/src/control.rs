@@ -149,6 +149,22 @@ pub fn seek_ticks(target_s: f64, start: i64, end: i64) -> Option<i64> {
     Some(start.saturating_add(rel as i64).min(end))
 }
 
+/// Seek target in ticks for `target_s` seconds on the session timeline (relative to `start`, like the reported
+/// position), clamped into the seekable range (`seek_range`). NaN or an empty range => `None`; saturates.
+pub fn seek_target(
+    target_s: f64,
+    start: i64,
+    end: i64,
+    min: Option<i64>,
+    max: Option<i64>,
+) -> Option<i64> {
+    let (lo, hi) = seek_range(min, max, start, end);
+    if target_s.is_nan() || hi <= lo {
+        return None;
+    }
+    Some(start.saturating_add((target_s * 1e7) as i64).clamp(lo, hi)) // `as i64` saturates
+}
+
 #[derive(Default)]
 struct Inner {
     busy: AtomicBool,
@@ -467,6 +483,37 @@ mod tests {
         tx.send(()).unwrap();
         settle(&c);
         assert_eq!(c.last_result(), Some(CommandResult::Unsupported));
+    }
+
+    #[test]
+    fn seek_target_is_relative_to_start_and_clamped_to_the_seek_range() {
+        let s = 10_000_000; // ticks per second
+        // MinSeekTime (5 s) != StartTime (2 s): 10 s on the timeline is tick 12 s, not 15 s
+        assert_eq!(
+            seek_target(10.0, 2 * s, 100 * s, Some(5 * s), Some(50 * s)),
+            Some(12 * s)
+        );
+        assert_eq!(
+            seek_target(1.0, 2 * s, 100 * s, Some(5 * s), Some(50 * s)),
+            Some(5 * s),
+            "below MinSeekTime clamps up"
+        );
+        assert_eq!(
+            seek_target(90.0, 2 * s, 100 * s, Some(5 * s), Some(50 * s)),
+            Some(50 * s),
+            "above MaxSeekTime clamps down"
+        );
+        assert_eq!(seek_target(3.0, 2 * s, 100 * s, None, None), Some(5 * s));
+        assert_eq!(seek_target(f64::NAN, 0, 100 * s, None, None), None);
+        assert_eq!(seek_target(1.0, 7, 7, None, None), None);
+        assert_eq!(
+            seek_target(f64::INFINITY, 0, i64::MAX, None, None),
+            Some(i64::MAX)
+        );
+        assert_eq!(
+            seek_target(f64::NEG_INFINITY, s, 9 * s, None, None),
+            Some(s)
+        );
     }
 
     #[test]

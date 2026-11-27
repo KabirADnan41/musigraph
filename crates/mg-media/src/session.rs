@@ -2,7 +2,7 @@
 //! selected session as a `NowPlaying` snapshot. WinRT calls through windows-rs are safe code.
 
 use crate::control::{
-    Capabilities, CommandResult, FailClass, MediaCommand, SessionBackend, seek_range, seek_ticks,
+    Capabilities, CommandResult, FailClass, MediaCommand, SessionBackend, seek_target,
 };
 use crate::{
     Candidate, MAX_ART_BYTES, NowPlaying, PlaybackState, sanitize_text, select_session,
@@ -236,13 +236,13 @@ fn run_command(cmd: MediaCommand) -> CommandResult {
             let opt = |r: windows::core::Result<windows::Foundation::TimeSpan>| {
                 r.ok().map(|d| d.Duration)
             };
-            let (lo, hi) = seek_range(
-                opt(t.MinSeekTime()),
-                opt(t.MaxSeekTime()),
+            let Some(target) = seek_target(
+                secs,
                 tick(t.StartTime()),
                 tick(t.EndTime()),
-            );
-            let Some(target) = seek_ticks(secs, lo, hi) else {
+                opt(t.MinSeekTime()),
+                opt(t.MaxSeekTime()),
+            ) else {
                 return CommandResult::Unsupported;
             };
             wait!(s.TryChangePlaybackPositionAsync(target))

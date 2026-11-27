@@ -255,10 +255,14 @@ fn fs_controls(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
         let q = p - v0.xy;
         let half = v0.z;
         if (half <= 0.0 || abs(q.x) > half * 1.8 || abs(q.y) > half * 1.8) { continue; }
+        // disabled: op = DISABLED_OPACITY (0.35), below 4.5:1 on purpose (inactive controls are WCAG-exempt)
         let op = v1.x;
-        // hover / toggled plate
+        // hover / toggled plate: the pill fill, opaque, so the icon (fg or accent) keeps >= 4.5:1 on any scene
         let plate = cov(length(q) - half * 0.98, 0.75);
-        o = over(o, vec3<f32>(1.0), (0.13 * v1.y + 0.07 * v1.z) * plate * op * al);
+        o = over(o, c.bg.rgb, max(v1.y, v1.z) * plate * op * al);
+        // hover cue: a 1.5 px fg ring just inside the plate edge, >= 3:1 against the pill (checked in controls.rs)
+        let hring = cov(abs(length(q) - half * 0.98 + 0.75 * s) - 0.75 * s, 0.75);
+        o = over(o, c.fg.rgb, 0.7 * v1.y * hring * op * al);
         // icon: 22 px in a 44 px hit target, shrinks a little while pressed
         let isz = half * 0.5 * (1.0 - 0.06 * v2.x);
         let ic = icon_cov(u32(v0.w + 0.5), q / isz, 1.0 / isz);
@@ -283,7 +287,11 @@ fn fs_controls(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
         let pp = p - vec2<f32>(mid, c.prog.z);
         // backing: the pill fill at the pill opacity, a thin capsule just around the track, so the line keeps
         // its contrast over a bright scene (TRACK_ALPHA / PLAYED_ALPHA in overlay.rs; checked in controls.rs)
-        let under = cov(sd_round_box(pp, vec2<f32>(hl, ht) + vec2<f32>(3.0 * s), ht + 3.0 * s), 0.75);
+        // while focused the backing also covers the focus ring (4 px gap, 2 px ring, 1 px margin), so the ring
+        // never sits on the raw scene
+        let rw = max(1.0, s);
+        let pad = 3.0 * s + step(0.5, c.prog_p.w) * (5.0 * s + 2.0 * rw);
+        let under = cov(sd_round_box(pp, vec2<f32>(hl, ht) + vec2<f32>(pad), ht + pad), 0.75);
         o = over(o, c.bg.rgb, c.bg.w * under * al);
         let trk = cov(sd_round_box(pp, vec2<f32>(hl, ht), ht), 0.75);
         let xp = c.prog.x + clamp(c.prog_p.x, 0.0, 1.0) * (c.prog.y - c.prog.x);
@@ -291,9 +299,8 @@ fn fs_controls(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
         o = over(o, c.fg.rgb, trk * (0.12 + 0.83 * played) * al);
         let knob = cov(length(p - vec2<f32>(xp, c.prog.z)) - 6.0 * s * c.prog_p.y, 0.75);
         o = over(o, c.fg.rgb, knob * c.prog_p.y * al);
-        // keyboard focus ring: 2 px, 4 px outside the backing capsule (same style as the buttons)
+        // keyboard focus ring: 2 px, 4 px outside the resting backing capsule (same style as the buttons)
         if (c.prog_p.w > 0.5) {
-            let rw = max(1.0, s);
             let fr = cov(abs(sd_round_box(pp, vec2<f32>(hl, ht) + vec2<f32>(7.0 * s + rw), ht + 7.0 * s + rw)) - rw, 0.75);
             o = over(o, vec3<f32>(1.0), fr * al);
         }

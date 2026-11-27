@@ -211,11 +211,16 @@ fn run_session(
         client.Start().map_err(|e| format!("Start: {e}"))?;
         (enumerator, client, capture, format, device_id)
     };
+    // Durations accumulate in frames for this open (one sample rate) and convert once per update, so per-packet
+    // truncation does not add up; earlier opens' totals are the base.
+    let (mut real_base_ms, mut silence_base_ms) = (0, 0);
+    let (mut real_frames, mut silence_frames) = (0u64, 0u64);
     if let Ok(mut s) = status.lock() {
         s.sample_rate = format.sample_rate;
         s.channels = format.channels;
         s.opens += 1;
         s.last_error = None;
+        (real_base_ms, silence_base_ms) = (s.real_audio_ms, s.synthesized_silence_ms);
     }
 
     let mut mono: Vec<f32> = Vec::with_capacity(4096);
@@ -270,8 +275,9 @@ fn run_session(
                     }
                     if let Ok(mut s) = status.lock() {
                         s.real_packets += 1;
-                        s.real_audio_ms +=
-                            frames_to_ms(u64::from(packet.frames), format.sample_rate);
+                        real_frames = real_frames.saturating_add(u64::from(packet.frames));
+                        s.real_audio_ms = real_base_ms
+                            .saturating_add(frames_to_ms(real_frames, format.sample_rate));
                         if packet.flags & (AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY.0 as u32) != 0 {
                             s.discontinuities += 1;
                         }
@@ -300,7 +306,9 @@ fn run_session(
             last_emit = Instant::now();
             if let Ok(mut s) = status.lock() {
                 s.synthesized_silence_blocks += 1;
-                s.synthesized_silence_ms += frames_to_ms(n as u64, format.sample_rate);
+                silence_frames = silence_frames.saturating_add(n as u64);
+                s.synthesized_silence_ms = silence_base_ms
+                    .saturating_add(frames_to_ms(silence_frames, format.sample_rate));
             }
         }
         // Default device changed (or vanished)? Return so the supervisor re-opens.
