@@ -68,8 +68,9 @@ impl Consent {
 }
 
 fn app_dir() -> Option<PathBuf> {
-    let base = std::env::var_os("APPDATA").filter(|v| !v.is_empty())?;
-    Some(PathBuf::from(base).join("Musigraph"))
+    // an absolute path only: a relative APPDATA would resolve against the working directory (review S1)
+    let base = PathBuf::from(std::env::var_os("APPDATA")?);
+    base.is_absolute().then(|| base.join("Musigraph"))
 }
 
 pub fn load() -> Consent {
@@ -115,13 +116,13 @@ pub struct RevokeResult {
     pub warning: Option<&'static str>,
 }
 
-/// Runtime gate for online lyrics: persisted consent plus an in-memory session revocation that wins even
-/// if persisting the revocation fails. The engine must consult `allows_network()` before every request and
+/// Runtime gate for online lyrics. `revoke` sets the in-memory state to Declined before persisting, so a failed
+/// save still disables retrieval for this session. Not `Copy`: a stale copy taken before a revoke would still
+/// allow the network. The engine must consult `allows_network()` before every request and
 /// mirror changes into `LrclibClient::set_consent`. Local lyrics never consult it.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct OnlineLyricsGate {
     consent: Consent,
-    session_revoked: bool,
 }
 
 impl OnlineLyricsGate {
@@ -129,7 +130,6 @@ impl OnlineLyricsGate {
     pub fn from_dir(dir: &Path) -> Self {
         Self {
             consent: load_from(dir),
-            session_revoked: false,
         }
     }
 
@@ -138,18 +138,16 @@ impl OnlineLyricsGate {
     }
 
     pub fn allows_network(&self) -> bool {
-        self.consent.allows_network() && !self.session_revoked
+        self.consent.allows_network()
     }
 
     /// Explicit user action only.
     pub fn grant(&mut self, dir: Option<&Path>) {
         self.consent = Consent::grant_to(dir);
-        self.session_revoked = false;
     }
 
     /// Disables retrieval at once (in memory first), then persists; never claims durability it lacks.
     pub fn revoke(&mut self, dir: Option<&Path>) -> RevokeResult {
-        self.session_revoked = true;
         self.consent = Consent::Declined;
         let (_, durable) = Consent::decline_to(dir);
         RevokeResult {

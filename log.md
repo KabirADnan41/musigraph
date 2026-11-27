@@ -601,3 +601,19 @@ The mg-media test count there should read 33 for commit 3eb9341 (36 included 3 u
 ## 2026-11-28 - Reduced-motion runtime wiring (main session, Q-007)
 - scene_run.rs: `App.motion_last/motion_reduced`; once per second `motion_pref::reduced_motion(--reduced-motion flag)` (flag wins; the Windows "Animation effects" setting read via SystemParametersInfoW, read-only, None on failure => not reduced). On a change it calls `mapper.set_reduced_motion` and `pres.set_reduced_motion` (the same setters the startup flag used), so toggling the Windows setting applies at runtime. The call is a single cheap syscall on the frame thread once a second; audio capture runs on its own thread. `allow(dead_code)` removed from main.rs.
 - Not verified: live toggling of the Windows setting in a running window (no display session); only compile/clippy so far.
+
+## 2026-11-28 - Skill usage record for Album Focus (honest)
+- `review-animations` is not model-invocable (its own setting) and `improve-animations` dispatches subagents and writes plans: neither was executed. Their PRINCIPLES were applied manually: interruptible tweens retargeting from the current value, stagger 60 ms, ease-out for entrances and ease-in-out for on-screen moves, asymmetric attack/release, no animation of the cover, reduced motion = fewer/gentler (not zero), blur masking the crossfade. Skills actually READ by agents (per their log entries): algorithmic-art, better-typography, better-layout, better-colors, animate, emil-design-eng, ClaudeAnimationBase guide. Not claimed: impeccable, ui-ux-pro-max, frontend-design, better-accessibility, GSAP/HyperFrames consulted only as background.
+
+## 2026-11-28 - Review B fixes (main session; lyrics/consent security review of 552d038: PASS WITH SUGGESTIONS, no BLOCKER/HIGH)
+- **Fixed (confirmed):**
+  - (1) lrclib mod.rs: a Transient/RetryAfter reply for a track that is no longer current now records the key as retried BEFORE returning, so switching back cannot make one key cost three requests. RED first: the new test `a_late_transient_failure_for_a_left_track_still_uses_up_its_one_retry` failed (None vs Some(Error)).
+  - (2) lyrics_consent.rs: the redundant `session_revoked` flag was removed (equivalent mutant; revoke already sets Declined in memory first) and `Copy` dropped from `OnlineLyricsGate` (a stale copy would still allow the network).
+  - (3) S1: `app_dir()` accepts only an absolute APPDATA (a relative value would resolve against the working directory).
+- **Not changed, with reasons:**
+  - S2 fixed temp-file name (same-user symlink or two-instance race only; the existing failed-write tests rely on the name);
+  - fsync before rename (a crash leaves an empty file, which loads as Unasked, i.e. fails closed);
+  - tests keep F:\musigraph\temp by owner storage rule;
+  - weak-test notes (rate-cap assert, revoke allowance assert) and years inside "Live 1986/1992" version segments recorded as LOW.
+- **Tests:** mg-media 90 pass, mg-engine lyrics_consent 14 pass, clippy -D warnings clean.
+- Integration conditions from the reviewer are recorded in AUTOPILOT-PROGRESS.md.

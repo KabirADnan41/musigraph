@@ -680,13 +680,15 @@ impl Requester {
         if retryable {
             // One bounded retry per track key: only while the track is still playing, never twice. The
             // pause above is the applicable backoff; the global rate cap applies to the retry in `poll`.
-            if !is_current {
-                return None; // track changed: nothing is retried or remembered
-            }
             if self.retried.len() >= MAX_SETTLED {
                 self.retried.clear();
             }
-            if self.retried.insert(req.query.clone()) {
+            // recorded even when the track has changed, so switching back never buys a third request
+            let first_failure = self.retried.insert(req.query.clone());
+            if !is_current {
+                return None; // track changed: nothing is scheduled or reported
+            }
+            if first_failure {
                 return None; // not settled: `poll` asks again once the pause is over
             }
             outcome = Outcome::Error; // second failure is final

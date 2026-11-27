@@ -1024,3 +1024,22 @@ fn retries_still_obey_the_rate_cap_and_the_pause() {
     // each failure also pauses (backoff), so far fewer than the cap's worth go out
     assert!(sent <= MAX_REQUESTS_PER_MINUTE, "{sent}");
 }
+
+/// Review finding (2026-11-28): a transient failure that arrives after the track changed must still use up the
+/// key's single retry, so switching back cannot make one track key cost three requests.
+#[test]
+fn a_late_transient_failure_for_a_left_track_still_uses_up_its_one_retry() {
+    let t0 = Instant::now();
+    let mut r = on(t0);
+    let req = r.poll(t0 + DEBOUNCE).unwrap();
+    r.observe(t0 + ms(1600), Some(&qn(5)));
+    assert_eq!(r.on_outcome(t0 + ms(1700), &req, Outcome::Transient), None);
+    r.observe(t0 + Duration::from_secs(30), Some(&q()));
+    let again = r.poll(t0 + Duration::from_secs(60)).expect("the one retry");
+    assert_eq!(again.query, q());
+    assert_eq!(
+        r.on_outcome(t0 + Duration::from_secs(61), &again, Outcome::Transient),
+        Some(Outcome::Error),
+        "second failure is final: at most two requests per key"
+    );
+}
