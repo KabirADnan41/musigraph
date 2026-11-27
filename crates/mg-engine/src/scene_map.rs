@@ -11,7 +11,7 @@
 use mg_dsp::AudioFrame;
 use mg_dsp::features::MusicFeatures;
 use mg_dsp::smooth::Smoother;
-use mg_gfx::scene::{SLOTS, SceneMode, SceneParams};
+use mg_gfx::scene::{FocusParams, SLOTS, SceneMode, SceneParams};
 
 #[derive(Clone, Debug)]
 pub struct MapTuning {
@@ -96,8 +96,7 @@ pub struct SceneMapper {
     orb_flow: f32,
     orb_rot: f32,
     orb_az: [f32; 2],
-    /// Album Focus rotation phase (slow, grows without wrapping: one hour is only a few hundred units).
-    focus_rot: f32,
+    focus: FocusMap,
     onset_count: u32,
     /// Latest music descriptors, rest values while audio is stale/absent. CPU-side only; never packed.
     music: MusicFeatures,
@@ -449,6 +448,158 @@ fn group_of(pos: f32) -> usize {
         .count()
 }
 
+/// Album Focus environment mapping ("a room lit by the album art", docs\design\ALBUM-FOCUS-SPEC-2026-11-27.md).
+/// Music only moves LIGHT: spill intensity and size, haze flow and warp, dust glints and a faint hue drift. The
+/// cover and the text are never driven. Timescales follow the mapper's rule: fast signals (accents) give small
+/// transients, medium ones brightness, slow ones size, speed and colour. Each part has its own time constant and
+/// its own onset rule, so the room never moves in unison (twinning). Deterministic: no randomness.
+struct FocusMap {
+    spill: Smoother,
+    /// Spill radius scale k (tau 8 s), flow rate (tau 1.2 s), warp (tau 4 s), hue offset in radians (tau 6 s).
+    radius: f32,
+    flow_v: f32,
+    warp: f32,
+    hue: f32,
+    swell: Smoother,
+    swell_hold: f32,
+    swell_wait: f32,
+    drop: Smoother,
+    drop_hold: f32,
+    drop_wait: f32,
+    twinkle: Smoother,
+    /// Haze flow phase (noise units) and dust twinkle clock (cycles): integrated, never reset.
+    flow_phase: f32,
+    twinkle_phase: f32,
+    /// Build level sampled every 0.1 s over the last second (drop detector).
+    build_ring: [f32; 10],
+    build_tick: f32,
+    build_idx: usize,
+    reduced: bool,
+}
+
+/// Slowest haze flow: silence and calm pads still breathe, barely (noise units per second).
+pub const FOCUS_FLOW_FLOOR: f32 = 0.006;
+/// Spill intensity in silence (never black).
+pub const FOCUS_SPILL_REST: f32 = 0.50;
+const FOCUS_SWELL_REFRACTORY_S: f32 = 0.25;
+const FOCUS_DROP_REFRACTORY_S: f32 = 2.0;
+/// Reduced motion: flow runs at this fraction; swells and twinkle are off.
+const FOCUS_RM_FLOW: f32 = 0.3;
+
+impl FocusMap {
+    fn new() -> Self {
+        // the room starts at its rest light, never dark (a dark first frame would fade in as a flash of "nothing")
+        let mut spill = Smoother::new(80.0, 900.0);
+        spill.step(FOCUS_SPILL_REST, 10.0);
+        Self {
+            spill,
+            radius: 1.0,
+            flow_v: FOCUS_FLOW_FLOOR,
+            warp: 3.0,
+            hue: 0.0,
+            swell: Smoother::new(80.0, 600.0),
+            swell_hold: 0.0,
+            swell_wait: 0.0,
+            drop: Smoother::new(120.0, 900.0),
+            drop_hold: 0.0,
+            drop_wait: 0.0,
+            twinkle: Smoother::new(25.0, 300.0),
+            flow_phase: 0.0,
+            twinkle_phase: 0.0,
+            build_ring: [0.0; 10],
+            build_tick: 0.0,
+            build_idx: 0,
+            reduced: false,
+        }
+    }
+
+    /// Fills the music fields of `FocusParams` (geometry, weights, text pocket and bar belong to the runner).
+    fn update(&mut self, m: &MusicFeatures, silent: bool, dt: f32) -> FocusParams {
+        let c = |v: f32| fin(v).clamp(0.0, 1.0);
+        let at = |a: &[f32; mg_dsp::GROUPS], i: usize| c(a[i]);
+        let ease = |y: &mut f32, x: f32, tau: f32| *y = ema(*y, x, dt, tau);
+        let (calm, build, level) = (c(m.calm), c(m.build), c(m.level));
+        // I = (0.62 + 0.30 max(agc0, agc1)) x ceiling, attack 80 ms / release 900 ms; silence -> 0.50
+        let ceiling = 0.5 + 0.5 * level;
+        let i_t = if silent {
+            FOCUS_SPILL_REST
+        } else {
+            (0.62 + 0.30 * at(&m.agc, 0).max(at(&m.agc, 1))) * ceiling
+        };
+        let base = self.spill.step(i_t, dt);
+        // swell: bass accent above 0.25 -> +10 % (tau 600 ms, refractory 250 ms)
+        self.swell_wait = (self.swell_wait - dt).max(0.0);
+        self.swell_hold = (self.swell_hold - dt).max(0.0);
+        if !silent && !self.reduced && at(&m.accent, 1) > 0.25 && self.swell_wait == 0.0 {
+            self.swell_wait = FOCUS_SWELL_REFRACTORY_S;
+            self.swell_hold = 0.12;
+        }
+        let swell = self
+            .swell
+            .step(if self.swell_hold > 0.0 { 1.0 } else { 0.0 }, dt);
+        // drop: the build level falls by 0.4 within one second -> +15 % over 900 ms
+        self.build_tick += dt;
+        if self.build_tick >= 0.1 {
+            self.build_tick = 0.0;
+            self.build_ring[self.build_idx] = build;
+            self.build_idx = (self.build_idx + 1) % self.build_ring.len();
+        }
+        let peak = self.build_ring.iter().copied().fold(0.0, f32::max);
+        self.drop_wait = (self.drop_wait - dt).max(0.0);
+        self.drop_hold = (self.drop_hold - dt).max(0.0);
+        if !silent && !self.reduced && peak - build >= 0.4 && self.drop_wait == 0.0 {
+            self.drop_wait = FOCUS_DROP_REFRACTORY_S;
+            self.drop_hold = 0.2;
+        }
+        let drop = self
+            .drop
+            .step(if self.drop_hold > 0.0 { 1.0 } else { 0.0 }, dt);
+        // k = 1 + 0.04 long1 (tau 8 s); flow v = (0.015 + 0.05 agc3)(1 - 0.6 calm) (tau 1.2 s); W = 3 + 1.5 build (tau 4 s)
+        ease(&mut self.radius, 1.0 + 0.04 * at(&m.long, 1), 8.0);
+        let v_t = if silent {
+            FOCUS_FLOW_FLOOR
+        } else {
+            ((0.015 + 0.05 * at(&m.agc, 3)) * (1.0 - 0.6 * calm)).max(FOCUS_FLOW_FLOOR)
+        };
+        ease(&mut self.flow_v, v_t, 1.2);
+        ease(
+            &mut self.warp,
+            if silent { 3.0 } else { 3.0 + 1.5 * build },
+            4.0,
+        );
+        // haze hue +-10 degrees from the centroid (tau 6 s)
+        let hue_t = if silent {
+            0.0
+        } else {
+            (c(m.centroid) - 0.5) * 2.0 * 10.0f32.to_radians()
+        };
+        ease(&mut self.hue, hue_t, 6.0);
+        // dust twinkle: depth from the 4-8 kHz accent (attack 25 ms, release 300 ms); off in silence
+        let tw_t = if silent || self.reduced {
+            0.0
+        } else {
+            (at(&m.accent, 5) / 0.3).clamp(0.0, 1.0)
+        };
+        let tw = self.twinkle.step(tw_t, dt).clamp(0.0, 1.0);
+        let v = if self.reduced {
+            self.flow_v * FOCUS_RM_FLOW
+        } else {
+            self.flow_v
+        };
+        self.flow_phase = (self.flow_phase + v * dt) % 4096.0;
+        self.twinkle_phase = (self.twinkle_phase + dt * 2.0 * tw) % 4096.0;
+        FocusParams {
+            spill: base * (1.0 + 0.10 * swell + 0.15 * drop),
+            radius: self.radius,
+            flow: [self.flow_phase, self.twinkle_phase],
+            warp: self.warp,
+            twinkle: tw,
+            hue: self.hue,
+            ..FocusParams::default()
+        }
+    }
+}
+
 impl SceneMapper {
     pub fn new(tune: MapTuning) -> Self {
         let mut slot_map = [(0.0, 0); SLOTS];
@@ -484,7 +635,7 @@ impl SceneMapper {
             orb_flow: 0.0,
             orb_rot: 0.0,
             orb_az: [0.5; 2],
-            focus_rot: 0.0,
+            focus: FocusMap::new(),
             onset_count: 0,
             slot_map,
             music: MusicFeatures::default(),
@@ -500,6 +651,11 @@ impl SceneMapper {
 
     pub fn music(&self) -> &MusicFeatures {
         &self.music
+    }
+
+    /// Reduced motion for Album Focus: haze flow x0.3, no swells, drops or dust twinkle.
+    pub fn set_reduced_motion(&mut self, on: bool) {
+        self.focus.reduced = on;
     }
 
     /// Advances the scene by `dt` seconds (clamped to 0..0.25) and returns the parameters to draw.
@@ -608,12 +764,11 @@ impl SceneMapper {
         self.scroll[1] += 0.012 * speed * dt;
         // dust falls (0.015 + 0.04 s) screen heights per second = that many / 0.022 cells; one phase unit = 128 cells
         self.dust = (self.dust + (0.015 + 0.04 * s) / 0.022 * dt / 128.0).fract();
-        // Aurora: ribbon phases advance faster with intensity; Focus rotates slowly; band levels bass -> treble.
+        // Aurora: ribbon phases advance faster with intensity; band levels bass -> treble.
         const PHASE_WRAP: f32 = 64.0;
         for (i, ph) in self.aurora_ph.iter_mut().enumerate() {
             *ph = (*ph + dt * (0.04 + 0.20 * s) * (1.0 + 0.15 * i as f32)) % PHASE_WRAP;
         }
-        self.focus_rot += dt * (0.02 + 0.06 * s);
         let mut aurora_band = [0.0f32; 4];
         let mut count = [0u32; 4];
         for i in 0..SLOTS {
@@ -688,6 +843,9 @@ impl SceneMapper {
             dt,
         );
 
+        // Album Focus: its own block, from last frame's music features like Fluid
+        let album = self.focus.update(&self.music, silent, dt);
+
         SceneParams {
             fluid,
             time: self.t,
@@ -703,11 +861,9 @@ impl SceneMapper {
             aurora_band,
             orb_flow: [self.orb_flow, self.orb_rot, self.orb_az[0], self.orb_az[1]],
             orb_band,
-            focus_rot: self.focus_rot,
             front_x0: (self.onset_count as f32 * 0.618_034).fract(),
-            // the runner overwrites `focus` and `focus_active` from the artwork layout
-            focus: [0.5, 0.4, 0.16, 0.16],
-            focus_active: 0.0,
+            // the runner adds geometry, cover weights, text pocket and bar to the music fields
+            album,
             rings: self.rings,
             palette,
             mode: if live { input.mode } else { SceneMode::NoAudio },
@@ -1920,6 +2076,242 @@ mod fluid_gpu_tests {
                     "at frame {i}"
                 );
             }
+        }
+    }
+}
+
+/// Album Focus environment mapping: deterministic, real fixtures through the real analyzer and mapper.
+#[cfg(test)]
+mod focus_tests {
+    use super::fluid_tests::{SR, fx, kick, run};
+    use super::*;
+    use crate::sim::Tick;
+
+    fn albums(t: &[Tick]) -> Vec<&FocusParams> {
+        t.iter().map(|k| &k.params.album).collect()
+    }
+
+    /// Haze flow rate (noise units per second) over the last `secs` of a run at 60 fps.
+    fn flow_rate(t: &[Tick], secs: f32) -> f32 {
+        let n = (secs * 60.0) as usize;
+        let (a, b) = (&t[t.len() - n].params.album, &t[t.len() - 1].params.album);
+        (b.flow[0] - a.flow[0]) / ((n - 1) as f32 / 60.0)
+    }
+
+    fn max_of(t: &[Tick], f: impl Fn(&FocusParams) -> f32) -> f32 {
+        albums(t).into_iter().map(f).fold(0.0, f32::max)
+    }
+
+    #[test]
+    fn silence_settles_to_the_rest_light_with_a_tiny_flow_and_no_twinkle_and_is_never_dark() {
+        let t = run(&fx("silence", 4.0), 60.0);
+        // never black, from the very first frame; the analyzer's first frames may dip it a little before it settles
+        let min = albums(&t)
+            .iter()
+            .map(|a| a.spill)
+            .fold(f32::INFINITY, f32::min);
+        assert!(min > 0.38, "silence dipped to {min}");
+        assert!(
+            albums(&t[(3.0 * 60.0) as usize..])
+                .iter()
+                .all(|a| (a.spill - FOCUS_SPILL_REST).abs() < 0.02),
+            "not at rest after 3 s"
+        );
+        let last = &t.last().unwrap().params.album;
+        assert!(last.twinkle == 0.0 && last.warp > 2.99 && last.warp < 3.01);
+        let v = flow_rate(&t, 1.0);
+        assert!((v - FOCUS_FLOW_FLOOR).abs() < 0.0015, "silent flow {v}");
+    }
+
+    #[test]
+    fn music_then_silence_returns_to_the_rest_light_within_3_s() {
+        let mut x = kick(4.0);
+        x.extend(vec![0.0; (7.0 * SR as f32) as usize]);
+        let t = run(&x, 60.0);
+        let stop = 4.0;
+        assert!(max_of(&t[..(stop * 60.0) as usize], |a| a.spill) > 0.65);
+        let a = &t[((stop + 3.5) * 60.0) as usize].params.album;
+        assert!(
+            (a.spill - FOCUS_SPILL_REST).abs() < 0.04,
+            "spill {} 3.5 s after the music stopped",
+            a.spill
+        );
+        assert!(a.twinkle == 0.0);
+        assert!(flow_rate(&t, 1.0) < 0.009, "flow {}", flow_rate(&t, 1.0));
+    }
+
+    #[test]
+    fn kick_pad_and_hats_move_different_parts_of_the_room() {
+        let (k, p, h) = (
+            run(&kick(8.0), 60.0),
+            run(&fx("pad", 8.0), 60.0),
+            run(&fx("hats", 8.0), 60.0),
+        );
+        // the bass pulse lifts the spill; a steady pad does not pulse it
+        let (kick_hi, pad_hi) = (max_of(&k, |a| a.spill), max_of(&p, |a| a.spill));
+        let swing = |t: &[Tick]| {
+            let s: Vec<f32> = albums(&t[t.len() / 2..]).iter().map(|a| a.spill).collect();
+            s.iter().cloned().fold(0.0, f32::max) - s.iter().cloned().fold(f32::INFINITY, f32::min)
+        };
+        println!(
+            "focus spill: kick max {kick_hi:.3} swing {:.3}, pad max {pad_hi:.3} swing {:.3}",
+            swing(&k),
+            swing(&p)
+        );
+        assert!(kick_hi > 0.65, "kick spill {kick_hi}");
+        assert!(
+            swing(&k) > 2.0 * swing(&p) + 0.02,
+            "kick swing {} vs pad {}",
+            swing(&k),
+            swing(&p)
+        );
+        // calm music flows slower than rhythmic music
+        let (fk, fp) = (flow_rate(&k, 3.0), flow_rate(&p, 3.0));
+        println!("focus flow: kick {fk:.4} pad {fp:.4}");
+        assert!(fk > fp, "kick flow {fk} vs pad {fp}");
+        // dust glints with the treble accent, not with a kick or a pad
+        let (th, tk, tp) = (
+            max_of(&h, |a| a.twinkle),
+            max_of(&k, |a| a.twinkle),
+            max_of(&p, |a| a.twinkle),
+        );
+        println!("focus twinkle: hats {th:.3} kick {tk:.3} pad {tp:.3}");
+        assert!(th > 0.3 && tk < 0.15 && tp < 0.05, "{th} {tk} {tp}");
+    }
+
+    #[test]
+    fn the_same_input_gives_the_same_room_and_every_value_is_finite_and_bounded() {
+        let x = fx("demo", 6.0);
+        let (a, b) = (run(&x, 60.0), run(&x, 60.0));
+        assert!(
+            a.iter()
+                .zip(&b)
+                .all(|(p, q)| p.params.album == q.params.album),
+            "not deterministic"
+        );
+        for k in &a {
+            let f = &k.params.album;
+            assert!(
+                f.pack((1920, 1080))
+                    .chunks_exact(4)
+                    .all(|c| f32::from_ne_bytes([c[0], c[1], c[2], c[3]]).is_finite())
+            );
+            assert!((0.4..=1.3).contains(&f.spill), "spill {}", f.spill);
+            assert!((3.0..=4.6).contains(&f.warp) && (0.0..=1.0).contains(&f.twinkle));
+            assert!(f.hue.abs() <= 10.0f32.to_radians() + 1e-4);
+        }
+    }
+
+    #[test]
+    fn reduced_motion_slows_the_flow_and_turns_swells_and_twinkle_off() {
+        let busy = |i: usize, m: &mut MusicFeatures| {
+            m.agc[3] = 0.8;
+            m.accent[5] = 0.5;
+            if i.is_multiple_of(20) {
+                m.accent[1] = 0.6;
+            }
+        };
+        let (n, r) = (feed_with(false, 6.0, busy), feed_with(true, 6.0, busy));
+        let rate = |a: &[FocusParams]| (a[a.len() - 1].flow[0] - a[a.len() - 61].flow[0]) / 1.0;
+        assert!(n.iter().any(|a| a.twinkle > 0.5), "normal twinkles");
+        assert!(r.iter().all(|a| a.twinkle == 0.0), "reduced does not");
+        let (fn_, fr) = (rate(&n), rate(&r));
+        assert!((fr / fn_ - 0.3).abs() < 0.03, "flow {fn_} -> {fr}");
+        // no swell in reduced motion: the spill stays at its steady value while accents fire
+        let steady = r.last().unwrap().spill;
+        assert!(r.iter().skip(120).all(|a| (a.spill - steady).abs() < 0.01));
+    }
+
+    /// Features for `secs` at 60 fps through a fresh mapper, with `edit` applied to every frame.
+    fn feed(secs: f32, edit: impl FnMut(usize, &mut MusicFeatures)) -> Vec<FocusParams> {
+        feed_with(false, secs, edit)
+    }
+
+    fn feed_with(
+        reduced: bool,
+        secs: f32,
+        mut edit: impl FnMut(usize, &mut MusicFeatures),
+    ) -> Vec<FocusParams> {
+        let mut map = SceneMapper::new(MapTuning::default());
+        map.set_reduced_motion(reduced);
+        let f = AudioFrame {
+            silent: false,
+            band_count: mg_dsp::MAX_BANDS,
+            rms_db: -12.0,
+            group_medium: [0.5; mg_dsp::GROUPS],
+            energy: 0.7,
+            ..AudioFrame::default()
+        };
+        (0..(secs * 60.0) as usize)
+            .map(|i| {
+                let mut m = MusicFeatures {
+                    level: 0.8,
+                    ..MusicFeatures::default()
+                };
+                edit(i, &mut m);
+                map.observe_music(&m, true);
+                map.update(
+                    &Input {
+                        frame: &f,
+                        onsets: 0,
+                        onset_strength: 0.0,
+                        fresh: true,
+                        mode: SceneMode::Live,
+                    },
+                    1.0 / 60.0,
+                )
+                .album
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_bass_accent_swells_by_about_10_percent_and_a_build_drop_by_about_15_percent() {
+        let base = feed(3.0, |_, _| {});
+        let rest = base.last().unwrap().spill;
+        // one bass accent at 1.0 s
+        let sw = feed(3.0, |i, m| {
+            if (60..63).contains(&i) {
+                m.accent[1] = 0.6;
+            }
+        });
+        let peak = sw.iter().map(|a| a.spill).fold(0.0, f32::max);
+        assert!(
+            peak > rest * 1.04 && peak < rest * 1.12,
+            "swell {peak} vs {rest}"
+        );
+        // a build that falls from 0.9 to 0.2 inside one second
+        let dr = feed(5.0, |i, m| m.build = if i < 120 { 0.9 } else { 0.2 });
+        let peak = dr.iter().map(|a| a.spill).fold(0.0, f32::max);
+        assert!(peak > rest * 1.07, "drop {peak} vs {rest}");
+        // accents closer than the refractory 250 ms are one swell: four accents 100 ms apart stay under +12 %
+        let burst = feed(3.0, |i, m| {
+            if [60, 66, 72, 78].contains(&i) {
+                m.accent[1] = 0.6;
+            }
+        });
+        let peak = burst.iter().map(|a| a.spill).fold(0.0, f32::max);
+        assert!(peak < rest * 1.12, "refractory: {peak} vs {rest}");
+    }
+
+    #[test]
+    fn hostile_features_stay_finite() {
+        let hostile = MusicFeatures {
+            agc: [f32::NAN; mg_dsp::GROUPS],
+            accent: [f32::INFINITY; mg_dsp::GROUPS],
+            long: [-5.0; mg_dsp::GROUPS],
+            level: f32::NAN,
+            centroid: f32::INFINITY,
+            build: f32::NAN,
+            calm: 9.0,
+            ..MusicFeatures::default()
+        };
+        for f in feed(2.0, |_, m| *m = hostile) {
+            assert!(
+                f.pack((640, 480))
+                    .chunks_exact(4)
+                    .all(|c| f32::from_ne_bytes([c[0], c[1], c[2], c[3]]).is_finite())
+            );
         }
     }
 }

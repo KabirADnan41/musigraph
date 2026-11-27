@@ -44,10 +44,6 @@ pub struct SceneParams {
     /// Aurora: ribbon phases (cycles, integrated on the CPU) and band levels (bass to treble, 0..1).
     pub aurora_phase: [f32; 4],
     pub aurora_band: [f32; 4],
-    /// Album Focus: artwork centre (uv x, uv y) and half size in screen heights; `focus_active` 0 when there is no artwork.
-    pub focus: [f32; 4],
-    pub focus_rot: f32,
-    pub focus_active: f32,
     /// Aurora onset front origin (0..1 across the screen), changes with every onset.
     pub front_x0: f32,
     /// Orb: (flow phase, rotation phase) in cycles, integrated on the CPU, then the impact azimuths (0..1) of the two onset ripples whose (age, amplitude) live in `rings`.
@@ -57,6 +53,8 @@ pub struct SceneParams {
     /// Fluid: emitters, flow and memory for the dye simulation. Its own uniform block (`fluid::FluidParams::pack`),
     /// never part of `pack()`, so it cannot collide with the ex0..ex5 fields of the other scenes.
     pub fluid: crate::fluid::FluidParams,
+    /// Album Focus environment: its own block (`FocusParams::pack`, `@group(1)` of focus.wgsl), never part of `pack()`.
+    pub album: FocusParams,
     pub mode: SceneMode,
     pub bars: [f32; SLOTS],
     pub peaks: [f32; SLOTS],
@@ -84,13 +82,11 @@ impl Default for SceneParams {
             ],
             aurora_phase: [0.0; 4],
             aurora_band: [0.0; 4],
-            focus: [0.5, 0.4, 0.16, 0.16],
-            focus_rot: 0.0,
-            focus_active: 0.0,
             front_x0: 0.5,
             orb_flow: [0.0; 4],
             orb_band: [0.0; 4],
             fluid: crate::fluid::FluidParams::default(),
+            album: FocusParams::default(),
             mode: SceneMode::NoAudio,
             bars: [0.0; SLOTS],
             peaks: [0.0; SLOTS],
@@ -142,15 +138,258 @@ impl SceneParams {
         }
         put(&mut o, &self.aurora_phase);
         put(&mut o, &self.aurora_band);
-        put(&mut o, &self.focus);
-        put(
-            &mut o,
-            &[self.focus_rot, self.front_x0, self.focus_active, 0.0],
-        );
+        // ex2 and ex3.xzw are free (Album Focus reads its own block, `FocusParams`)
+        put(&mut o, &[0.0; 4]);
+        put(&mut o, &[0.0, self.front_x0, 0.0, 0.0]);
         put(&mut o, &self.orb_flow);
         put(&mut o, &self.orb_band);
         debug_assert_eq!(o.len(), UNIFORM_BYTES);
         o
+    }
+}
+
+/// Bytes of `FocusParams::pack` (the WGSL `FU` struct in focus.wgsl).
+pub const FOCUS_BYTES: usize = 10 * 16;
+/// Edge-colour grid side (the cover's 8x8 box mip) of `ArtLight`.
+pub const ART_GRID: usize = 8;
+const ART_SLOT_VEC4S: usize = ART_GRID * ART_GRID + 1;
+
+/// Album Focus environment ("a room lit by the album art", focus.wgsl). Geometry is in screen heights from the
+/// top-left corner (independent of the render scale); colours come from the cover slots (`ArtLight`) and the
+/// palette in the shared block. The mapper fills the music fields, the runner the geometry and the weights.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FocusParams {
+    /// Light source: centre x, centre y, half width, half height (the cover, or the empty cover slot of the
+    /// text-led composition). A zero size means a soft default source mid-screen.
+    pub rect: [f32; 4],
+    /// Spill intensity I and radius scale k.
+    pub spill: f32,
+    pub radius: f32,
+    /// Weights of the current and the previous cover's colours (their drawn alphas, the previous one under the
+    /// current); the remainder is palette light.
+    pub art_w: [f32; 2],
+    /// Haze flow phase (noise units, integrated on the CPU, never reset), warp W, dust twinkle depth 0..1.
+    pub flow: [f32; 2],
+    pub warp: f32,
+    pub twinkle: f32,
+    /// Haze hue offset (radians, OKLCH).
+    pub hue: f32,
+    /// Control-bar visibility 0..1 (floor dim: environment x0.8 below 0.80 H).
+    pub bar: f32,
+    /// Text ink rectangles (x0, y0, x1, y1) whose environment luminance is capped at `ink_cap`, with strength
+    /// `ink_on` 0..1 (0 = unused).
+    pub ink: [[f32; 4]; 4],
+    pub ink_cap: [f32; 4],
+    pub ink_on: [f32; 4],
+}
+
+impl Default for FocusParams {
+    fn default() -> Self {
+        Self {
+            rect: [0.0; 4],
+            spill: 0.5,
+            radius: 1.0,
+            art_w: [0.0; 2],
+            flow: [0.0; 2],
+            warp: 3.0,
+            twinkle: 0.0,
+            hue: 0.0,
+            bar: 0.0,
+            ink: [[0.0; 4]; 4],
+            ink_cap: [1.0; 4],
+            ink_on: [0.0; 4],
+        }
+    }
+}
+
+impl FocusParams {
+    /// Packs the WGSL `FU` layout for a render target of `res` pixels (finite values only). `res` only sets the dust
+    /// cell: about 147 motes at any aspect.
+    pub fn pack(&self, res: (u32, u32)) -> Vec<u8> {
+        let aspect = res.0.max(1) as f32 / res.1.max(1) as f32;
+        let inv_cell = 1.0 / (0.11 * (aspect / (16.0 / 9.0)).sqrt());
+        let mut o = Vec::with_capacity(FOCUS_BYTES);
+        put(&mut o, &self.rect);
+        put(
+            &mut o,
+            &[self.spill, self.radius, self.art_w[0], self.art_w[1]],
+        );
+        put(
+            &mut o,
+            &[self.flow[0], self.flow[1], self.warp, self.twinkle],
+        );
+        put(&mut o, &[self.hue, self.bar, 0.0, inv_cell]);
+        for r in &self.ink {
+            put(&mut o, r);
+        }
+        put(&mut o, &self.ink_cap);
+        put(&mut o, &self.ink_on);
+        debug_assert_eq!(o.len(), FOCUS_BYTES);
+        o
+    }
+}
+
+/// The colours a cover throws into the room (linear RGB), computed once per cover off the render thread: the
+/// 8x8 box-filtered grid (row-major, sampled bilinearly at the nearest point of the cover) and the mean, with the
+/// mean's relative luminance Y.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ArtLight {
+    pub grid: [[f32; 3]; ART_GRID * ART_GRID],
+    pub mean: [f32; 3],
+    pub mean_y: f32,
+}
+
+/// Focus's `@group(1)`: the per-frame block and the two cover-colour slots (current, previous), which are
+/// written only when a cover changes (mirroring the overlay's `set_art` / `shift_art` / `clear_prev_art`).
+/// Size of the low-resolution room-light texture (`fs_room`); keep equal to ROOM_W / ROOM_H in focus.wgsl. About
+/// 1/16 of the pixels of a 1080p frame: the room (gradient, spill, haze) has no detail finer than ~0.15 H.
+pub const ROOM_SIZE: (u32, u32) = (480, 270);
+const ROOM_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
+
+struct FocusRes {
+    bgl: wgpu::BindGroupLayout,
+    uniform: wgpu::Buffer,
+    art: wgpu::Buffer,
+    group: wgpu::BindGroup,
+    /// Same buffers with a 1x1 stand-in for the room texture, bound while the room pass itself draws.
+    pre_group: wgpu::BindGroup,
+    room: wgpu::TextureView,
+    slots: [Option<ArtLight>; 2],
+}
+
+impl FocusRes {
+    fn new(device: &wgpu::Device) -> Self {
+        let entry = |binding| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Uniform,
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        };
+        let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("focus"),
+            entries: &[
+                entry(0),
+                entry(1),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+        let buf = |label, size: usize| {
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size: size as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            })
+        };
+        let uniform = buf("focus", FOCUS_BYTES);
+        let art = buf("focus-art", 2 * ART_SLOT_VEC4S * 16);
+        let tex = |label, (w, h): (u32, u32), usage| {
+            device
+                .create_texture(&wgpu::TextureDescriptor {
+                    label: Some(label),
+                    size: wgpu::Extent3d {
+                        width: w,
+                        height: h,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: ROOM_FORMAT,
+                    usage,
+                    view_formats: &[],
+                })
+                .create_view(&wgpu::TextureViewDescriptor::default())
+        };
+        let room = tex(
+            "focus-room",
+            ROOM_SIZE,
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        );
+        let stand_in = tex(
+            "focus-room-1x1",
+            (1, 1),
+            wgpu::TextureUsages::TEXTURE_BINDING,
+        );
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("focus-room"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+        let group_with = |label, view: &wgpu::TextureView| {
+            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some(label),
+                layout: &bgl,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: uniform.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: art.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::TextureView(view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: wgpu::BindingResource::Sampler(&sampler),
+                    },
+                ],
+            })
+        };
+        let group = group_with("focus", &room);
+        let pre_group = group_with("focus-room-pass", &stand_in);
+        Self {
+            bgl,
+            uniform,
+            art,
+            group,
+            pre_group,
+            room,
+            slots: [None, None],
+        }
+    }
+
+    /// Uploads both slots (2 KB, only when a cover changes). An empty slot is black; its weight is 0 anyway.
+    fn write_art(&self, queue: &wgpu::Queue) {
+        let mut o = Vec::with_capacity(2 * ART_SLOT_VEC4S * 16);
+        for s in &self.slots {
+            match s {
+                Some(a) => {
+                    for c in &a.grid {
+                        put(&mut o, &[c[0], c[1], c[2], 0.0]);
+                    }
+                    put(&mut o, &[a.mean[0], a.mean[1], a.mean[2], a.mean_y]);
+                }
+                None => put(&mut o, &[0.0; ART_SLOT_VEC4S * 4]),
+            }
+        }
+        queue.write_buffer(&self.art, 0, &o);
     }
 }
 
@@ -254,6 +493,7 @@ const FLUID_WGSL: &str = concat!(include_str!("common.wgsl"), include_str!("flui
 pub struct SceneSet {
     inner: FullscreenRenderer,
     fluid: FluidSim,
+    focus: FocusRes,
 }
 
 impl SceneSet {
@@ -263,13 +503,112 @@ impl SceneSet {
             format,
             scale,
             "scenes",
-            &[SPECTRUM_WGSL, AURORA_WGSL, FOCUS_WGSL, ORB_WGSL],
+            &[SPECTRUM_WGSL, AURORA_WGSL],
             UNIFORM_BYTES,
         );
+        let focus = FocusRes::new(device);
         let fluid = FluidSim::new(device, FLUID_WGSL);
-        let i = inner.add_pipeline(device, "fluid", FLUID_WGSL, fluid.bind_group_layout());
-        assert_eq!(i, SceneKind::Fluid.index(), "pipeline order");
-        Self { inner, fluid }
+        let focus_pipe = inner.add_pipeline(device, "focus", FOCUS_WGSL, Some(&focus.bgl));
+        let order = [
+            focus_pipe,
+            inner.add_pipeline(device, "orb", ORB_WGSL, None),
+            inner.add_pipeline(device, "fluid", FLUID_WGSL, Some(fluid.bind_group_layout())),
+        ];
+        assert_eq!(
+            order,
+            [
+                SceneKind::Focus.index(),
+                SceneKind::Orb.index(),
+                SceneKind::Fluid.index()
+            ],
+            "pipeline order"
+        );
+        // the room pass draws into the small texture the Focus pass samples; it runs only when Focus is drawn
+        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("focus-room"),
+            source: wgpu::ShaderSource::Wgsl(FOCUS_WGSL.into()),
+        });
+        let room_pipe = crate::fullscreen::make_pipeline(
+            device,
+            &module,
+            &[Some(inner.shared_layout()), Some(&focus.bgl)],
+            "focus-room",
+            ROOM_FORMAT,
+            "fs_room",
+        );
+        inner.set_prepass(
+            SceneKind::Focus.index(),
+            crate::fullscreen::PrePass {
+                pipeline: room_pipe,
+                target: focus.room.clone(),
+                group1: focus.pre_group.clone(),
+            },
+        );
+        // new buffers are zero-filled: both cover slots start empty (weight 0)
+        Self {
+            inner,
+            fluid,
+            focus,
+        }
+    }
+
+    /// The `@group(1)` bind groups by scene index, after writing Focus's per-frame block.
+    fn groups<'a>(
+        focus: &'a FocusRes,
+        fluid: &'a FluidSim,
+        queue: &wgpu::Queue,
+        p: &SceneParams,
+        res: (u32, u32),
+    ) -> [(usize, &'a wgpu::BindGroup); 2] {
+        queue.write_buffer(&focus.uniform, 0, &p.album.pack(res));
+        [
+            (SceneKind::Focus.index(), &focus.group),
+            (SceneKind::Fluid.index(), fluid.render_group()),
+        ]
+    }
+
+    /// Album Focus: the current cover's colours change (None = no cover). Mirrors `Overlay::set_art`/`clear_art`.
+    pub fn set_focus_art(&mut self, queue: &wgpu::Queue, light: Option<ArtLight>) {
+        self.focus.slots[0] = light;
+        self.focus.write_art(queue);
+    }
+
+    /// Album Focus: the current cover becomes the previous one (crossfade source). Mirrors `Overlay::shift_art`.
+    pub fn shift_focus_art(&mut self, queue: &wgpu::Queue) {
+        self.focus.slots[1] = self.focus.slots[0].take();
+        self.focus.write_art(queue);
+    }
+
+    /// Album Focus: the previous cover is gone. Mirrors `Overlay::clear_prev_art`.
+    pub fn clear_prev_focus_art(&mut self, queue: &wgpu::Queue) {
+        self.focus.slots[1] = None;
+        self.focus.write_art(queue);
+    }
+
+    /// Which cover slots hold colours (current, previous); tests and diagnostics.
+    pub fn focus_art_slots(&self) -> [bool; 2] {
+        [self.focus.slots[0].is_some(), self.focus.slots[1].is_some()]
+    }
+
+    /// Diagnostic (headless): GPU ms per Focus scene draw at `res`, submit-to-completion with no readback.
+    pub fn focus_gpu_ms(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        res: (u32, u32),
+        p: &SceneParams,
+        reps: u32,
+    ) -> Result<f64, String> {
+        let groups = Self::groups(&self.focus, &self.fluid, queue, p, res);
+        self.inner.time_offscreen(
+            device,
+            queue,
+            res,
+            &p.pack(res),
+            SceneKind::Focus.index(),
+            &groups,
+            reps,
+        )
     }
 
     /// Fluid quality tier 0..=3 (grid 256x144 .. 768x432 at 16:9); a change restarts the field.
@@ -295,12 +634,13 @@ impl SceneSet {
         } else {
             self.fluid.release();
         }
+        let queue = gpu.queue.clone();
         self.inner.render_scenes(
             gpu,
             &p.pack(res),
             scene.index(),
             xfade.map(|(k, t)| (k.index(), t)),
-            Some(self.fluid.render_group()),
+            &Self::groups(&self.focus, &self.fluid, &queue, p, res),
             post,
         )
     }
@@ -369,7 +709,7 @@ impl SceneSet {
             res,
             &p.pack(res),
             SceneKind::Fluid.index(),
-            Some(self.fluid.render_group()),
+            &Self::groups(&self.focus, &self.fluid, queue, p, res),
             reps,
         )?;
         Ok((sim, draw))
@@ -404,7 +744,7 @@ impl SceneSet {
             &p.pack(res),
             scene.index(),
             xfade.map(|(k, t)| (k.index(), t)),
-            Some(self.fluid.render_group()),
+            &Self::groups(&self.focus, &self.fluid, queue, p, res),
             post,
         )
     }
@@ -511,6 +851,165 @@ mod tests {
         assert_eq!((f32_at(&b, 1344), f32_at(&b, 1356)), (1.0, 4.0)); // ex4
         assert_eq!((f32_at(&b, 1360), f32_at(&b, 1372)), (5.0, 8.0)); // ex5, last float
         assert_eq!(b.len(), 1376);
+    }
+
+    fn light(left: [f32; 3], right: [f32; 3]) -> ArtLight {
+        let grid = std::array::from_fn(|i| {
+            if i % ART_GRID < ART_GRID / 2 {
+                left
+            } else {
+                right
+            }
+        });
+        let mean = [0, 1, 2].map(|c| 0.5 * (left[c] + right[c]));
+        ArtLight {
+            grid,
+            mean,
+            mean_y: 0.2126 * mean[0] + 0.7152 * mean[1] + 0.0722 * mean[2],
+        }
+    }
+
+    /// Mean linear luminance (0..1) and mean rgb of a pixel box of an RGBA8 image.
+    fn box_rgb(img: &[u8], w: u32, x0: u32, x1: u32, y0: u32, y1: u32) -> [f32; 3] {
+        let mut s = [0.0f32; 3];
+        for y in y0..y1 {
+            for x in x0..x1 {
+                for c in 0..3 {
+                    s[c] += f32::from(img[((y * w + x) * 4) as usize + c]) / 255.0;
+                }
+            }
+        }
+        s.map(|v| v / ((x1 - x0) * (y1 - y0)) as f32)
+    }
+
+    #[test]
+    fn focus_block_packs_to_its_declared_size_and_stays_finite() {
+        let mut f = FocusParams {
+            rect: [f32::NAN, 0.5, f32::INFINITY, 0.2],
+            ..Default::default()
+        };
+        f.ink[3] = [0.1, 0.2, 0.3, 0.4];
+        f.ink_cap[3] = 0.05;
+        let b = f.pack((1920, 1080));
+        assert_eq!(b.len(), FOCUS_BYTES);
+        assert!(
+            b.chunks_exact(4)
+                .all(|c| f32::from_ne_bytes([c[0], c[1], c[2], c[3]]).is_finite())
+        );
+        // ink rect 3 at vec4 index 7 (after rect, a, b, c, ink0..2), its cap at 8 .z... check by offsets
+        assert_eq!(f32_at(&b, (4 + 3) * 16), 0.1);
+        assert_eq!(f32_at(&b, 8 * 16 + 3 * 4), 0.05);
+        // the dust cell follows the aspect: 21:9 has a bigger cell count per height, so a smaller cell, in 1/cell
+        let wide = f32_at(&f.pack((2560, 1080)), 3 * 16 + 12);
+        let std = f32_at(&b, 3 * 16 + 12);
+        assert!(
+            (std - 1.0 / 0.11).abs() < 0.01 && wide < std,
+            "{std} {wide}"
+        );
+        let src = include_str!("focus.wgsl");
+        assert!(
+            src.contains("ink: array<vec4<f32>, 4>") && src.contains("fa: array<vec4<f32>, 130>")
+        );
+    }
+
+    #[test]
+    fn focus_room_is_lit_by_the_cover_it_follows_the_slots_and_never_shows_a_slot_headless() {
+        let Some((h, mut scene)) = headless() else {
+            return;
+        };
+        let res = (640u32, 360u32);
+        let mut p = SceneParams {
+            mode: SceneMode::Live,
+            ..Default::default()
+        };
+        p.album.rect = [0.5 * 640.0 / 360.0, 0.46, 0.25, 0.25];
+        p.album.spill = 0.9;
+        let render = |s: &SceneSet, p: &SceneParams| {
+            s.render_offscreen_scenes(
+                &h.device,
+                &h.queue,
+                res,
+                p,
+                SceneKind::Focus,
+                None,
+                &|_, _| {},
+            )
+            .unwrap()
+        };
+        // no cover: the empty slot is a soft light, never darker than its surroundings
+        p.album.art_w = [0.0, 0.0];
+        let none = render(&scene, &p);
+        assert_eq!(scene.focus_art_slots(), [false, false]);
+        let c = box_rgb(&none, res.0, 290, 350, 130, 190);
+        let edge = box_rgb(&none, res.0, 10, 70, 130, 190);
+        assert!(
+            c[0] + c[1] + c[2] > 1.2 * (edge[0] + edge[1] + edge[2]),
+            "{c:?} vs {edge:?}"
+        );
+        // a red-left / blue-right cover lights its left red and its right blue
+        scene.set_focus_art(&h.queue, Some(light([1.0, 0.0, 0.0], [0.0, 0.0, 1.0])));
+        assert_eq!(scene.focus_art_slots(), [true, false]);
+        p.album.art_w = [1.0, 0.0];
+        let lit = render(&scene, &p);
+        let (l, r) = (
+            box_rgb(&lit, res.0, 190, 225, 150, 210),
+            box_rgb(&lit, res.0, 415, 450, 150, 210),
+        );
+        assert!(
+            l[0] > 1.5 * l[2] && r[2] > 1.5 * r[0],
+            "left {l:?} right {r:?}"
+        );
+        // the previous cover is mirrored into the second slot and weighs in with its own weight
+        scene.shift_focus_art(&h.queue);
+        scene.set_focus_art(&h.queue, Some(light([0.0, 1.0, 0.0], [0.0, 1.0, 0.0])));
+        assert_eq!(scene.focus_art_slots(), [true, true]);
+        p.album.art_w = [0.0, 1.0];
+        let prev = render(&scene, &p);
+        let g = box_rgb(&prev, res.0, 190, 225, 150, 210);
+        assert!(
+            g[1] > 4.0 * g[0].max(g[2]) || g[0] > 4.0 * g[1],
+            "previous slot lights the room: {g:?}"
+        );
+        scene.clear_prev_focus_art(&h.queue);
+        scene.set_focus_art(&h.queue, None);
+        assert_eq!(scene.focus_art_slots(), [false, false]);
+        // the art-brightest cap: next to a white cover the room stays at most 0.6 x its mean Y (0.6), and the pocket
+        // caps what is under a text rectangle; the floor dims with the bar
+        scene.set_focus_art(&h.queue, Some(light([1.0; 3], [1.0; 3])));
+        p.album.art_w = [1.0, 0.0];
+        p.album.ink[0] = [1.15, 0.30, 1.55, 0.45];
+        p.album.ink_cap[0] = 0.03;
+        p.album.ink_on[0] = 1.0;
+        let capped = render(&scene, &p);
+        let y = |b: [f32; 3]| 0.2126 * b[0] + 0.7152 * b[1] + 0.0722 * b[2];
+        let near = box_rgb(&capped, res.0, 415, 445, 170, 240); // just right of the cover (0.04 H)
+        assert!(
+            y(near) <= 0.6 + 0.01,
+            "art stays the brightest: {}",
+            y(near)
+        );
+        let under = box_rgb(&capped, res.0, 420, 540, 120, 160); // inside the pocket rectangle
+        assert!(y(under) <= 0.03 + 0.004, "pocket cap: {}", y(under));
+        let (below_before, above_before) = (
+            box_rgb(&capped, res.0, 20, 140, 310, 350),
+            box_rgb(&capped, res.0, 20, 140, 20, 60),
+        );
+        p.album.bar = 1.0;
+        let dimmed = render(&scene, &p);
+        let (below, above) = (
+            box_rgb(&dimmed, res.0, 20, 140, 310, 350),
+            box_rgb(&dimmed, res.0, 20, 140, 20, 60),
+        );
+        assert!(
+            y(below) < 0.86 * y(below_before),
+            "floor dims: {} -> {}",
+            y(below_before),
+            y(below)
+        );
+        assert!(
+            (y(above) - y(above_before)).abs() < 0.004,
+            "the rest does not"
+        );
     }
 
     #[test]

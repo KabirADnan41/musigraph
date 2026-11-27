@@ -29,7 +29,7 @@ pub struct ArtDraw {
     pub radius: f32,
     /// Shadow strength 0..1 (1 = the spec's contact 0.55 + ambient 0.45 alphas).
     pub shadow: f32,
-    /// Sampling LOD (blur bridge hook for the crossfade; 0 = sharp; needs a mip chain to have an effect).
+    /// Sampling LOD of the blur bridge during a crossfade (0 = sharp; the cover texture carries the mips it needs).
     pub lod: f32,
 }
 
@@ -382,15 +382,38 @@ fn make_texture(
     queue: &wgpu::Queue,
     label: &str,
     format: wgpu::TextureFormat,
-    (w, h): (u32, u32),
+    size: (u32, u32),
     bytes_per_px: u32,
     data: &[u8],
 ) -> Option<wgpu::TextureView> {
+    make_texture_mips(device, queue, label, format, size, bytes_per_px, data, &[])
+}
+
+/// `make_texture` with extra mip levels 1.. (each `max(1, w >> level)` x `max(1, h >> level)`, same format). Any
+/// level of the wrong length refuses the whole texture (nothing half-uploaded).
+#[allow(clippy::too_many_arguments)]
+fn make_texture_mips(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    label: &str,
+    format: wgpu::TextureFormat,
+    (w, h): (u32, u32),
+    bytes_per_px: u32,
+    data: &[u8],
+    mips: &[Vec<u8>],
+) -> Option<wgpu::TextureView> {
+    let level_size = |l: u32| ((w >> l).max(1), (h >> l).max(1));
     if w == 0
         || h == 0
         || w > MAX_TEXTURE_SIDE
         || h > MAX_TEXTURE_SIDE
         || data.len() != (w * h * bytes_per_px) as usize
+        || mips.len() >= 16
+        || (w.max(h) >> mips.len()) == 0
+        || mips.iter().enumerate().any(|(i, m)| {
+            let (mw, mh) = level_size(i as u32 + 1);
+            m.len() != (mw * mh * bytes_per_px) as usize
+        })
     {
         return None;
     }
@@ -401,32 +424,38 @@ fn make_texture(
             height: h,
             depth_or_array_layers: 1,
         },
-        mip_level_count: 1,
+        mip_level_count: 1 + mips.len() as u32,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
         format,
         usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
         view_formats: &[],
     });
-    queue.write_texture(
-        wgpu::TexelCopyTextureInfo {
-            texture: &tex,
-            mip_level: 0,
-            origin: wgpu::Origin3d::ZERO,
-            aspect: wgpu::TextureAspect::All,
-        },
-        data,
-        wgpu::TexelCopyBufferLayout {
-            offset: 0,
-            bytes_per_row: Some(w * bytes_per_px),
-            rows_per_image: Some(h),
-        },
-        wgpu::Extent3d {
-            width: w,
-            height: h,
-            depth_or_array_layers: 1,
-        },
-    );
+    for (level, bytes) in std::iter::once(data)
+        .chain(mips.iter().map(|m| m.as_slice()))
+        .enumerate()
+    {
+        let (lw, lh) = level_size(level as u32);
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &tex,
+                mip_level: level as u32,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            bytes,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(lw * bytes_per_px),
+                rows_per_image: Some(lh),
+            },
+            wgpu::Extent3d {
+                width: lw,
+                height: lh,
+                depth_or_array_layers: 1,
+            },
+        );
+    }
     Some(tex.create_view(&wgpu::TextureViewDescriptor::default()))
 }
 
@@ -544,6 +573,8 @@ impl Overlay {
             address_mode_v: wgpu::AddressMode::ClampToEdge,
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
+            // trilinear: only the cover (the sole texture with mips) reacts, for the blur bridge
+            mipmap_filter: wgpu::MipmapFilterMode::Linear,
             ..Default::default()
         });
         let uniform = device.create_buffer(&wgpu::BufferDescriptor {
@@ -707,7 +738,21 @@ impl Overlay {
         size: (u32, u32),
         rgba: &[u8],
     ) -> bool {
-        self.art = make_texture(
+        self.set_art_mips(device, queue, size, rgba, &[])
+    }
+
+    /// `set_art` with mip levels 1.. (CPU box-filtered by the presentation worker, uploaded together with the
+    /// picture, once per cover). The texture lives until the cover is cleared or replaced. A malformed level
+    /// refuses the cover.
+    pub fn set_art_mips(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        size: (u32, u32),
+        rgba: &[u8],
+        mips: &[Vec<u8>],
+    ) -> bool {
+        self.art = make_texture_mips(
             device,
             queue,
             "art",
@@ -715,6 +760,7 @@ impl Overlay {
             size,
             4,
             rgba,
+            mips,
         );
         self.rebuild(device);
         self.art.is_some()
@@ -1177,6 +1223,64 @@ mod tests {
         ov.clear_prev_art(&h.device);
         let img = render(&ov, &p);
         assert!(px(&img, res.0, 160, 90)[0] < 60, "previous cover dropped");
+    }
+
+    #[test]
+    fn cover_mips_are_uploaded_with_the_picture_and_sampled_by_the_blur_bridge_headless() {
+        let Ok(h) = init_headless() else {
+            eprintln!("SKIPPED (no hardware GPU)");
+            return;
+        };
+        let res = (320u32, 180u32);
+        let scene = SceneSet::new_headless(&h.device);
+        let mut ov = Overlay::new_headless(&h.device, &h.queue);
+        // 8x8 black/white checker, its 4x4 and 2x2 levels flat grey
+        let checker: Vec<u8> = (0..64)
+            .flat_map(|i| {
+                let v = if (i % 8 + i / 8) % 2 == 0 { 255 } else { 0 };
+                [v, v, v, 255]
+            })
+            .collect();
+        let grey = |n: usize| {
+            (0..n)
+                .flat_map(|_| [188u8, 188, 188, 255])
+                .collect::<Vec<u8>>()
+        };
+        let mips = [grey(16), grey(4)];
+        // a malformed level refuses the cover instead of uploading half of it
+        assert!(!ov.set_art_mips(&h.device, &h.queue, (8, 8), &checker, &[grey(15)]));
+        assert!(!ov.set_art_mips(
+            &h.device,
+            &h.queue,
+            (8, 8),
+            &checker,
+            &[grey(16), grey(4), grey(1), grey(1)]
+        ));
+        assert!(ov.set_art_mips(&h.device, &h.queue, (8, 8), &checker, &mips));
+        let sp = SceneParams::default();
+        let render = |ov: &Overlay, lod: f32| {
+            let mut p = params(res);
+            let a = p.art.as_mut().unwrap();
+            (a.hw, a.hh, a.lod) = (32.0, 32.0, lod);
+            scene
+                .render_offscreen_with(&h.device, &h.queue, res, &sp, &|enc, view| {
+                    ov.draw(&h.queue, enc, view, &p)
+                })
+                .unwrap()
+        };
+        // two neighbouring texel centres of the 64 px cover (8 px per texel)
+        let (sharp, soft) = (render(&ov, 0.0), render(&ov, 2.0));
+        let (a, b) = (px(&sharp, res.0, 132, 70)[0], px(&sharp, res.0, 140, 70)[0]);
+        assert!(a.abs_diff(b) > 150, "lod 0 is the picture: {a} vs {b}");
+        let (a, b) = (px(&soft, res.0, 132, 70)[0], px(&soft, res.0, 140, 70)[0]);
+        assert!(
+            a.abs_diff(b) < 4 && a.abs_diff(128) < 6,
+            "lod 2 is the mip: {a} vs {b}"
+        );
+        // a cover without mips ignores the lod (nothing to bridge with, nothing broken)
+        assert!(ov.set_art(&h.device, &h.queue, (8, 8), &checker));
+        let flat = render(&ov, 2.0);
+        assert!(px(&flat, res.0, 132, 70)[0].abs_diff(px(&flat, res.0, 140, 70)[0]) > 150);
     }
 
     #[test]

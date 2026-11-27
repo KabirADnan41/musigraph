@@ -5,7 +5,7 @@
 //! API (stride x height checked against the buffer size). COM is initialised per thread (MTA) and released when
 //! the renderer is dropped (after its interfaces); keep the renderer on the thread that created it.
 
-use crate::{Cut, LineStyle, MAX_SIDE, TextBitmap, bound_text, is_rtl, tracking_safe};
+use crate::{Align, Cut, LineStyle, MAX_SIDE, TextBitmap, bound_text, is_rtl, tracking_safe};
 use windows::Win32::Graphics::Direct2D::Common::{
     D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_PIXEL_FORMAT,
 };
@@ -17,7 +17,8 @@ use windows::Win32::Graphics::Direct2D::{
 use windows::Win32::Graphics::DirectWrite::{
     DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL,
     DWRITE_FONT_WEIGHT, DWRITE_LINE_SPACING_METHOD_UNIFORM, DWRITE_READING_DIRECTION_RIGHT_TO_LEFT,
-    DWRITE_TEXT_METRICS, DWRITE_TEXT_RANGE, DWRITE_TRIMMING, DWRITE_TRIMMING_GRANULARITY_CHARACTER,
+    DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT_TRAILING, DWRITE_TEXT_METRICS,
+    DWRITE_TEXT_RANGE, DWRITE_TRIMMING, DWRITE_TRIMMING_GRANULARITY_CHARACTER,
     DWRITE_TRIMMING_GRANULARITY_WORD, DWRITE_WORD_WRAPPING_EMERGENCY_BREAK,
     DWRITE_WORD_WRAPPING_NO_WRAP, DWRITE_WORD_WRAPPING_WRAP, DWriteCreateFactory, IDWriteFactory,
     IDWriteFontCollection, IDWriteTextLayout1,
@@ -213,6 +214,13 @@ impl TextRenderer {
                 .max(1);
             // draw in a box exactly as wide as the text so RTL/right-aligned lines land inside the bitmap
             layout.SetMaxWidth(ink_w as f32).ok()?;
+            match style.align {
+                Align::Start => {}
+                Align::Center => layout.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER).ok()?,
+                Align::End => layout
+                    .SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING)
+                    .ok()?,
+            }
             layout.GetMetrics(&mut m).ok()?;
             let w = ink_w + 2 * pad;
             let h = (m.height.min(box_h).ceil() as u32).max(1) + 2 * pad;
@@ -302,6 +310,61 @@ mod tests {
             max_width,
             ..LineStyle::default()
         }
+    }
+
+    /// Left edge (px from the bitmap's left) of the ink in the lowest `rows` rows of the ink box.
+    fn bottom_left_ink(b: &TextBitmap, rows: u32) -> u32 {
+        let (w, h) = (b.width as usize, b.height as usize);
+        let last = (0..h)
+            .rev()
+            .find(|&y| b.coverage[y * w..(y + 1) * w].iter().any(|&c| c > 100))
+            .expect("ink");
+        let first = last.saturating_sub(rows as usize);
+        (0..w)
+            .find(|&x| (first..=last).any(|y| b.coverage[y * w + x] > 100))
+            .expect("ink") as u32
+    }
+
+    #[test]
+    fn paragraph_alignment_moves_the_short_last_line_and_keeps_the_default() {
+        let r = TextRenderer::new().expect("directwrite available");
+        let two = |align| LineStyle {
+            max_lines: 2,
+            line_height: 1.1,
+            align,
+            ..style(330)
+        };
+        let text = "Hold the light a little longer tonight";
+        let start = r.render_line(text, &two(Align::Start)).expect("start");
+        let centre = r.render_line(text, &two(Align::Center)).expect("centre");
+        let end = r.render_line(text, &two(Align::End)).expect("end");
+        assert_eq!(start.height, centre.height, "same two lines");
+        let (s, c, e) = (
+            bottom_left_ink(&start, 12),
+            bottom_left_ink(&centre, 12),
+            bottom_left_ink(&end, 12),
+        );
+        assert!(
+            s <= start.pad + 6,
+            "start-aligned text starts at the pad ({s})"
+        );
+        assert!(
+            c > s + 6 && e > c + 6,
+            "centre {c} and end {e} are further right than start {s}"
+        );
+        // the default style is unchanged (Start)
+        assert_eq!(LineStyle::default().align, Align::Start);
+        assert_eq!(
+            r.render_line(
+                text,
+                &LineStyle {
+                    align: Align::Start,
+                    ..two(Align::Start)
+                }
+            )
+            .unwrap(),
+            start
+        );
     }
 
     #[test]

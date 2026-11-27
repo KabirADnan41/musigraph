@@ -321,7 +321,17 @@ impl LyricView {
         }
         let (w, h) = (surface.0 as f32, surface.1 as f32);
         let (style, step) = match self.column {
-            Some(c) => (LYRIC_CURRENT.style(text, h, c.w), LYRIC_CURRENT.step),
+            Some(c) => (
+                LineStyle {
+                    align: if c.centered {
+                        mg_text::Align::Center
+                    } else {
+                        mg_text::Align::Start
+                    },
+                    ..LYRIC_CURRENT.style(text, h, c.w)
+                },
+                LYRIC_CURRENT.step,
+            ),
             None => (
                 LineStyle {
                     px: lyric_px(h),

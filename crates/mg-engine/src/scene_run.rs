@@ -25,7 +25,7 @@ use mg_dsp::features::{MusicFeatures, MusicTracker};
 use mg_dsp::{AnalysisParams, Analyzer, AudioFrame};
 use mg_gfx::context::{BackendChoice, FrameStatus, Gpu};
 use mg_gfx::overlay::Overlay;
-use mg_gfx::scene::{SceneKind, SceneMode, SceneParams, SceneSet};
+use mg_gfx::scene::{SceneKind, SceneMode, SceneSet};
 use mg_media::{Dispatch, MediaCommand};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -167,7 +167,7 @@ pub struct SceneOpts {
     pub controls: ControlsMode,
     /// Fluid quality tier 0..=3 (developer flag `--fluid-tier`; auto-tier is a TODO).
     pub fluid_tier: u8,
-    /// PLACEHOLDER (owner question): reduced motion for the overlay (`--reduced-motion`). The Windows setting
+    /// reduced motion for the overlay (`--reduced-motion`). The Windows setting
     /// (SPI_GETCLIENTAREAANIMATION) is not reachable with the dependencies and `windows` features enabled today.
     pub reduced_motion: bool,
 }
@@ -338,6 +338,9 @@ impl SynthSource {
 }
 
 struct App {
+    /// Reduced motion = `--reduced-motion` OR the Windows animation setting (polled once a second; one cheap read-only call).
+    motion_last: Option<Instant>,
+    motion_reduced: bool,
     opts: SceneOpts,
     shared: Arc<Mutex<Shared>>,
     capture: Option<Loopback>,
@@ -353,10 +356,6 @@ struct App {
     last_np: Option<mg_media::NowPlaying>,
     switch: SceneSwitch,
     last_auto_switch: Instant,
-    /// Album Focus: last artwork rectangle and how present it is (eased), so the composition glides to the
-    /// centre orb when the artwork goes away instead of snapping.
-    focus_last: [f32; 4],
-    focus_vis: f32,
     gpu: Option<Gpu>,
     window: Option<Arc<Window>>,
     start: Instant,
@@ -736,6 +735,18 @@ impl App {
             .gpu
             .as_ref()
             .map_or((0, 0), |g| (g.config.width, g.config.height));
+        if self
+            .motion_last
+            .is_none_or(|t| now.duration_since(t) >= Duration::from_secs(1))
+        {
+            self.motion_last = Some(now);
+            let r = crate::motion_pref::reduced_motion(self.opts.reduced_motion);
+            if r != self.motion_reduced {
+                self.motion_reduced = r;
+                self.mapper.set_reduced_motion(r);
+                self.pres.set_reduced_motion(r);
+            }
+        }
         let t_poll = Instant::now();
         if self
             .last_media_poll
@@ -777,9 +788,10 @@ impl App {
             .as_ref()
             .map_or(1.0, |w| w.scale_factor() as f32);
         let full_lift = crate::controls::lyric_lift(anchor, surface, dpi);
+        let bar_vis = (self.ctl.lyric_lift(anchor) / full_lift.max(1e-3)).clamp(0.0, 1.0);
         self.pres.set_bar(
             surface.1 as f32 - 128.0 * crate::controls::ui_scale(surface, dpi),
-            self.ctl.lyric_lift(anchor) / full_lift.max(1e-3),
+            bar_vis,
         );
         self.pres
             .set_album_scene(self.switch.target() == SceneKind::Focus, surface);
@@ -804,21 +816,10 @@ impl App {
         for job in self.ctl.take_jobs() {
             self.worker.submit(job);
         }
-        // Album Focus radiates from the artwork rectangle (one source of truth: the overlay layout).
-        let target_vis = match overlay_params.art.or(overlay_params.art_prev) {
-            Some(a) => {
-                let (w, h) = (surface.0.max(1) as f32, surface.1.max(1) as f32);
-                self.focus_last = [a.cx / w, a.cy / h, a.hw / h, a.hh / h];
-                a.alpha.clamp(0.0, 1.0)
-            }
-            None => 0.0,
-        };
-        let step = dt as f32 / 0.6;
-        self.focus_vis += (target_vis - self.focus_vis).clamp(-step, step);
-        let orb = SceneParams::default().focus;
-        params.focus =
-            [0, 1, 2, 3].map(|i| orb[i] + (self.focus_last[i] - orb[i]) * self.focus_vis);
-        params.focus_active = self.focus_vis;
+        // Album Focus room light: the presentation owns the light rectangle (one source of truth with the cover
+        // layout), the cover weights and the text pocket; the mapper owns the music fields.
+        self.pres.merge_focus(&mut params.album);
+        params.album.bar = bar_vis;
         if let Some(every) = self.opts.auto_scenes {
             if now.duration_since(self.last_auto_switch).as_secs() >= every {
                 self.last_auto_switch = now;
@@ -861,12 +862,29 @@ impl App {
                 .collect();
             for op in ops {
                 match op {
-                    GpuOp::SetArt(img) => {
-                        ov.set_art(&g.device, &g.queue, (img.width, img.height), &img.rgba);
+                    GpuOp::SetArt(img, extra) => {
+                        let mips = extra.as_ref().map_or(&[][..], |e| e.mips.as_slice());
+                        ov.set_art_mips(
+                            &g.device,
+                            &g.queue,
+                            (img.width, img.height),
+                            &img.rgba,
+                            mips,
+                        );
+                        scene.set_focus_art(&g.queue, extra.map(|e| *e.light));
                     }
-                    GpuOp::ShiftArt => ov.shift_art(&g.device),
-                    GpuOp::ClearPrevArt => ov.clear_prev_art(&g.device),
-                    GpuOp::ClearArt => ov.clear_art(&g.device),
+                    GpuOp::ShiftArt => {
+                        ov.shift_art(&g.device);
+                        scene.shift_focus_art(&g.queue);
+                    }
+                    GpuOp::ClearPrevArt => {
+                        ov.clear_prev_art(&g.device);
+                        scene.clear_prev_focus_art(&g.queue);
+                    }
+                    GpuOp::ClearArt => {
+                        ov.clear_art(&g.device);
+                        scene.set_focus_art(&g.queue, None);
+                    }
                     GpuOp::SetText(i, b) => {
                         ov.set_text(&g.device, &g.queue, i, (b.width, b.height), &b.coverage);
                     }
@@ -1017,10 +1035,16 @@ pub fn run(opts: SceneOpts) -> i32 {
     let stale_after = Duration::from_secs_f32(tune.stale_after_s);
     let mut app = App {
         opts,
+        motion_last: None,
+        motion_reduced: reduced_motion,
         shared,
         capture,
         synth,
-        mapper: SceneMapper::new(tune),
+        mapper: {
+            let mut m = SceneMapper::new(tune);
+            m.set_reduced_motion(reduced_motion);
+            m
+        },
         stale_after,
         scene: None,
         overlay: None,
@@ -1036,8 +1060,6 @@ pub fn run(opts: SceneOpts) -> i32 {
         last_np: None,
         switch: SceneSwitch::new(style),
         last_auto_switch: Instant::now(),
-        focus_last: SceneParams::default().focus,
-        focus_vis: 0.0,
         gpu: None,
         window: None,
         start: Instant::now(),

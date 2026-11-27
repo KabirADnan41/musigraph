@@ -17,10 +17,11 @@
 
 use crate::lyric_view::{Column, LyricSource, LyricView};
 use mg_gfx::overlay::{ArtDraw, META_SLOT, OverlayParams, TextColors, TextDraw};
+use mg_gfx::scene::{ART_GRID, ArtLight, FocusParams};
 use mg_media::lrc::Lyrics;
 use mg_media::palette::{Palette, to_oklab};
 use mg_media::{ArtImage, NowPlaying};
-use mg_text::{Cut, LineStyle, TextBitmap};
+use mg_text::{Align, Cut, LineStyle, TextBitmap};
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::thread::JoinHandle;
@@ -53,11 +54,15 @@ pub const LYRICS_WAIT_S: f32 = 0.28;
 const RESIZE_SETTLE_S: f32 = 0.15;
 const LAYOUT_EASE_S: f32 = 0.22;
 
-/// Part-2 hook (blur bridge): sampling LOD of the artwork at crossfade progress `t` (0..1). The spec's bridge is
-/// `2·sin(πt)`, which needs a mip chain on the cover texture (CPU mips, part 2); until then it is 0 (no blur).
+/// Blur bridge: sampling LOD of the artwork at crossfade progress `t` (0..1), `2·sin(πt)` (spec): sharp at both ends,
+/// two mip levels soft in the middle, where the two unrelated pictures overlap most (emil-design-eng: blur masks an
+/// imperfect crossfade). Needs the mip chain `art_extra` makes; the caller passes 0 in reduced motion.
 pub fn art_blur_lod(t: f32) -> f32 {
-    let _ = t;
-    0.0
+    if t.is_finite() {
+        2.0 * (std::f32::consts::PI * t.clamp(0.0, 1.0)).sin()
+    } else {
+        0.0
+    }
 }
 
 // ---- easing -----------------------------------------------------------------------------------------
@@ -312,6 +317,7 @@ impl Role {
             } else {
                 Cut::Text
             },
+            ..LineStyle::default()
         }
     }
 }
@@ -349,6 +355,8 @@ pub enum Job {
     Art {
         track_id: u64,
         bytes: Arc<[u8]>,
+        /// Build the blur-bridge mip chain too (off in reduced motion: the bridge is not drawn).
+        mips: bool,
     },
     Text(TextJob),
     /// Find and parse the user-supplied lyrics file for a track (or build the demo lyrics).
@@ -381,6 +389,8 @@ pub enum Ready {
         track_id: u64,
         image: Option<ArtImage>,
         palette: Option<Palette>,
+        /// Mips and room-light colours of `image`, made on the worker (never on the render thread).
+        extra: Option<ArtExtra>,
     },
     Text {
         track_id: u64,
@@ -410,8 +420,8 @@ pub enum Ready {
 pub enum GpuOp {
     /// The current cover becomes the previous one (crossfade source).
     ShiftArt,
-    /// Replaces the current cover.
-    SetArt(ArtImage),
+    /// Replaces the current cover (with its mips for the overlay and its room-light colours for the scene).
+    SetArt(ArtImage, Option<ArtExtra>),
     ClearArt,
     ClearPrevArt,
     SetText(usize, TextBitmap),
@@ -859,7 +869,7 @@ pub struct Presentation {
     jobs: Vec<Job>,
     ops: Vec<GpuOp>,
     art: [Option<ArtLayer>; 2],
-    art_pending: Option<Option<ArtImage>>,
+    art_pending: Option<Option<(ArtImage, Option<ArtExtra>)>>,
     els: [TextEl; 3],
     text_pending: Option<[Option<Fitted>; 3]>,
     palette: PaletteState,
@@ -870,6 +880,10 @@ pub struct Presentation {
     /// Control-bar zone top (px from the top; 0 = unknown) and how far the bar is shown (0..1).
     zone_top: f32,
     bar_vis: f32,
+    /// Cover slot (centre x, y, side) of the last composition, and the room-light inputs derived from the last
+    /// frame (see `merge_focus`).
+    slot: [f32; 3],
+    focus: FocusParams,
 }
 
 impl Presentation {
@@ -901,6 +915,8 @@ impl Presentation {
             lyrics_on: true,
             zone_top: 0.0,
             bar_vis: 0.0,
+            slot: [0.0; 3],
+            focus: FocusParams::default(),
         }
     }
 
@@ -1048,11 +1064,20 @@ impl Presentation {
         let roles = self.roles();
         // the meta line belongs to Album Focus only; the compact layouts keep title and artist
         let with_meta = self.style() == Style::Album;
+        // centred blocks (portrait, legacy Center) centre the lines of a wrapped title inside their bitmap too
+        let centred = match self.style() {
+            Style::Album => album_geom(w, h, self.zone(h), self.lyric_variant).portrait,
+            Style::Center => true,
+            _ => false,
+        };
         let items = std::array::from_fn(|i| {
             let s = &self.shown[i];
             (!s.trim().is_empty() && (i < 2 || with_meta)).then(|| TextItem {
                 text: s.clone(),
-                style: roles[i].style(s, h, col),
+                style: LineStyle {
+                    align: if centred { Align::Center } else { Align::Start },
+                    ..roles[i].style(s, h, col)
+                },
                 step: roles[i].step,
             })
         });
@@ -1134,6 +1159,7 @@ impl Presentation {
                     self.jobs.push(Job::Art {
                         track_id: n.track_id,
                         bytes: bytes.clone(),
+                        mips: !self.reduced_motion,
                     });
                 }
             }
@@ -1146,6 +1172,7 @@ impl Presentation {
                     self.jobs.push(Job::Art {
                         track_id: n.track_id,
                         bytes: bytes.clone(),
+                        mips: !self.reduced_motion,
                     });
                 }
             }
@@ -1161,12 +1188,13 @@ impl Presentation {
                 track_id,
                 image,
                 palette,
+                extra,
             } => {
                 if Some(track_id) != self.track_id {
                     return;
                 }
                 self.palette.set_target(palette);
-                self.art_pending = Some(image);
+                self.art_pending = Some(image.map(|i| (i, extra)));
             }
             Ready::Text {
                 track_id,
@@ -1191,7 +1219,7 @@ impl Presentation {
     fn step_art(&mut self, dt: f32) {
         if let Some(p) = self.art_pending.take() {
             self.art_expected = false;
-            if let Some(img) = p {
+            if let Some((img, extra)) = p {
                 let aspect = img.width as f32 / img.height.max(1) as f32;
                 // Of the two textures keep the one that contributes more to the picture as the crossfade
                 // source; the other (an obsolete, mostly invisible transition) is dropped.
@@ -1204,7 +1232,7 @@ impl Presentation {
                     self.ops.push(GpuOp::ShiftArt);
                     self.art[1] = self.art[0].take();
                 }
-                self.ops.push(GpuOp::SetArt(img));
+                self.ops.push(GpuOp::SetArt(img, extra));
                 self.art[0] = Some(ArtLayer {
                     aspect,
                     alpha: 0.0,
@@ -1354,7 +1382,19 @@ impl Presentation {
             out.lyric_emph = self.lyrics.emphasis();
             out.lyric_clip = self.lyrics.clip();
         }
+        self.focus = focus_feed(&out, self.slot);
         out
+    }
+
+    /// Copies the room-light inputs of the last `update` (light rectangle, cover weights, text pocket) into `f`;
+    /// the music fields, the bar and the cover colours are not touched.
+    pub fn merge_focus(&self, f: &mut FocusParams) {
+        let g = &self.focus;
+        f.rect = g.rect;
+        f.art_w = g.art_w;
+        f.ink = g.ink;
+        f.ink_cap = g.ink_cap;
+        f.ink_on = g.ink_on;
     }
 
     /// Places cover and title block for `style`, writes them into `out` and returns the lyric column
@@ -1405,7 +1445,14 @@ impl Presentation {
         };
         // ---- covers (each layer keeps its own rect; a leaving cover stays where it was) ----
         let [cx, cy, side] = slot;
+        self.slot = slot;
         let crossfading = self.art[1].is_some();
+        // blur bridge: both pictures soften together while they overlap (never in reduced motion)
+        let bridge = if crossfading && !self.reduced_motion {
+            art_blur_lod(self.art[0].map_or(1.0, |c| c.alpha))
+        } else {
+            0.0
+        };
         for (k, layer) in self.art.iter_mut().enumerate() {
             let Some(l) = layer else { continue };
             let a = l.aspect.clamp(0.2, 5.0);
@@ -1428,7 +1475,7 @@ impl Presentation {
                 alpha: t * t * (3.0 - 2.0 * t),
                 radius: 0.02 * 2.0 * r[2].max(r[3]),
                 shadow: 1.0,
-                lod: art_blur_lod(if k == 0 && crossfading { t } else { 1.0 }),
+                lod: bridge,
             };
             if k == 0 {
                 out.art = Some(draw);
@@ -1523,6 +1570,98 @@ impl Presentation {
     }
 }
 
+// ---- room light inputs (Album Focus environment) -------------------------------------------------------
+
+/// Required contrast of each role over the environment (spec "Contrast": title and current lyric 7:1, artist
+/// 4.5:1, context and meta 3:1) and the headroom kept for dither and shadow.
+const RATIO_TITLE: f32 = 7.0;
+const RATIO_ARTIST: f32 = 4.5;
+const RATIO_CONTEXT: f32 = 3.0;
+const POCKET_HEADROOM: f32 = 0.8;
+/// The pocket never caps above this relative luminance (spec: Y <= 0.06), nor below `POCKET_MIN_Y` (never a scrim).
+const POCKET_MAX_Y: f32 = 0.06;
+const POCKET_MIN_Y: f32 = 0.01;
+
+fn rel_lum(c: [f32; 3]) -> f32 {
+    0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2]
+}
+
+/// Largest background luminance that still gives `ratio`:1 for text of relative luminance `text_y` (WCAG form
+/// (Yt + 0.05) / (Yb + 0.05)), with headroom, clamped to the pocket range.
+pub fn pocket_cap(text_y: f32, ratio: f32) -> f32 {
+    (((text_y + 0.05) / ratio - 0.05) * POCKET_HEADROOM).clamp(POCKET_MIN_Y, POCKET_MAX_Y)
+}
+
+/// The room-light inputs the presentation owns, in screen heights (top-left origin): the light source rectangle
+/// (the drawn cover, or the empty cover slot as a soft point source), the weights of the current and previous
+/// cover colours, and up to four text ink rectangles with the luminance cap each one needs and their own alpha.
+/// Music fields, bar visibility and the cover colours themselves are added by the runner / the scene.
+pub fn focus_feed(out: &OverlayParams, slot: [f32; 3]) -> FocusParams {
+    let h = out.res.1.max(1) as f32;
+    let mut f = FocusParams {
+        rect: match out.art.or(out.art_prev) {
+            Some(a) => [a.cx / h, a.cy / h, a.hw / h, a.hh / h],
+            None => [
+                slot[0] / h,
+                slot[1] / h,
+                0.5 * slot[2] / h,
+                0.5 * slot[2] / h,
+            ],
+        },
+        ..FocusParams::default()
+    };
+    let a0 = out.art.map_or(0.0, |a| a.alpha.clamp(0.0, 1.0));
+    let a1 = out.art_prev.map_or(0.0, |a| a.alpha.clamp(0.0, 1.0));
+    f.art_w = [a0, a1 * (1.0 - a0)];
+    let c = &out.colors;
+    let rect = |d: &TextDraw| [d.x / h, d.y / h, (d.x + d.w) / h, (d.y + d.h) / h];
+    let mut n = 0;
+    for (d, col, ratio) in [
+        (out.title, c.title, RATIO_TITLE),
+        (out.artist, c.artist, RATIO_ARTIST),
+        (out.meta, c.meta, RATIO_CONTEXT),
+    ] {
+        if let Some(d) = d.filter(|d| d.alpha > 0.002) {
+            f.ink[n] = rect(&d);
+            f.ink_cap[n] = pocket_cap(rel_lum(col), ratio);
+            f.ink_on[n] = d.alpha.clamp(0.0, 1.0);
+            n += 1;
+        }
+    }
+    // the lyric column: x from the drawn lines, y from the column mask when there is one (the slide moves lines
+    // inside it); the cap serves the strictest role in it (current 7:1, context 3:1)
+    let lines: Vec<&TextDraw> = out
+        .lyrics
+        .iter()
+        .flatten()
+        .filter(|d| d.alpha > 0.002)
+        .collect();
+    if let Some(first) = lines.first() {
+        let mut r = rect(first);
+        for d in &lines[1..] {
+            let q = rect(d);
+            r = [
+                r[0].min(q[0]),
+                r[1].min(q[1]),
+                r[2].max(q[2]),
+                r[3].max(q[3]),
+            ];
+        }
+        if let Some(clip) = out.lyric_clip {
+            r[1] = clip[0] / h;
+            r[3] = clip[1] / h;
+        }
+        f.ink[n] = r;
+        f.ink_cap[n] = pocket_cap(rel_lum(c.lyric), RATIO_TITLE)
+            .min(pocket_cap(rel_lum(c.context), RATIO_CONTEXT));
+        f.ink_on[n] = lines
+            .iter()
+            .fold(0.0f32, |m, d| m.max(d.alpha))
+            .clamp(0.0, 1.0);
+    }
+    f
+}
+
 // ---- worker thread ----------------------------------------------------------------------------------
 
 pub struct Worker {
@@ -1532,16 +1671,145 @@ pub struct Worker {
     done: Arc<std::sync::atomic::AtomicBool>,
 }
 
-pub fn process_art(track_id: u64, bytes: &[u8]) -> Ready {
+/// Extra levels of the blur-bridge mip chain: the bridge samples up to lod 2.
+pub const ART_MIP_LEVELS: usize = 2;
+
+/// What the worker derives from a decoded cover beyond its pixels (never computed on the render thread).
+#[derive(Clone, Debug, PartialEq)]
+pub struct ArtExtra {
+    /// Box-filtered mip levels 1.. (RGBA8, sRGB-encoded, averaged in linear light); empty when not needed.
+    pub mips: Vec<Vec<u8>>,
+    /// The room-light colours of the cover.
+    pub light: Box<ArtLight>,
+}
+
+fn srgb_to_linear_lut() -> &'static [f32; 256] {
+    static LUT: std::sync::OnceLock<[f32; 256]> = std::sync::OnceLock::new();
+    LUT.get_or_init(|| {
+        std::array::from_fn(|i| {
+            let c = i as f32 / 255.0;
+            if c <= 0.04045 {
+                c / 12.92
+            } else {
+                ((c + 0.055) / 1.055).powf(2.4)
+            }
+        })
+    })
+}
+
+fn linear_to_srgb8(l: f32) -> u8 {
+    let l = l.clamp(0.0, 1.0);
+    let c = if l <= 0.003_130_8 {
+        12.92 * l
+    } else {
+        1.055 * l.powf(1.0 / 2.4) - 0.055
+    };
+    (c * 255.0 + 0.5) as u8
+}
+
+/// Mip levels 1..=`levels` of `img` (RGBA8 sRGB) and the room-light colours (8x8 box grid + mean, linear RGB),
+/// from one linearised copy of the image. Memory: one f32 copy of the cover (<= 4 MB at the 512 px limit) that is
+/// dropped before returning. `None` for a malformed image.
+pub fn art_extra(img: &ArtImage, levels: usize) -> Option<ArtExtra> {
+    let (w, h) = (img.width as usize, img.height as usize);
+    if w == 0 || h == 0 || img.rgba.len() != w * h * 4 {
+        return None;
+    }
+    let lut = srgb_to_linear_lut();
+    let mut cur: Vec<f32> = Vec::with_capacity(w * h * 4);
+    for p in img.rgba.chunks_exact(4) {
+        cur.extend_from_slice(&[
+            lut[usize::from(p[0])],
+            lut[usize::from(p[1])],
+            lut[usize::from(p[2])],
+            f32::from(p[3]) / 255.0,
+        ]);
+    }
+    // 8x8 grid: each cell is the box average of its pixel range (at least one pixel for tiny covers)
+    let n = ART_GRID;
+    let mut grid = [[0.0f32; 3]; ART_GRID * ART_GRID];
+    for (i, cell) in grid.iter_mut().enumerate() {
+        let (cx, cy) = (i % n, i / n);
+        let (x0, y0) = (cx * w / n, cy * h / n);
+        let (x1, y1) = (
+            ((cx + 1) * w / n).max(x0 + 1),
+            ((cy + 1) * h / n).max(y0 + 1),
+        );
+        let mut acc = [0.0f32; 3];
+        for y in y0..y1.min(h) {
+            for x in x0..x1.min(w) {
+                let o = (y * w + x) * 4;
+                for c in 0..3 {
+                    acc[c] += cur[o + c];
+                }
+            }
+        }
+        let cnt = ((y1.min(h) - y0) * (x1.min(w) - x0)).max(1) as f32;
+        *cell = acc.map(|v| v / cnt);
+    }
+    let mut mean = [0.0f32; 3];
+    for c in &grid {
+        for k in 0..3 {
+            mean[k] += c[k] / grid.len() as f32;
+        }
+    }
+    let light = ArtLight {
+        mean_y: 0.2126 * mean[0] + 0.7152 * mean[1] + 0.0722 * mean[2],
+        grid,
+        mean,
+    };
+    // mips: each level boxes the previous one in linear light
+    let mut mips = Vec::new();
+    let (mut sw, mut sh) = (w, h);
+    for _ in 0..levels {
+        if sw <= 1 && sh <= 1 {
+            break;
+        }
+        let (nw, nh) = ((sw / 2).max(1), (sh / 2).max(1));
+        let mut next = Vec::with_capacity(nw * nh * 4);
+        let mut bytes = Vec::with_capacity(nw * nh * 4);
+        for y in 0..nh {
+            for x in 0..nw {
+                let mut acc = [0.0f32; 4];
+                for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+                    let o = ((2 * y + dy).min(sh - 1) * sw + (2 * x + dx).min(sw - 1)) * 4;
+                    for c in 0..4 {
+                        acc[c] += 0.25 * cur[o + c];
+                    }
+                }
+                next.extend_from_slice(&acc);
+                bytes.extend_from_slice(&[
+                    linear_to_srgb8(acc[0]),
+                    linear_to_srgb8(acc[1]),
+                    linear_to_srgb8(acc[2]),
+                    (acc[3].clamp(0.0, 1.0) * 255.0 + 0.5) as u8,
+                ]);
+            }
+        }
+        mips.push(bytes);
+        cur = next;
+        (sw, sh) = (nw, nh);
+    }
+    Some(ArtExtra {
+        mips,
+        light: Box::new(light),
+    })
+}
+
+pub fn process_art(track_id: u64, bytes: &[u8], mips: bool) -> Ready {
     let image = mg_media::decode_art(bytes);
     let palette = image.as_ref().and_then(|img| {
         let (px, w, h) = img.thumbnail(64);
         (w > 0 && h > 0).then(|| mg_media::palette::extract(&px, w, h))
     });
+    let extra = image
+        .as_ref()
+        .and_then(|img| art_extra(img, if mips { ART_MIP_LEVELS } else { 0 }));
     Ready::Art {
         track_id,
         image,
         palette,
+        extra,
     }
 }
 
@@ -1663,7 +1931,11 @@ pub fn process_line(
 /// Runs any job synchronously (used by the worker and by the headless self-test).
 pub fn process_job(text: Option<&mg_text::TextRenderer>, job: Job) -> Ready {
     match job {
-        Job::Art { track_id, bytes } => process_art(track_id, &bytes),
+        Job::Art {
+            track_id,
+            bytes,
+            mips,
+        } => process_art(track_id, &bytes, mips),
         Job::Text(t) => match text {
             Some(r) => process_text(r, &t),
             None => Ready::Text {
@@ -1931,6 +2203,7 @@ mod tests {
                         rgba: vec![128; 256],
                     }),
                     palette: Some(Palette::fallback()),
+                    extra: None,
                 },
                 Job::Lyrics {
                     track_id,
@@ -2062,6 +2335,7 @@ mod tests {
             track_id: 1,
             image: Some(img([255, 0, 0, 255])),
             palette: Some(Palette::fallback()),
+            extra: None,
         });
         p.on_ready(Ready::Text {
             track_id: 1,
@@ -2106,9 +2380,10 @@ mod tests {
             track_id: 1,
             image: Some(img([200, 20, 20, 255])),
             palette: Some(Palette::fallback()),
+            extra: None,
         });
         let o = run(&mut p, 1.5);
-        assert!(matches!(p.take_ops().as_slice(), [GpuOp::SetArt(_)]));
+        assert!(matches!(p.take_ops().as_slice(), [GpuOp::SetArt(..)]));
         assert!(o.art.expect("shown").alpha > 0.99);
         // track 2 arrives with its artwork decoded 50 ms later
         p.on_now_playing(Some(&np(2, "B", Some(Arc::from(vec![2u8])))), SURF);
@@ -2118,10 +2393,14 @@ mod tests {
             track_id: 2,
             image: Some(img([20, 20, 200, 255])),
             palette: Some(Palette::fallback()),
+            extra: None,
         });
         let o = p.update(DT, SURF, 0.5, 0.2);
         assert!(
-            matches!(p.take_ops().as_slice(), [GpuOp::ShiftArt, GpuOp::SetArt(_)]),
+            matches!(
+                p.take_ops().as_slice(),
+                [GpuOp::ShiftArt, GpuOp::SetArt(..)]
+            ),
             "old cover becomes the crossfade source, the new one is uploaded at once"
         );
         let held = o.art_prev.expect("previous cover held").alpha;
@@ -2164,6 +2443,7 @@ mod tests {
             track_id: 1,
             image: None,
             palette: None,
+            extra: None,
         });
         let o = run(&mut p, 2.0);
         assert!(o.art.is_none());
@@ -2284,6 +2564,7 @@ mod tests {
                     track_id: 1,
                     image: Some(img([10, 10, 10, 255])), // a 2:1 image
                     palette: None,
+                    extra: None,
                 });
                 for _ in 0..90 {
                     pump(&mut p);
@@ -2318,6 +2599,7 @@ mod tests {
             track_id: 1,
             image: Some(img([10, 200, 10, 255])),
             palette: Some(Palette::fallback()),
+            extra: None,
         });
         let o = run(&mut p, 3.5);
         assert!(o.art.is_none() && o.title.is_none());
@@ -2364,6 +2646,7 @@ mod tests {
             track_id: 1,
             image: Some(img([200, 20, 20, 255])),
             palette: Some(Palette::fallback()),
+            extra: None,
         });
         run(&mut p, 1.5);
         p.take_ops();
@@ -2527,6 +2810,7 @@ mod tests {
                 track_id: id,
                 image: Some(img(c)),
                 palette: None,
+                extra: None,
             });
         };
         cover(&mut p, 1, [1, 0, 0, 255]);
@@ -2550,7 +2834,7 @@ mod tests {
                 GpuOp::ShiftArt => {
                     prev = cur.take();
                 }
-                GpuOp::SetArt(i) => cur = Some(i.rgba[0]),
+                GpuOp::SetArt(i, _) => cur = Some(i.rgba[0]),
                 GpuOp::ClearArt => cur = None,
                 GpuOp::ClearPrevArt => prev = None,
                 _ => {}
@@ -2952,5 +3236,300 @@ mod tests {
         if f.lines == 2 {
             assert!(((f.bitmap.width - 2 * f.bitmap.pad) as f32) < 700.0 * 0.95);
         }
+    }
+
+    // ---- Album Focus part 2: art colours, mips, blur bridge, text pocket ---------------------------------------
+
+    fn solid(w: u32, h: u32, c: [u8; 4]) -> ArtImage {
+        ArtImage {
+            width: w,
+            height: h,
+            rgba: (0..w * h).flat_map(|_| c).collect(),
+        }
+    }
+
+    #[test]
+    fn mip_chain_has_the_right_sizes_averages_in_linear_light_and_bounds_memory() {
+        // odd and non-square sizes follow max(1, w >> level)
+        for (w, h) in [(512u32, 512u32), (500, 300), (7, 5), (3, 2), (1, 1), (2, 9)] {
+            let e = art_extra(&solid(w, h, [10, 200, 90, 255]), ART_MIP_LEVELS).expect("extra");
+            let possible = (w.max(h).ilog2() as usize).min(ART_MIP_LEVELS);
+            assert_eq!(e.mips.len(), possible, "{w}x{h}");
+            for (i, m) in e.mips.iter().enumerate() {
+                let (mw, mh) = ((w >> (i + 1)).max(1), (h >> (i + 1)).max(1));
+                assert_eq!(m.len(), (mw * mh * 4) as usize, "{w}x{h} level {}", i + 1);
+                // a flat cover stays that colour (sRGB round trip within one step)
+                assert!(
+                    m.chunks_exact(4).all(|p| p[0].abs_diff(10) <= 1
+                        && p[1].abs_diff(200) <= 1
+                        && p[2].abs_diff(90) <= 1
+                        && p[3] == 255),
+                    "{w}x{h} level {} drifted",
+                    i + 1
+                );
+            }
+        }
+        // a black/white checker averages to mid grey IN LINEAR LIGHT (0.5 linear = sRGB 188), not to sRGB 128
+        let mut c = solid(4, 4, [0, 0, 0, 255]);
+        for y in 0..4usize {
+            for x in 0..4usize {
+                if (x + y) % 2 == 0 {
+                    c.rgba[(y * 4 + x) * 4..][..3].copy_from_slice(&[255, 255, 255]);
+                }
+            }
+        }
+        let e = art_extra(&c, 1).expect("extra");
+        assert!(e.mips[0].chunks_exact(4).all(|p| p[0].abs_diff(188) <= 1));
+        // zero levels = no mips (reduced motion), the colours are still made
+        assert!(art_extra(&c, 0).expect("extra").mips.is_empty());
+        // malformed input is refused, never a panic
+        assert!(
+            art_extra(
+                &ArtImage {
+                    width: 4,
+                    height: 4,
+                    rgba: vec![0; 10]
+                },
+                2
+            )
+            .is_none()
+        );
+        assert!(art_extra(&solid(0, 0, [0; 4]), 2).is_none());
+        // the extra levels cost a third of the base at most
+        let big = art_extra(&solid(512, 512, [1, 2, 3, 255]), ART_MIP_LEVELS).expect("extra");
+        assert!(big.mips.iter().map(Vec::len).sum::<usize>() <= 512 * 512 * 4 / 3);
+    }
+
+    #[test]
+    fn room_light_colours_follow_the_cover_layout_and_luminance() {
+        // left half red, right half blue, top row brighter: the 8x8 grid is row-major, row 0 = top
+        let (w, h) = (16u32, 16u32);
+        let mut c = solid(w, h, [0, 0, 255, 255]);
+        for y in 0..h as usize {
+            for x in 0..(w / 2) as usize {
+                c.rgba[(y * w as usize + x) * 4..][..3].copy_from_slice(&[255, 0, 0]);
+            }
+        }
+        let l = art_extra(&c, 0).expect("extra").light;
+        let at = |cx: usize, cy: usize| l.grid[cy * ART_GRID + cx];
+        assert!(at(0, 0)[0] > 0.99 && at(0, 0)[2] < 0.01, "top-left is red");
+        assert!(
+            at(7, 7)[2] > 0.99 && at(7, 7)[0] < 0.01,
+            "bottom-right is blue"
+        );
+        assert!(at(0, 7)[0] > 0.99 && at(7, 0)[2] > 0.99);
+        // the mean is linear light: half red + half blue
+        assert!((l.mean[0] - 0.5).abs() < 1e-3 && (l.mean[2] - 0.5).abs() < 1e-3);
+        assert!((l.mean_y - (0.2126 * 0.5 + 0.0722 * 0.5)).abs() < 1e-3);
+        // white and black
+        let white = art_extra(&solid(8, 8, [255; 4]), 0).unwrap().light;
+        let black = art_extra(&solid(8, 8, [0, 0, 0, 255]), 0).unwrap().light;
+        assert!((white.mean_y - 1.0).abs() < 1e-3 && black.mean_y == 0.0);
+        // tiny covers (smaller than the grid) still fill every cell
+        let one = art_extra(&solid(1, 1, [255, 255, 0, 255]), 0)
+            .unwrap()
+            .light;
+        assert!(one.grid.iter().all(|c| c[0] > 0.99 && c[2] < 0.01));
+    }
+
+    #[test]
+    fn process_art_makes_the_extra_on_the_calling_thread_only_when_decodable() {
+        // undecodable bytes: no image, no palette, no extra, and nothing panics
+        let Ready::Art {
+            image,
+            palette,
+            extra,
+            ..
+        } = process_art(5, &[1, 2, 3], true)
+        else {
+            panic!("art result expected")
+        };
+        assert!(image.is_none() && palette.is_none() && extra.is_none());
+        // a real PNG decodes to an image whose extra matches `art_extra` of that image (mips only when asked)
+        let png = mg_media::synth::png_rgba(8, 8, &vec![200u8; 8 * 8 * 4]);
+        for (mips, n) in [(true, ART_MIP_LEVELS), (false, 0)] {
+            let Ready::Art { image, extra, .. } = process_art(5, &png, mips) else {
+                panic!("art result expected")
+            };
+            let (Some(image), Some(extra)) = (image, extra) else {
+                return; // no image decoder in this environment: nothing more to verify
+            };
+            assert_eq!(extra.mips.len(), n);
+            assert_eq!(Some(extra), art_extra(&image, n));
+        }
+    }
+
+    #[test]
+    fn stale_artwork_colours_and_mips_never_reach_the_gpu_ops() {
+        let extra = || art_extra(&solid(8, 8, [255, 0, 0, 255]), 2);
+        let mut p = Presentation::new(Layout::Corner);
+        p.on_now_playing(Some(&np(1, "Old", Some(Arc::from(vec![1u8])))), SURF);
+        p.take_jobs();
+        p.on_now_playing(Some(&np(2, "New", Some(Arc::from(vec![2u8])))), SURF);
+        p.take_jobs();
+        // the slow worker answers for track 1 after track 2 started
+        p.on_ready(Ready::Art {
+            track_id: 1,
+            image: Some(solid(8, 8, [255, 0, 0, 255])),
+            palette: Some(Palette::fallback()),
+            extra: extra(),
+        });
+        run(&mut p, 1.0);
+        assert!(p.take_ops().is_empty(), "stale cover or colours uploaded");
+        // the current track's cover brings its own extra along, in the same op
+        p.on_ready(Ready::Art {
+            track_id: 2,
+            image: Some(solid(8, 8, [0, 255, 0, 255])),
+            palette: Some(Palette::fallback()),
+            extra: art_extra(&solid(8, 8, [0, 255, 0, 255]), 2),
+        });
+        run(&mut p, 0.1);
+        let ops = p.take_ops();
+        let [GpuOp::SetArt(img, Some(e))] = ops.as_slice() else {
+            panic!("expected one SetArt with its extra")
+        };
+        assert_eq!(img.rgba[1], 255);
+        assert!(
+            e.light.mean[1] > 0.99 && e.light.mean[0] < 0.01,
+            "colours belong to the new cover"
+        );
+    }
+
+    #[test]
+    fn the_blur_bridge_is_two_mip_levels_at_the_middle_and_sharp_at_both_ends() {
+        assert_eq!(art_blur_lod(0.0), 0.0);
+        assert!((art_blur_lod(0.5) - 2.0).abs() < 1e-5);
+        assert!(art_blur_lod(1.0).abs() < 1e-5);
+        assert!(art_blur_lod(f32::NAN) == 0.0 && art_blur_lod(7.0).abs() < 1e-5);
+        let mut last = 0.0;
+        for i in 0..=50 {
+            let l = art_blur_lod(i as f32 / 100.0);
+            assert!(l >= last - 1e-6, "monotonic up to the middle");
+            last = l;
+        }
+        // in the presentation: only while a crossfade runs, on both pictures, never in reduced motion
+        let crossfade = |rm: bool| {
+            let mut p = Presentation::new(Layout::Corner);
+            p.set_reduced_motion(rm);
+            p.on_now_playing(Some(&np(1, "A", Some(Arc::from(vec![1u8])))), SURF);
+            p.take_jobs();
+            p.on_ready(Ready::Art {
+                track_id: 1,
+                image: Some(img([200, 20, 20, 255])),
+                palette: None,
+                extra: None,
+            });
+            let steady = run(&mut p, 1.5);
+            assert_eq!(
+                steady.art.expect("cover").lod,
+                0.0,
+                "a steady cover is sharp"
+            );
+            p.on_now_playing(Some(&np(2, "B", Some(Arc::from(vec![2u8])))), SURF);
+            p.take_jobs();
+            run(&mut p, 0.05);
+            p.on_ready(Ready::Art {
+                track_id: 2,
+                image: Some(img([20, 20, 200, 255])),
+                palette: None,
+                extra: None,
+            });
+            p.update(DT, SURF, 0.5, 0.2);
+            let mut peak: f32 = 0.0;
+            let mut both = true;
+            for _ in 0..60 {
+                let o = p.update(DT, SURF, 0.5, 0.2);
+                if let (Some(a), Some(b)) = (o.art, o.art_prev) {
+                    peak = peak.max(a.lod);
+                    both &= a.lod == b.lod;
+                }
+            }
+            let end = run(&mut p, 1.0);
+            assert_eq!(
+                end.art.expect("new cover").lod,
+                0.0,
+                "sharp again at the end"
+            );
+            (peak, both)
+        };
+        let (peak, both) = crossfade(false);
+        assert!(peak > 1.5 && both, "bridge peak {peak}");
+        assert_eq!(crossfade(true).0, 0.0, "reduced motion has no blur");
+    }
+
+    #[test]
+    fn the_text_pocket_serves_each_role_its_contrast_and_follows_the_text() {
+        // cap math: the WCAG ratio of text over a background at the cap is at least the requirement
+        for (yt, ratio) in [(0.857f32, 7.0f32), (0.512, 4.5), (0.238, 3.0), (0.287, 3.0)] {
+            let cap = pocket_cap(yt, ratio);
+            assert!((0.01..=0.06).contains(&cap));
+            assert!(
+                (yt + 0.05) / (cap + 0.05) >= ratio,
+                "{yt} {ratio} cap {cap}"
+            );
+        }
+        // geometry: with a cover, text and lyrics the feed has one rectangle per element, in screen heights
+        let mut p = Presentation::new(Layout::Center);
+        p.set_album_scene(true, SURF);
+        p.set_lyric_source(LyricSource::Demo);
+        p.set_bar(SURF.1 as f32 - 128.0, 0.0);
+        p.on_now_playing(Some(&np(1, "Title", Some(Arc::from(vec![1u8])))), SURF);
+        p.set_position(Some(10.5));
+        for _ in 0..240 {
+            pump(&mut p);
+            p.update(DT, SURF, 0.5, 0.2);
+            p.take_ops();
+        }
+        let o = p.update(DT, SURF, 0.5, 0.2);
+        let mut f = FocusParams::default();
+        p.merge_focus(&mut f);
+        let h = SURF.1 as f32;
+        let a = o.art.expect("cover");
+        assert!((f.rect[0] - a.cx / h).abs() < 1e-5 && (f.rect[3] - a.hh / h).abs() < 1e-5);
+        assert!(f.art_w[0] > 0.99 && f.art_w[0] + f.art_w[1] <= 1.0 + 1e-6);
+        let active = (0..4).filter(|&i| f.ink_on[i] > 0.0).count();
+        let drawn = [o.title, o.artist, o.meta]
+            .iter()
+            .flatten()
+            .filter(|d| d.alpha > 0.002)
+            .count()
+            + usize::from(o.lyrics.iter().flatten().any(|d| d.alpha > 0.002));
+        assert!(
+            drawn >= 2 && active == drawn,
+            "pockets {active} vs drawn elements {drawn}"
+        );
+        for i in 0..4 {
+            if f.ink_on[i] > 0.0 {
+                let r = f.ink[i];
+                assert!(r[2] > r[0] && r[3] > r[1] && r[0] >= 0.0 && r[3] <= 1.0 + 0.05);
+                assert!((0.01..=0.06).contains(&f.ink_cap[i]));
+            }
+        }
+        // the first rectangle is the title's own draw
+        let t = o.title.expect("title");
+        assert!(
+            (f.ink[0][0] - t.x / h).abs() < 1e-5 && (f.ink[0][3] - (t.y + t.h) / h).abs() < 1e-5
+        );
+        // no cover: the light source is the (empty) cover slot, with no cover weight
+        let mut q = Presentation::new(Layout::Center);
+        q.set_album_scene(true, SURF);
+        q.on_now_playing(Some(&np(1, "Title", None)), SURF);
+        pump(&mut q);
+        q.update(DT, SURF, 0.5, 0.2);
+        let mut g = FocusParams::default();
+        q.merge_focus(&mut g);
+        assert_eq!(g.art_w, [0.0, 0.0]);
+        assert!(
+            g.rect[2] > 0.1 && g.rect[3] > 0.1,
+            "the slot, not a point: {:?}",
+            g.rect
+        );
+        // a text that is not shown has no pocket
+        let mut r = Presentation::new(Layout::Center);
+        r.set_album_scene(true, SURF);
+        r.update(DT, SURF, 0.5, 0.2);
+        let mut z = FocusParams::default();
+        r.merge_focus(&mut z);
+        assert_eq!(z.ink_on, [0.0; 4]);
     }
 }

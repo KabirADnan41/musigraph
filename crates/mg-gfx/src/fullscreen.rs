@@ -23,6 +23,14 @@ struct MixTargets {
     size: (u32, u32),
 }
 
+/// A pass recorded before a scene's own pass: it renders into `target` (a texture the scene then samples) with the
+/// shared group 0 and its own `group1`. Created and owned by the scene set, drawn only when that scene is drawn.
+pub struct PrePass {
+    pub pipeline: wgpu::RenderPipeline,
+    pub target: wgpu::TextureView,
+    pub group1: wgpu::BindGroup,
+}
+
 pub struct FullscreenRenderer {
     pipelines: Vec<wgpu::RenderPipeline>,
     mix_pipeline: wgpu::RenderPipeline,
@@ -41,6 +49,8 @@ pub struct FullscreenRenderer {
     format: wgpu::TextureFormat,
     scale: f32,
     target: Option<Target>,
+    /// Scene index -> a small pass drawn before that scene each frame (Focus: its low-resolution room light).
+    prepass: Vec<(usize, PrePass)>,
     /// Time to create the shader modules and pipelines (the driver may compile later, on first use).
     pub compile_ms: f64,
 }
@@ -195,6 +205,7 @@ impl FullscreenRenderer {
         });
         Self {
             uses_group1: vec![false; pipelines.len()],
+            prepass: Vec::new(),
             pipelines,
             mix_pipeline,
             mix_bgl,
@@ -214,29 +225,47 @@ impl FullscreenRenderer {
         }
     }
 
-    /// Appends a scene pipeline whose shader also reads `@group(1)` with layout `group1` (the caller passes the
-    /// matching bind group to every draw). Returns its scene index. Created up front like the others.
+    /// Appends a scene pipeline; with `group1` its shader also reads `@group(1)` with that layout (the caller
+    /// passes the matching bind group, keyed by this scene index, to every draw). Returns its scene index.
+    /// Created up front like the others.
     pub fn add_pipeline(
         &mut self,
         device: &wgpu::Device,
         label: &str,
         wgsl: &str,
-        group1: &wgpu::BindGroupLayout,
+        group1: Option<&wgpu::BindGroupLayout>,
     ) -> usize {
+        let t0 = Instant::now();
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some(label),
             source: wgpu::ShaderSource::Wgsl(wgsl.into()),
         });
+        let layouts = match group1 {
+            Some(g) => vec![Some(&self.bgl), Some(g)],
+            None => vec![Some(&self.bgl)],
+        };
         self.pipelines.push(make_pipeline(
             device,
             &shader,
-            &[Some(&self.bgl), Some(group1)],
+            &layouts,
             label,
             self.format,
             "fs",
         ));
-        self.uses_group1.push(true);
+        self.uses_group1.push(group1.is_some());
+        self.compile_ms += t0.elapsed().as_secs_f64() * 1000.0;
         self.pipelines.len() - 1
+    }
+
+    /// Layout of the shared group 0 (for pipelines built outside, see `set_prepass`).
+    pub(crate) fn shared_layout(&self) -> &wgpu::BindGroupLayout {
+        &self.bgl
+    }
+
+    /// Registers the pass drawn before scene `scene` (replacing an earlier one).
+    pub fn set_prepass(&mut self, scene: usize, p: PrePass) {
+        self.prepass.retain(|(i, _)| *i != scene);
+        self.prepass.push((scene, p));
     }
 
     /// Internal render resolution for the given surface size.
@@ -314,21 +343,21 @@ impl FullscreenRenderer {
         uniform: &[u8],
         post: F,
     ) -> Result<FrameStatus, String> {
-        self.render_scenes(gpu, uniform, 0, None, None, post)
+        self.render_scenes(gpu, uniform, 0, None, &[], post)
     }
 
     /// Draws scene `scene`, or - with `xfade = Some((to, t))` - a crossfade from `scene` to `to` at blend `t`
     /// (0..1, eased by the caller). During a crossfade both scenes render into their own targets and a mix pass
     /// blends them; outside a crossfade exactly one scene is drawn (no extra cost). Pipelines already exist, so
-    /// switching never compiles. `post` records overlays on the surface in the same submission. `group1` is bound
-    /// for pipelines added with `add_pipeline` (such a scene stays black if it is `None`).
+    /// switching never compiles. `post` records overlays on the surface in the same submission. `group1` holds the
+    /// `@group(1)` bind group per scene index for pipelines added with one (such a scene stays black without it).
     pub fn render_scenes<F: FnOnce(&mut wgpu::CommandEncoder, &wgpu::TextureView)>(
         &mut self,
         gpu: &mut Gpu,
         uniform: &[u8],
         scene: usize,
         xfade: Option<(usize, f32)>,
-        group1: Option<&wgpu::BindGroup>,
+        group1: &[(usize, &wgpu::BindGroup)],
         post: F,
     ) -> Result<FrameStatus, String> {
         if uniform.len() != self.uniform_len {
@@ -381,12 +410,19 @@ impl FullscreenRenderer {
         enc: &mut wgpu::CommandEncoder,
         view: &wgpu::TextureView,
         scene: usize,
-        group1: Option<&wgpu::BindGroup>,
+        group1: &[(usize, &wgpu::BindGroup)],
     ) {
+        if let Some((_, pp)) = self.prepass.iter().find(|(i, _)| *i == scene) {
+            let mut pre = begin_color_pass(enc, "scene prepass", &pp.target);
+            pre.set_pipeline(&pp.pipeline);
+            pre.set_bind_group(0, &self.bind_group, &[]);
+            pre.set_bind_group(1, &pp.group1, &[]);
+            pre.draw(0..3, 0..1);
+        }
         let mut pass = begin_color_pass(enc, "scene", view);
         if self.uses_group1[scene] {
-            match group1 {
-                Some(g) => pass.set_bind_group(1, g, &[]),
+            match group1.iter().find(|(i, _)| *i == scene) {
+                Some((_, g)) => pass.set_bind_group(1, *g, &[]),
                 None => return, // cleared to black: never draw with a missing binding
             }
         }
@@ -403,7 +439,7 @@ impl FullscreenRenderer {
         from: usize,
         to: usize,
         m: &MixTargets,
-        group1: Option<&wgpu::BindGroup>,
+        group1: &[(usize, &wgpu::BindGroup)],
     ) {
         self.draw_scene(enc, &m.views[0], from, group1);
         self.draw_scene(enc, &m.views[1], to, group1);
@@ -480,7 +516,7 @@ impl FullscreenRenderer {
         (w, h): (u32, u32),
         uniform: &[u8],
         scene: usize,
-        group1: Option<&wgpu::BindGroup>,
+        group1: &[(usize, &wgpu::BindGroup)],
         frames: u32,
     ) -> Result<f64, String> {
         queue.write_buffer(&self.uniform, 0, uniform);
@@ -545,7 +581,7 @@ impl FullscreenRenderer {
         uniform: &[u8],
         post: &dyn Fn(&mut wgpu::CommandEncoder, &wgpu::TextureView),
     ) -> Result<Vec<u8>, String> {
-        self.render_offscreen_scenes(device, queue, w, h, uniform, 0, None, None, post)
+        self.render_offscreen_scenes(device, queue, w, h, uniform, 0, None, &[], post)
     }
 
     /// Offscreen render of scene `scene` or a crossfade (`xfade = Some((to, t))`), then `post`, then readback.
@@ -559,7 +595,7 @@ impl FullscreenRenderer {
         uniform: &[u8],
         scene: usize,
         xfade: Option<(usize, f32)>,
-        group1: Option<&wgpu::BindGroup>,
+        group1: &[(usize, &wgpu::BindGroup)],
         post: &dyn Fn(&mut wgpu::CommandEncoder, &wgpu::TextureView),
     ) -> Result<Vec<u8>, String> {
         if uniform.len() != self.uniform_len {

@@ -560,7 +560,14 @@ mod tests {
         let x = fixture(name, SR).unwrap();
         let mut h = 0xcbf2_9ce4_8422_2325u64;
         for t in run(&x[..sec(3.0).min(x.len())], 60.0) {
-            for b in t.params.pack((1280, 720)) {
+            for (i, b) in t.params.pack((1280, 720)).into_iter().enumerate() {
+                // Album Focus moved to its own uniform block (FocusParams): ex2 and ex3.x / .z / .w of the shared block
+                // are retired and no scene reads them. Every byte that is still live is hashed.
+                let b = if (1312..1332).contains(&i) || (1336..1344).contains(&i) {
+                    0
+                } else {
+                    b
+                };
                 h = (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3);
             }
         }
@@ -569,9 +576,11 @@ mod tests {
 
     #[test]
     fn packed_uniform_bytes_match_golden_hashes() {
-        // Captured from the code BEFORE the music plumbing existed (3 s of each fixture at 60 fps, 1280x720).
-        assert_eq!(pack_hash("kick"), 0x1484_032f_5f2a_d455);
-        assert_eq!(pack_hash("demo"), 0x0af2_f12a_f19e_5e0b);
+        // Captured from the code BEFORE the music plumbing existed (3 s of each fixture at 60 fps, 1280x720), with the
+        // retired Focus bytes masked: the same masked hash was recomputed on the unchanged parent commit (a8cb2c0), so
+        // every byte that is still read by a scene is identical to what it was.
+        assert_eq!(pack_hash("kick"), 0x62ad_de97_0db8_b8d4);
+        assert_eq!(pack_hash("demo"), 0x5fd9_bb52_3c3a_dc1e);
     }
 
     /// Mean of a per-tick music value over the last second of a 6 s run.

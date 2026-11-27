@@ -25,6 +25,57 @@ fn headless() -> Result<Headless, String> {
     }
 }
 
+/// The headless target is a linear `Rgba8Unorm` image while the live surface is sRGB (the hardware encodes on write):
+/// preview PNGs of the Album Focus scene are encoded the same way so they look as they do on screen.
+fn srgb_view(img: &[u8]) -> Vec<u8> {
+    let enc = |v: u8| {
+        let l = f32::from(v) / 255.0;
+        let c = if l <= 0.003_130_8 {
+            12.92 * l
+        } else {
+            1.055 * l.powf(1.0 / 2.4) - 0.055
+        };
+        (c * 255.0 + 0.5) as u8
+    };
+    img.chunks_exact(4)
+        .flat_map(|p| [enc(p[0]), enc(p[1]), enc(p[2]), p[3]])
+        .collect()
+}
+
+/// Applies one presentation GPU op the way the live loop does: the overlay gets the cover (with its mips) and the
+/// scene gets its room-light colours.
+fn apply_gpu_op(
+    op: crate::presentation::GpuOp,
+    ov: &mut mg_gfx::overlay::Overlay,
+    scene: &mut SceneSet,
+    h: &Headless,
+) {
+    use crate::presentation::GpuOp;
+    match op {
+        GpuOp::SetArt(a, extra) => {
+            let mips = extra.as_ref().map_or(&[][..], |e| e.mips.as_slice());
+            ov.set_art_mips(&h.device, &h.queue, (a.width, a.height), &a.rgba, mips);
+            scene.set_focus_art(&h.queue, extra.map(|e| *e.light));
+        }
+        GpuOp::ShiftArt => {
+            ov.shift_art(&h.device);
+            scene.shift_focus_art(&h.queue);
+        }
+        GpuOp::ClearArt => {
+            ov.clear_art(&h.device);
+            scene.set_focus_art(&h.queue, None);
+        }
+        GpuOp::ClearPrevArt => {
+            ov.clear_prev_art(&h.device);
+            scene.clear_prev_focus_art(&h.queue);
+        }
+        GpuOp::SetText(k, b) => {
+            ov.set_text(&h.device, &h.queue, k, (b.width, b.height), &b.coverage);
+        }
+        GpuOp::ClearText(k) => ov.clear_text(&h.device, k),
+    }
+}
+
 fn mean(v: &[f32]) -> f32 {
     v.iter().sum::<f32>() / v.len().max(1) as f32
 }
@@ -115,7 +166,7 @@ fn max_delta_100ms(lum: &[f32]) -> f32 {
 /// was available.
 fn presentation_previews(failures: &mut Vec<String>) -> bool {
     use crate::media_feed::demo_tracks;
-    use crate::presentation::{GpuOp, Layout, Presentation, apply_album};
+    use crate::presentation::{Layout, Presentation, apply_album};
     use mg_gfx::overlay::Overlay;
     let Ok(h) = headless() else { return false };
     let Some(text) = mg_text::TextRenderer::new() else {
@@ -126,7 +177,7 @@ fn presentation_previews(failures: &mut Vec<String>) -> bool {
     let x = fixture("demo", SR).expect("demo fixture");
     let ticks = Sim::new(SR, FPS, MapTuning::default()).run(&x[..x.len().min(SR as usize * 12)]);
     let base_params = ticks.last().expect("ticks").params.clone();
-    let scene = SceneSet::new_headless(&h.device);
+    let mut scene = SceneSet::new_headless(&h.device);
     let dump = std::env::var("MG_SCENE_DUMP").ok();
     let mut themes: Vec<(String, [f32; 3])> = Vec::new();
     for (kind, layout) in SceneKind::ALL
@@ -138,6 +189,8 @@ fn presentation_previews(failures: &mut Vec<String>) -> bool {
                 continue; // the other scenes are previewed on three albums to keep the self-test quick
             }
             let mut ov = Overlay::new_headless(&h.device, &h.queue);
+            scene.set_focus_art(&h.queue, None);
+            scene.clear_prev_focus_art(&h.queue);
             let mut pres = Presentation::new(layout);
             pres.set_lyric_source(crate::lyric_view::LyricSource::Demo);
             pres.set_album_scene(kind == SceneKind::Focus, res);
@@ -170,29 +223,14 @@ fn presentation_previews(failures: &mut Vec<String>) -> bool {
                 }
                 last = Some(pres.update(1.0 / 60.0, res, base_params.energy, base_params.swell));
                 for op in pres.take_ops() {
-                    match op {
-                        GpuOp::SetArt(a) => {
-                            ov.set_art(&h.device, &h.queue, (a.width, a.height), &a.rgba);
-                        }
-                        GpuOp::ShiftArt => ov.shift_art(&h.device),
-                        GpuOp::ClearPrevArt => ov.clear_prev_art(&h.device),
-                        GpuOp::ClearArt => ov.clear_art(&h.device),
-                        GpuOp::SetText(k, b) => {
-                            ov.set_text(&h.device, &h.queue, k, (b.width, b.height), &b.coverage);
-                        }
-                        GpuOp::ClearText(k) => ov.clear_text(&h.device, k),
-                    }
+                    apply_gpu_op(op, &mut ov, &mut scene, &h);
                 }
             }
             let op = last.expect("frames");
             let mut p = base_params.clone();
             let (album, w) = pres.album();
             apply_album(&mut p.palette, &album, w, 0.85 + 0.30 * p.energy);
-            if let Some(a) = op.art {
-                let (w, hh) = (res.0 as f32, res.1 as f32);
-                p.focus = [a.cx / w, a.cy / hh, a.hw / hh, a.hh / hh];
-                p.focus_active = a.alpha;
-            }
+            pres.merge_focus(&mut p.album);
             let bare =
                 scene.render_offscreen_scenes(&h.device, &h.queue, res, &p, kind, None, &|_, _| {});
             let img = scene.render_offscreen_scenes(
@@ -289,7 +327,7 @@ fn presentation_previews(failures: &mut Vec<String>) -> bool {
 fn album_previews(failures: &mut Vec<String>) -> bool {
     use crate::lyric_view::LyricSource;
     use crate::media_feed::demo_tracks;
-    use crate::presentation::{GpuOp, Job, Layout, Presentation, apply_album, process_job};
+    use crate::presentation::{Job, Layout, Presentation, apply_album, process_job};
     use mg_gfx::overlay::Overlay;
     let Ok(h) = headless() else { return false };
     let Some(text) = mg_text::TextRenderer::new() else {
@@ -307,7 +345,7 @@ fn album_previews(failures: &mut Vec<String>) -> bool {
     let x = fixture("demo", SR).expect("demo fixture");
     let ticks = Sim::new(SR, FPS, MapTuning::default()).run(&x[..x.len().min(SR as usize * 12)]);
     let base_params = ticks.last().expect("ticks").params.clone();
-    let scene = SceneSet::new_headless(&h.device);
+    let mut scene = SceneSet::new_headless(&h.device);
     let dump = std::env::var("MG_SCENE_DUMP").ok();
     let lyric_from: Option<f64> = std::env::var("MG_LYRIC_FROM")
         .ok()
@@ -321,6 +359,8 @@ fn album_previews(failures: &mut Vec<String>) -> bool {
                 n.art = None;
             }
             let mut ov = Overlay::new_headless(&h.device, &h.queue);
+            scene.set_focus_art(&h.queue, None);
+            scene.clear_prev_focus_art(&h.queue);
             let mut pres = Presentation::new(Layout::Center);
             pres.set_album_scene(true, res);
             pres.set_bar(
@@ -347,29 +387,14 @@ fn album_previews(failures: &mut Vec<String>) -> bool {
                 }
                 last = Some(pres.update(1.0 / 60.0, res, base_params.energy, base_params.swell));
                 for op in pres.take_ops() {
-                    match op {
-                        GpuOp::ShiftArt => ov.shift_art(&h.device),
-                        GpuOp::SetArt(a) => {
-                            ov.set_art(&h.device, &h.queue, (a.width, a.height), &a.rgba);
-                        }
-                        GpuOp::ClearArt => ov.clear_art(&h.device),
-                        GpuOp::ClearPrevArt => ov.clear_prev_art(&h.device),
-                        GpuOp::SetText(k, b) => {
-                            ov.set_text(&h.device, &h.queue, k, (b.width, b.height), &b.coverage);
-                        }
-                        GpuOp::ClearText(k) => ov.clear_text(&h.device, k),
-                    }
+                    apply_gpu_op(op, &mut ov, &mut scene, &h);
                 }
             }
             let op = last.expect("frames");
             let mut p = base_params.clone();
             let (album, w) = pres.album();
             apply_album(&mut p.palette, &album, w, 0.85 + 0.30 * p.energy);
-            if let Some(a) = op.art {
-                let (w, hh) = (res.0 as f32, res.1 as f32);
-                p.focus = [a.cx / w, a.cy / hh, a.hw / hh, a.hh / hh];
-                p.focus_active = a.alpha;
-            }
+            pres.merge_focus(&mut p.album);
             let tag = format!(
                 "album-{}x{}-{}-{}",
                 res.0,
@@ -409,7 +434,7 @@ fn album_previews(failures: &mut Vec<String>) -> bool {
                 op.lyric_clip.map(|c| (c[0] as i32, c[1] as i32))
             );
             if let Some(dir) = &dump {
-                let png = mg_media::synth::png_rgba(res.0, res.1, &img);
+                let png = mg_media::synth::png_rgba(res.0, res.1, &srgb_view(&img));
                 let _ = std::fs::write(format!("{dir}/{tag}.png"), png);
             }
         }
@@ -761,6 +786,8 @@ fn fluid_checks(failures: &mut Vec<String>) -> bool {
                 ));
             }
         }
+    } else {
+        failures.push("fluid: fixture list changed, the distinctness block did not run".into());
     }
     if std::env::var("MG_FLUID_PERF").is_ok_and(|v| v == "1") {
         let x = fixture("demo", SR).expect("demo");
@@ -780,6 +807,331 @@ fn fluid_checks(failures: &mut Vec<String>) -> bool {
                 ),
                 Err(e) => failures.push(format!("fluid perf T{tier}: {e}")),
             }
+        }
+    }
+    true
+}
+
+/// 95th percentile of the relative luminance (0..1) of a pixel rectangle of a headless (linear `Rgba8Unorm`) image.
+fn region_y95(img: &[u8], w: u32, r: [f32; 4]) -> f32 {
+    let (x0, x1) = (r[0].max(0.0) as u32, (r[2].max(0.0) as u32).min(w));
+    let (y0, y1) = (r[1].max(0.0) as u32, r[3].max(0.0) as u32);
+    let mut v = Vec::new();
+    for y in y0..y1 {
+        for x in x0..x1 {
+            let i = ((y * w + x) * 4) as usize;
+            let c = |k: usize| f32::from(img[i + k]) / 255.0;
+            v.push(0.2126 * c(0) + 0.7152 * c(1) + 0.0722 * c(2));
+        }
+    }
+    v.sort_by(f32::total_cmp);
+    v.get((v.len() * 95 / 100).min(v.len().saturating_sub(1)))
+        .copied()
+        .unwrap_or(0.0)
+}
+
+/// Album Focus environment (docs\design\ALBUM-FOCUS-SPEC-2026-11-27.md):
+/// 1. flash safety and "never black" on every fixture (cover, no text), real analyzer -> mapper -> shader;
+/// 2. contrast readback: the environment under every text element for covers white / black / saturated yellow /
+///    noise (+ no cover), at the loudest spill the demo fixture reaches, 16:9 and portrait, against the real text
+///    colours: title and current lyric >= 7:1, artist >= 4.5:1, context and meta >= 3:1;
+/// 3. the no-cover environment is a soft light, never a dark slot;
+/// 4. worker-side cost of the mips + colours at the largest cover (CPU wall time, labelled as such);
+///
+/// `MG_FOCUS_PERF=1` also prints the headless submit-to-completion GPU time of the Focus pass at 1080p.
+fn focus_checks(failures: &mut Vec<String>) -> bool {
+    use crate::lyric_view::LyricSource;
+    use crate::media_feed::demo_tracks;
+    use crate::presentation::{
+        ART_MIP_LEVELS, Layout, Presentation, apply_album, art_extra, process_job,
+    };
+    use mg_gfx::overlay::Overlay;
+    let Ok(h) = headless() else { return false };
+    let Some(text) = mg_text::TextRenderer::new() else {
+        failures.push("focus: DirectWrite unavailable".into());
+        return true;
+    };
+    let mut scene = SceneSet::new_headless(&h.device);
+    let dump = std::env::var("MG_SCENE_DUMP").ok();
+
+    // ---- 1. every fixture: flash safety and never black ------------------------------------------------------------
+    let cover = mg_media::ArtImage {
+        width: 64,
+        height: 64,
+        rgba: (0..64 * 64)
+            .flat_map(|i| {
+                let (x, y) = ((i % 64) as f32 / 63.0, (i / 64) as f32 / 63.0);
+                [
+                    (60.0 + 190.0 * y) as u8,
+                    (90.0 + 80.0 * x) as u8,
+                    (200.0 - 150.0 * y) as u8,
+                    255,
+                ]
+            })
+            .collect(),
+    };
+    scene.set_focus_art(&h.queue, art_extra(&cover, 0).map(|e| *e.light));
+    let aspect = RES.0 as f32 / RES.1 as f32;
+    let mut rest_frames = Vec::new();
+    for name in FIXTURES {
+        let Some(x) = fixture(name, SR) else { continue };
+        let ticks = Sim::new(SR, FPS, MapTuning::default()).run(&x[..x.len().min(SR as usize * 8)]);
+        let mut lum = Vec::with_capacity(ticks.len());
+        let mut last = Vec::new();
+        for t in &ticks {
+            let mut p = t.params.clone();
+            p.album.rect = [0.31 * aspect, 0.46, 0.28, 0.28];
+            p.album.art_w = [1.0, 0.0];
+            let Ok(img) = scene.render_offscreen_scenes(
+                &h.device,
+                &h.queue,
+                RES,
+                &p,
+                SceneKind::Focus,
+                None,
+                &|_, _| {},
+            ) else {
+                failures.push(format!("focus/{name}: render failed"));
+                return true;
+            };
+            lum.push(region_lum(&img, 0, RES.0, 0, RES.1));
+            last = img;
+        }
+        let (d, m) = (max_delta_100ms(&lum), mean(&lum));
+        let lo = lum.iter().copied().fold(f32::INFINITY, f32::min);
+        println!("FOCUS {name:8} max_lum_delta_100ms={d:.4} mean_lum={m:.3} min_lum={lo:.3}");
+        if !(d.is_finite() && d < 0.05) {
+            failures.push(format!(
+                "focus/{name}: luminance changed by {d:.3} within 100 ms"
+            ));
+        }
+        if lo < 0.02 {
+            failures.push(format!("focus/{name}: environment went black ({lo:.3})"));
+        }
+        if matches!(name, "silence" | "kick" | "pad") {
+            rest_frames.push((name, last));
+        }
+    }
+    let mad = |a: &[u8], b: &[u8]| {
+        a.iter()
+            .zip(b)
+            .map(|(x, y)| u64::from(x.abs_diff(*y)))
+            .sum::<u64>() as f64
+            / a.len() as f64
+    };
+    // looked up by name: a changed fixture list must fail loudly, never skip the check
+    let by = |n: &str| rest_frames.iter().find(|(k, _)| *k == n).map(|(_, f)| f);
+    if let (Some(s), Some(k), Some(p)) = (by("silence"), by("kick"), by("pad")) {
+        for (what, d) in [
+            ("silence vs kick", mad(s, k)),
+            ("kick vs pad", mad(k, p)),
+            ("silence vs pad", mad(s, p)),
+        ] {
+            println!("FOCUS {what}: mad={d:.3}");
+            if d < 0.3 {
+                failures.push(format!("focus: {what} frames too similar (mad {d:.3})"));
+            }
+        }
+    } else {
+        failures.push("focus: silence/kick/pad fixtures missing from the list".into());
+    }
+
+    // ---- 2./3. contrast readback and no slot --------------------------------------------------------------------
+    let x = fixture("demo", SR).expect("demo");
+    let ticks = Sim::new(SR, FPS, MapTuning::default()).run(&x[..x.len().min(SR as usize * 12)]);
+    let loud = ticks
+        .iter()
+        .max_by(|a, b| a.params.album.spill.total_cmp(&b.params.album.spill))
+        .expect("ticks")
+        .params
+        .clone();
+    println!("FOCUS loudest demo spill I={:.3}", loud.album.spill);
+    let png = |rgba: Vec<u8>| mg_media::synth::png_rgba(64, 64, &rgba);
+    let flat = |c: [u8; 4]| png(c.iter().copied().cycle().take(64 * 64 * 4).collect());
+    let mut seed = 0x9E37_79B9u32;
+    let noise = png((0..64 * 64)
+        .flat_map(|_| {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            [seed as u8, (seed >> 8) as u8, (seed >> 16) as u8, 255]
+        })
+        .collect());
+    let covers: [(&str, Option<Vec<u8>>); 5] = [
+        ("white", Some(flat([255, 255, 255, 255]))),
+        ("black", Some(flat([0, 0, 0, 255]))),
+        ("yellow", Some(flat([255, 221, 0, 255]))),
+        ("noise", Some(noise)),
+        ("none", None),
+    ];
+    let tracks = demo_tracks();
+    for res in [(960u32, 540u32), (540, 960)] {
+        for (cname, art) in &covers {
+            let mut n = tracks[0].clone();
+            n.art = art.as_ref().map(|b| b.clone().into());
+            let mut ov = Overlay::new_headless(&h.device, &h.queue);
+            scene.set_focus_art(&h.queue, None);
+            scene.clear_prev_focus_art(&h.queue);
+            let mut pres = Presentation::new(Layout::Center);
+            pres.set_album_scene(true, res);
+            pres.set_bar(
+                res.1 as f32 - 128.0 * crate::controls::ui_scale(res, 1.0),
+                0.0,
+            );
+            pres.set_lyric_source(LyricSource::Demo);
+            pres.on_now_playing(Some(&n), res);
+            let mut last = None;
+            for _ in 0..300 {
+                pres.set_position(Some(10.5));
+                for job in pres.take_jobs() {
+                    let r = process_job(Some(&text), job);
+                    pres.on_ready(r);
+                }
+                last = Some(pres.update(1.0 / 60.0, res, loud.energy, loud.swell));
+                for op in pres.take_ops() {
+                    apply_gpu_op(op, &mut ov, &mut scene, &h);
+                }
+            }
+            let op = last.expect("frames");
+            let mut p = loud.clone();
+            let (album, w) = pres.album();
+            apply_album(&mut p.palette, &album, w, 0.85 + 0.30 * p.energy);
+            pres.merge_focus(&mut p.album);
+            let Ok(env) = scene.render_offscreen_scenes(
+                &h.device,
+                &h.queue,
+                res,
+                &p,
+                SceneKind::Focus,
+                None,
+                &|_, _| {},
+            ) else {
+                failures.push(format!("focus {cname} {}x{}: render failed", res.0, res.1));
+                continue;
+            };
+            let c = op.colors;
+            let ly = |rgb: [f32; 3]| 0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2];
+            let rect = |d: &mg_gfx::overlay::TextDraw| [d.x, d.y, d.x + d.w, d.y + d.h];
+            let mut rows: Vec<(&str, [f32; 4], f32, f32)> = Vec::new();
+            for (n, d, rgb, need) in [
+                ("title", op.title, c.title, 7.0),
+                ("artist", op.artist, c.artist, 4.5),
+                ("meta", op.meta, c.meta, 3.0),
+            ] {
+                if let Some(d) = d {
+                    rows.push((n, rect(&d), ly(rgb), need));
+                }
+            }
+            for (i, d) in op.lyrics.iter().enumerate() {
+                if let Some(d) = d.filter(|d| d.alpha > 0.5) {
+                    let mut r = rect(&d);
+                    if let Some(clip) = op.lyric_clip {
+                        r[1] = r[1].max(clip[0]);
+                        r[3] = r[3].min(clip[1]);
+                    }
+                    if r[3] > r[1] {
+                        let cur = op.lyric_emph[i] > 0.5;
+                        rows.push((
+                            if cur { "lyric" } else { "context" },
+                            r,
+                            ly(if cur { c.lyric } else { c.context }),
+                            if cur { 7.0 } else { 3.0 },
+                        ));
+                    }
+                }
+            }
+            let mut worst = f32::INFINITY;
+            for (what, r, yt, need) in &rows {
+                let y95 = region_y95(&env, res.0, *r);
+                let ratio = (yt + 0.05) / (y95 + 0.05);
+                worst = worst.min(ratio / need);
+                if ratio < *need {
+                    failures.push(format!(
+                        "focus {cname} {}x{}: {what} contrast {ratio:.2}:1 < {need}:1 (env Y95 {y95:.3}, text Y {yt:.3})",
+                        res.0, res.1
+                    ));
+                }
+            }
+            println!(
+                "FOCUS contrast {cname:6} {}x{}: {} text rects, worst ratio/required = {worst:.2}",
+                res.0,
+                res.1,
+                rows.len()
+            );
+            if art.is_none() && res.0 == 960 {
+                // no slot: the soft light behind the text-led composition is not darker than its surroundings
+                let r = p.album.rect;
+                let hpx = res.1 as f32;
+                let inner = [
+                    (r[0] - 0.1) * hpx,
+                    (r[1] - 0.1) * hpx,
+                    (r[0] + 0.1) * hpx,
+                    (r[1] + 0.1) * hpx,
+                ];
+                let ring = [
+                    (r[0] - 0.45) * hpx,
+                    (r[1] - 0.45) * hpx,
+                    (r[0] - 0.3) * hpx,
+                    (r[1] + 0.45) * hpx,
+                ];
+                let (i, o) = (
+                    region_y95(&env, res.0, inner),
+                    region_y95(&env, res.0, ring),
+                );
+                println!("FOCUS no-cover: centre Y95={i:.3} outer Y95={o:.3}");
+                if i < 0.9 * o {
+                    failures.push(format!("focus no-cover: a dark slot ({i:.3} vs {o:.3})"));
+                }
+            }
+            if let (Some(dir), true) = (&dump, res.0 == 960) {
+                let _ = std::fs::write(
+                    format!("{dir}/focus-env-{cname}.png"),
+                    mg_media::synth::png_rgba(res.0, res.1, &srgb_view(&env)),
+                );
+            }
+        }
+    }
+
+    // ---- 4. worker-side cost at the largest cover (CPU wall time, not GPU time) -----------------------------------
+    let side = mg_media::MAX_ART_SIDE;
+    let big = mg_media::ArtImage {
+        width: side,
+        height: side,
+        rgba: (0..side * side)
+            .flat_map(|i| [(i % side) as u8, (i / side) as u8, (i % 251) as u8, 255])
+            .collect(),
+    };
+    let t0 = std::time::Instant::now();
+    let e = art_extra(&big, ART_MIP_LEVELS).expect("extra");
+    let ms = t0.elapsed().as_secs_f64() * 1000.0;
+    let bytes: usize = e.mips.iter().map(Vec::len).sum();
+    println!(
+        "FOCUS art worker: {side}x{side} mips({ART_MIP_LEVELS})+colours {ms:.2} ms CPU (worker thread), extra upload {bytes} B on top of {} B",
+        big.rgba.len()
+    );
+    if e.mips.len() != ART_MIP_LEVELS || bytes > big.rgba.len() / 3 {
+        failures.push("focus: mip chain has the wrong shape".into());
+    }
+    if ms > 100.0 {
+        failures.push(format!(
+            "focus: art processing took {ms:.0} ms on the worker"
+        ));
+    }
+
+    if std::env::var("MG_FOCUS_PERF").is_ok_and(|v| v == "1") {
+        let mut p = loud;
+        p.album.rect = [0.55, 0.46, 0.28, 0.28];
+        p.album.art_w = [1.0, 0.0];
+        p.album.ink[0] = [0.9, 0.3, 1.4, 0.5];
+        p.album.ink_cap[0] = 0.05;
+        p.album.ink_on[0] = 1.0;
+        scene.set_focus_art(&h.queue, art_extra(&cover, 0).map(|e| *e.light));
+        match scene.focus_gpu_ms(&h.device, &h.queue, (1920, 1080), &p, 120) {
+            Ok(ms) => println!(
+                "FOCUS PERF 1080p: draw_ms={ms:.3} (headless, submit-to-completion GPU time of the Focus scene pass only, {})",
+                h.info.name
+            ),
+            Err(e) => failures.push(format!("focus perf: {e}")),
         }
     }
     true
@@ -910,6 +1262,7 @@ pub fn run(allow_no_gpu: bool) -> i32 {
     gpu_seen |= controls_previews(&mut failures);
     gpu_seen |= orb_checks(&mut failures);
     gpu_seen |= fluid_checks(&mut failures);
+    gpu_seen |= focus_checks(&mut failures);
     if !gpu_seen {
         println!(
             "NOTE: no hardware GPU device available; rendered-pixel checks were NOT run (parameter checks ran)."

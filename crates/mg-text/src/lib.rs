@@ -48,6 +48,17 @@ pub struct LineStyle {
     /// Line advance as a multiple of `px` for wrapped text (0 = 1.2).
     pub line_height: f32,
     pub cut: Cut,
+    /// Alignment of the lines of a wrapped block inside the bitmap (the widest line sets its width).
+    pub align: Align,
+}
+
+/// Paragraph alignment in the reading direction: `Start` is left for left-to-right text, right for right-to-left.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Align {
+    #[default]
+    Start,
+    Center,
+    End,
 }
 
 impl Default for LineStyle {
@@ -60,6 +71,7 @@ impl Default for LineStyle {
             tracking_em: 0.0,
             line_height: 0.0,
             cut: Cut::Text,
+            align: Align::Start,
         }
     }
 }

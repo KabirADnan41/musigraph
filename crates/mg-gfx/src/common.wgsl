@@ -23,8 +23,8 @@ struct U {
     bright: array<vec4<f32>, 24>,
     ex0: vec4<f32>,  // aurora: ribbon phases (cycles)
     ex1: vec4<f32>,  // aurora: band levels, bass to treble
-    ex2: vec4<f32>,  // focus: artwork centre (uv x, uv y), half size (screen heights)
-    ex3: vec4<f32>,  // focus: rotation phase, onset-front origin x, artwork present (0/1), unused
+    ex2: vec4<f32>,  // unused (Album Focus reads its own block at @group(1), see focus.wgsl)
+    ex3: vec4<f32>,  // aurora: onset-front origin x in .y; the rest is unused
     ex4: vec4<f32>,  // orb: flow phase, rotation phase (cycles), ripple 0 and 1 impact azimuths
     ex5: vec4<f32>,  // orb: bass, mid, treble, breath
 };
