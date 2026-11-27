@@ -5,6 +5,7 @@
 //! breathing) is time-based and uncorrelated with audio. Quality (render scale) only changes cost.
 
 use crate::context::{FrameStatus, Gpu};
+use crate::fluid::FluidSim;
 use crate::fullscreen::FullscreenRenderer;
 
 /// Mirrored bar slots across the screen (bass in the centre, treble at the edges).
@@ -53,6 +54,9 @@ pub struct SceneParams {
     pub orb_flow: [f32; 4],
     /// Orb: smoothed bass, mid, treble (0..1) and the slow glow breath (0..1).
     pub orb_band: [f32; 4],
+    /// Fluid: emitters, flow and memory for the dye simulation. Its own uniform block (`fluid::FluidParams::pack`),
+    /// never part of `pack()`, so it cannot collide with the ex0..ex5 fields of the other scenes.
+    pub fluid: crate::fluid::FluidParams,
     pub mode: SceneMode,
     pub bars: [f32; SLOTS],
     pub peaks: [f32; SLOTS],
@@ -86,6 +90,7 @@ impl Default for SceneParams {
             front_x0: 0.5,
             orb_flow: [0.0; 4],
             orb_band: [0.0; 4],
+            fluid: crate::fluid::FluidParams::default(),
             mode: SceneMode::NoAudio,
             bars: [0.0; SLOTS],
             peaks: [0.0; SLOTS],
@@ -170,22 +175,25 @@ pub enum SceneKind {
     Focus,
     /// One softly lit, audio-displaced sphere.
     Orb,
+    /// Liquid dye field: a feedback simulation (`fluid.rs`) drawn as glossy ink.
+    Fluid,
 }
 
 impl SceneKind {
     /// Every scene, in pipeline order (`index()` is the pipeline index: never reorder).
-    pub const ALL: [SceneKind; 4] = [
+    pub const ALL: [SceneKind; 5] = [
         SceneKind::Spectrum,
         SceneKind::Aurora,
         SceneKind::Focus,
         SceneKind::Orb,
+        SceneKind::Fluid,
     ];
 
     /// Lifecycle stage: the single source of truth for what the scene selector offers.
     pub fn lifecycle(self) -> Lifecycle {
         match self {
             SceneKind::Spectrum | SceneKind::Focus => Lifecycle::TechnicallyVerified,
-            SceneKind::Aurora => Lifecycle::Experimental,
+            SceneKind::Aurora | SceneKind::Fluid => Lifecycle::Experimental,
             SceneKind::Orb => Lifecycle::TechnicallyVerified,
         }
     }
@@ -226,6 +234,7 @@ impl SceneKind {
             SceneKind::Aurora => "aurora",
             SceneKind::Focus => "focus",
             SceneKind::Orb => "orb",
+            SceneKind::Fluid => "fluid",
         }
     }
 
@@ -238,27 +247,39 @@ const SPECTRUM_WGSL: &str = concat!(include_str!("common.wgsl"), include_str!("s
 const AURORA_WGSL: &str = concat!(include_str!("common.wgsl"), include_str!("aurora.wgsl"));
 const FOCUS_WGSL: &str = concat!(include_str!("common.wgsl"), include_str!("focus.wgsl"));
 const ORB_WGSL: &str = concat!(include_str!("common.wgsl"), include_str!("orb.wgsl"));
+const FLUID_WGSL: &str = concat!(include_str!("common.wgsl"), include_str!("fluid.wgsl"));
 
 /// All scene pipelines, created up front (a scene switch never compiles), sharing one uniform block.
+/// Fluid additionally owns a feedback simulation (`fluid.rs`) that runs only while Fluid is on screen.
 pub struct SceneSet {
     inner: FullscreenRenderer,
+    fluid: FluidSim,
 }
 
 impl SceneSet {
     pub fn new(device: &wgpu::Device, format: wgpu::TextureFormat, scale: f32) -> Self {
-        Self {
-            inner: FullscreenRenderer::new_multi(
-                device,
-                format,
-                scale,
-                "scenes",
-                &[SPECTRUM_WGSL, AURORA_WGSL, FOCUS_WGSL, ORB_WGSL],
-                UNIFORM_BYTES,
-            ),
-        }
+        let mut inner = FullscreenRenderer::new_multi(
+            device,
+            format,
+            scale,
+            "scenes",
+            &[SPECTRUM_WGSL, AURORA_WGSL, FOCUS_WGSL, ORB_WGSL],
+            UNIFORM_BYTES,
+        );
+        let fluid = FluidSim::new(device, FLUID_WGSL);
+        let i = inner.add_pipeline(device, "fluid", FLUID_WGSL, fluid.bind_group_layout());
+        assert_eq!(i, SceneKind::Fluid.index(), "pipeline order");
+        Self { inner, fluid }
+    }
+
+    /// Fluid quality tier 0..=3 (grid 256x144 .. 768x432 at 16:9); a change restarts the field.
+    pub fn set_fluid_tier(&mut self, tier: u8) {
+        self.fluid.set_tier(tier);
     }
 
     /// Draws `scene` (or a crossfade `scene -> to` at blend `t`), then `post` records overlays.
+    /// The Fluid simulation advances (fixed steps, from `p.time`) only while Fluid is one of the two scenes;
+    /// otherwise its textures are released, so the next entry starts from a clear field.
     pub fn render_scenes<F: FnOnce(&mut wgpu::CommandEncoder, &wgpu::TextureView)>(
         &mut self,
         gpu: &mut Gpu,
@@ -268,13 +289,99 @@ impl SceneSet {
         post: F,
     ) -> Result<FrameStatus, String> {
         let res = self.inner.current_render_size(gpu);
+        if scene == SceneKind::Fluid || xfade.is_some_and(|(k, _)| k == SceneKind::Fluid) {
+            self.fluid
+                .advance(&gpu.device, &gpu.queue, res, &p.fluid, p.time);
+        } else {
+            self.fluid.release();
+        }
         self.inner.render_scenes(
             gpu,
             &p.pack(res),
             scene.index(),
             xfade.map(|(k, t)| (k.index(), t)),
+            Some(self.fluid.render_group()),
             post,
         )
+    }
+
+    /// Headless counterpart of the live loop's Fluid step: advances the simulation to `p.time` at render size
+    /// `res` (fixed steps, at most three per call). Returns the steps run.
+    pub fn fluid_advance(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        res: (u32, u32),
+        p: &SceneParams,
+    ) -> u32 {
+        self.fluid.advance(device, queue, res, &p.fluid, p.time)
+    }
+
+    /// Runs exactly `n` fixed Fluid steps with `p` (soak tests: no clock, no rendering).
+    pub fn fluid_step(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        res: (u32, u32),
+        p: &SceneParams,
+        n: u32,
+    ) {
+        self.fluid.step(device, queue, res, &p.fluid, n);
+    }
+
+    /// Drops the Fluid textures (what the live loop does when Fluid leaves the screen).
+    pub fn fluid_release(&mut self) {
+        self.fluid.release();
+    }
+
+    /// Current Fluid grid, None while released.
+    pub fn fluid_grid(&self) -> Option<(u32, u32)> {
+        self.fluid.grid()
+    }
+
+    /// Diagnostic (headless): GPU ms per Fluid sim step and per Fluid scene draw at `res` (no readback), with the
+    /// field as it is now. The grid follows `res` and the current tier.
+    pub fn fluid_gpu_ms(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        res: (u32, u32),
+        p: &SceneParams,
+        reps: u32,
+    ) -> Result<(f64, f64), String> {
+        let wait = || {
+            device
+                .poll(wgpu::PollType::Wait {
+                    submission_index: None,
+                    timeout: Some(std::time::Duration::from_secs(10)),
+                })
+                .map_err(|e| format!("timing wait failed: {e}"))
+        };
+        self.fluid.step(device, queue, res, &p.fluid, 1);
+        wait()?;
+        let t0 = std::time::Instant::now();
+        self.fluid.step(device, queue, res, &p.fluid, reps.max(1));
+        wait()?;
+        let sim = t0.elapsed().as_secs_f64() * 1000.0 / f64::from(reps.max(1));
+        let draw = self.inner.time_offscreen(
+            device,
+            queue,
+            res,
+            &p.pack(res),
+            SceneKind::Fluid.index(),
+            Some(self.fluid.render_group()),
+            reps,
+        )?;
+        Ok((sim, draw))
+    }
+
+    /// Current dye texture as RGBA f32 (x/y/z dye, w heat); tests and diagnostics.
+    pub fn fluid_dye(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+    ) -> Result<(u32, u32, Vec<f32>), String> {
+        self.fluid.read_dye(device, queue)
     }
 
     /// Headless render of any scene or crossfade, then `post`.
@@ -297,6 +404,7 @@ impl SceneSet {
             &p.pack(res),
             scene.index(),
             xfade.map(|(k, t)| (k.index(), t)),
+            Some(self.fluid.render_group()),
             post,
         )
     }
@@ -414,6 +522,13 @@ mod tests {
         );
         assert_eq!(Aurora.lifecycle(), Lifecycle::Experimental);
         assert!(!Aurora.in_selector());
+        assert_eq!(Fluid.lifecycle(), Lifecycle::Experimental);
+        assert!(!Fluid.in_selector());
+        assert_eq!((Fluid.next(), Fluid.prev()), (Spectrum, Orb));
+        assert_eq!(SceneKind::parse("fluid"), Some(Fluid));
+        for k in SceneKind::ALL {
+            assert!(k.next() != Fluid && k.prev() != Fluid, "{k:?}");
+        }
         assert!(
             SceneKind::ALL
                 .iter()
@@ -671,6 +786,65 @@ mod tests {
         let ox = render(SceneKind::Orb, Some((SceneKind::Aurora, 1.0)));
         assert!(maxd(&ox, &b) <= 2, "orb -> aurora t=1 shows aurora");
         orb_is_a_lit_sphere_that_answers_to_bass_treble_and_onsets(&h, &scene);
+        fluid_renders_and_crossfades(&h, p);
+    }
+
+    /// Fluid joins the crossfade like the others: released it shows its dark base, a stepped field differs from
+    /// every other scene, and a crossfade into it ends on exactly the Fluid frame.
+    fn fluid_renders_and_crossfades(h: &crate::context::Headless, mut p: SceneParams) {
+        let res = (320u32, 180u32);
+        let mut scene = SceneSet::new(&h.device, wgpu::TextureFormat::Rgba8Unorm, 1.0);
+        let render = |s: &SceneSet, p: &SceneParams, k: SceneKind, x: Option<(SceneKind, f32)>| {
+            s.render_offscreen_scenes(&h.device, &h.queue, res, p, k, x, &|_, _| {})
+                .unwrap()
+        };
+        let idle = render(&scene, &p, SceneKind::Fluid, None);
+        let rgb = mean_lum(&idle, res.0, 0, res.0, 0, res.1);
+        assert!(rgb > 0.005 && rgb < 0.3, "dark base {rgb}");
+        for e in &mut p.fluid.emit {
+            e[2] = 1.0;
+        }
+        p.fluid.flow[0] = 0.08;
+        scene.fluid_step(&h.device, &h.queue, res, &p, 240);
+        assert_eq!(scene.fluid_grid(), Some((384, 216)), "default tier T1");
+        let f = render(&scene, &p, SceneKind::Fluid, None);
+        assert!(mad(&f, &idle) > 1.0, "dye shows: {}", mad(&f, &idle));
+        for k in [
+            SceneKind::Spectrum,
+            SceneKind::Aurora,
+            SceneKind::Focus,
+            SceneKind::Orb,
+        ] {
+            assert!(
+                mad(&f, &render(&scene, &p, k, None)) > 3.0,
+                "{k:?} vs fluid"
+            );
+        }
+        let maxd = |x: &[u8], y: &[u8]| x.iter().zip(y).map(|(p, q)| p.abs_diff(*q)).max().unwrap();
+        let o = render(&scene, &p, SceneKind::Orb, None);
+        assert!(
+            maxd(
+                &render(&scene, &p, SceneKind::Orb, Some((SceneKind::Fluid, 1.0))),
+                &f
+            ) <= 2
+        );
+        assert!(
+            maxd(
+                &render(&scene, &p, SceneKind::Fluid, Some((SceneKind::Orb, 1.0))),
+                &o
+            ) <= 2
+        );
+        let m = render(&scene, &p, SceneKind::Orb, Some((SceneKind::Fluid, 0.5)));
+        assert!(
+            mad(&m, &f) > 0.5 && mad(&m, &o) > 0.5,
+            "half way is a blend"
+        );
+        scene.fluid_release();
+        assert_eq!(scene.fluid_grid(), None);
+        assert!(
+            maxd(&render(&scene, &p, SceneKind::Fluid, None), &idle) <= 1,
+            "released = clear"
+        );
     }
 
     #[test]

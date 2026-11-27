@@ -101,8 +101,233 @@ pub struct SceneMapper {
     onset_count: u32,
     /// Latest music descriptors, rest values while audio is stale/absent. CPU-side only; never packed.
     music: MusicFeatures,
+    fluid: FluidMap,
     /// slot -> (band position 0..1, group index)
     slot_map: [(f32, usize); SLOTS],
+}
+
+/// Fluid scene mapping (F1, Experimental; design: docs\design\OPUS-CONSULT-2026-11-25.md, "Addendum: Fluid
+/// scene design"). Everything is smoothed here, dt based; the GPU sim only integrates. Emitter positions come
+/// from phase accumulators that are never reset (tempo bends an orbit, it never jumps it). Each emitter has its
+/// own orbit period, phase offset, spin direction and strength time constant: overlap and follow-through
+/// instead of three parts moving in unison ("twinning").
+struct FluidMap {
+    /// Per emitter: x and y orbit phases (cycles, wrapped to 0..1; the sines make the wrap seamless).
+    orbit: [[f32; 2]; 3],
+    strength: [f32; 3],
+    push: f32,
+    speed: f32,
+    freq: f32,
+    phase: f32,
+    tau: f32,
+    build: f32,
+    exposure: f32,
+    gate: f32,
+    vort: [[f32; 4]; 2],
+    vhue: [f32; 2],
+    since_vort: f32,
+    /// Orbit reach 0..1 from the rhythm (onset density), slow.
+    spread: f32,
+    spawns: u32,
+}
+
+/// Lissajous periods (s) and phase offsets per emitter (bass, mid, treble), y/x frequency ratios (irrational).
+const FL_PERIOD: [f32; 3] = [77.0, 48.0, 29.0];
+const FL_OFFSET: [f32; 3] = [0.0, 0.37, 0.71];
+const FL_RATIO: [f32; 3] = [1.618_034, std::f32::consts::SQRT_2, 1.732_051];
+/// Orbit centre height (uv, y down) per emitter: bass lowest, treble highest.
+const FL_HEIGHT: [f32; 3] = [0.34, 0.30, 0.27];
+/// Strength follow time constants (s): bass leads, treble settles last.
+const FL_STRENGTH_TAU: [f32; 3] = [0.25, 0.4, 0.6];
+/// Spin per emitter (1/s at full strength); alternating sign.
+const FL_SWIRL: [f32; 3] = [0.5, -0.7, 0.9];
+/// Splat radius (sh) and gain per emitter: the bass paints dense ink, the treble a lighter, airier veil.
+const FL_SIGMA: [f32; 3] = [0.085, 0.07, 0.08];
+const FL_GAIN: [f32; 3] = [1.0, 0.9, 0.65];
+/// Minimum time between two onset vortices and how long one lives (its envelope is ~0 by then).
+pub const FLUID_VORTEX_GAP_S: f32 = 0.25;
+const FL_VORTEX_LIFE_S: f32 = 2.0;
+/// Everything the sim injects stays in this uv box (y down): above artwork, lyrics and the control bar.
+pub const FLUID_SAFE_X: (f32, f32) = (0.15, 0.85);
+pub const FLUID_SAFE_Y: (f32, f32) = (0.12, 0.58);
+/// Slowest flow ever (sh/s): silence still breathes, barely.
+pub const FLUID_SPEED_FLOOR: f32 = 0.008;
+/// Slowest flow while music plays (sh/s): a calm pad still drifts.
+const FL_MUSIC_SPEED_MIN: f32 = 0.03;
+
+fn ema(y: f32, x: f32, dt: f32, tau: f32) -> f32 {
+    y + (x - y) * (1.0 - (-dt / tau).exp())
+}
+
+impl FluidMap {
+    fn new() -> Self {
+        Self {
+            orbit: [[0.0; 2]; 3],
+            strength: [0.0; 3],
+            push: 0.0,
+            speed: FLUID_SPEED_FLOOR,
+            freq: 3.0,
+            phase: 0.0,
+            tau: 3.0,
+            build: 0.0,
+            exposure: 0.85,
+            gate: 0.0,
+            vort: [[0.5, 0.3, 0.0, 100.0]; 2],
+            vhue: [0.0; 2],
+            since_vort: 10.0,
+            spread: 0.0,
+            spawns: 0,
+        }
+    }
+
+    /// `silent`: no fresh audio or the analyzer's silence flag. `absolute`: the frame's absolute group levels
+    /// (`AudioFrame::group_medium`, 0..1). `dt` is already sanitised by the caller.
+    fn update(
+        &mut self,
+        m: &MusicFeatures,
+        absolute: &[f32; mg_dsp::GROUPS],
+        silent: bool,
+        onsets: u32,
+        onset_strength: f32,
+        dt: f32,
+    ) -> mg_gfx::fluid::FluidParams {
+        let c = |v: f32| fin(v).clamp(0.0, 1.0);
+        let band = |a: &[f32; mg_dsp::GROUPS], i: usize| c(a[2 * i]).max(c(a[2 * i + 1]));
+        // AGC normalises every band to its own recent range, so it cannot tell a bass-heavy song from a bright
+        // one; the absolute band level gates each emitter (presence) and AGC shapes it within that.
+        let presence = |i: usize| (2.0 * band(absolute, i)).min(1.0);
+        let drive = |i: usize| 0.4 * band(&m.long, i) + 0.6 * band(&m.short, i);
+        let level = if silent { 0.0 } else { c(m.level) };
+        let ceiling = 0.5 + 0.5 * level; // quiet songs stay quiet even with full AGC
+        // sustained sound (pads) flows slowly; rhythm (onsets per second) lets it move
+        let rhythm = (fin(m.onset_density) / 3.0).clamp(0.0, 1.0);
+        let calm = c(m.calm);
+        // build: gentle intensification, slew-limited to 0.1 per second so a riser never jumps
+        let b_t = if silent { 0.0 } else { c(m.build) };
+        self.build += (b_t - self.build).clamp(-0.1 * dt, 0.1 * dt);
+        // injection gate: exactly 0 within 0.75 s of the analyzer's silence flag; back in 0.4 s
+        self.gate = if silent {
+            (self.gate - dt / 0.75).max(0.0)
+        } else {
+            (self.gate + dt / 0.4).min(1.0)
+        };
+        // slow, phase-continuous drivers
+        let speed_t = if silent {
+            FLUID_SPEED_FLOOR
+        } else {
+            ((0.05
+                + 0.20 * presence(1) * band(&m.long, 1)
+                + 0.12 * presence(0) * band(&m.long, 0)
+                + 0.12 * presence(2) * band(&m.long, 2))
+                * (1.0 - 0.6 * calm)
+                * (0.25 + 0.75 * rhythm)
+                * (1.0 + 0.4 * self.build))
+                .max(FL_MUSIC_SPEED_MIN)
+        };
+        self.speed = ema(self.speed, speed_t.max(FLUID_SPEED_FLOOR), dt, 1.0);
+        if !silent {
+            self.freq = ema(self.freq, 2.4 + 1.6 * c(m.centroid), dt, 2.0);
+        }
+        self.phase = (self.phase + dt * (0.03 + 0.12 * band(&m.long, 2))).rem_euclid(256.0);
+        let tau_t = if silent { 3.0 } else { 3.5 + 5.5 * calm };
+        self.tau = ema(self.tau, tau_t, dt, if silent { 0.3 } else { 1.5 });
+        // exposure: one-pole (1.5 s) and slew-limited (0.3/s): never a flash
+        let e_t = 0.85 + 0.3 * level;
+        let step = ema(self.exposure, e_t, dt, 1.5) - self.exposure;
+        self.exposure += step.clamp(-0.3 * dt, 0.3 * dt);
+        // bass accent (short above its own long average: an impact, not a steady bass line) -> push (fast attack,
+        // slow release: ease-out), heat and a wider bass splat
+        let bs = if silent {
+            0.0
+        } else {
+            band(&m.accent, 0) * presence(0)
+        };
+        let push_t = 0.25 * bs * ceiling;
+        self.push = ema(
+            self.push,
+            push_t,
+            dt,
+            if push_t > self.push { 0.04 } else { 0.3 },
+        );
+        // energetic music travels the canvas, calm music stays near where it is (never a jump: rate, not phase)
+        let orbit_rate = 0.4 + 8.0 * self.speed;
+        if !silent {
+            self.spread = ema(self.spread, rhythm, dt, 2.0);
+        }
+        let mut emit = [[0.0f32; 4]; 3];
+        let mut swirl = [0.0f32; 4];
+        for i in 0..3 {
+            let target = if silent {
+                0.0
+            } else {
+                FL_GAIN[i] * ceiling * presence(i) * (0.4 + 0.6 * drive(i))
+            };
+            self.strength[i] = ema(self.strength[i], target, dt, FL_STRENGTH_TAU[i]);
+            let o = &mut self.orbit[i];
+            o[0] = (o[0] + dt * orbit_rate / FL_PERIOD[i]).fract();
+            o[1] = (o[1] + dt * orbit_rate * FL_RATIO[i] / FL_PERIOD[i]).fract();
+            let tau2 = std::f32::consts::TAU;
+            // calm music gathers near the middle, rhythmic music spreads; heavier bands sit lower
+            let reach = 0.55 + 0.45 * self.spread;
+            let x = 0.5 + 0.33 * reach * (tau2 * (o[0] + FL_OFFSET[i])).sin();
+            let y = FL_HEIGHT[i] + 0.14 * reach * (tau2 * (o[1] + 1.7 * FL_OFFSET[i])).sin();
+            let sigma = FL_SIGMA[i] + if i == 0 { 0.2 * self.push } else { 0.0 }; // kicks splash wider
+            // a bass impact (push) splashes extra dye: kicks paint, a steady bass line only flows
+            let splash = if i == 0 { 1.0 + 4.0 * self.push } else { 1.0 };
+            let s =
+                (self.strength[i] * splash * self.gate * (1.0 + 0.3 * self.build)).clamp(0.0, 1.3);
+            // defensive: the orbit already lies inside the safe zone; a clamp keeps it there whatever the inputs
+            let (x, y) = (
+                x.clamp(FLUID_SAFE_X.0, FLUID_SAFE_X.1),
+                y.clamp(FLUID_SAFE_Y.0, FLUID_SAFE_Y.1),
+            );
+            emit[i] = [x, y, s, sigma];
+            swirl[i] = FL_SWIRL[i] * (0.3 + 0.7 * self.strength[i]);
+        }
+        swirl[3] = self.push * self.gate;
+        let heat = 1.5 * bs * ceiling * self.gate;
+
+        // onset + accent -> one smooth vortex (alpha envelope in the shader), >= 250 ms apart, two slots
+        for v in &mut self.vort {
+            v[3] = (v[3] + dt).min(100.0);
+            if v[3] > FL_VORTEX_LIFE_S {
+                *v = [v[0], v[1], 0.0, 100.0];
+            }
+        }
+        self.since_vort += dt;
+        let accent = (0..3).map(|i| band(&m.accent, i)).fold(0.0f32, f32::max);
+        if !silent
+            && onsets > 0
+            && self.since_vort >= FLUID_VORTEX_GAP_S
+            && accent > 0.04 + 0.12 * calm
+        {
+            self.since_vort = 0.0;
+            self.spawns = self.spawns.wrapping_add(1);
+            let dom = (0..3)
+                .max_by(|&a, &b| band(&m.accent, a).total_cmp(&band(&m.accent, b)))
+                .unwrap_or(0);
+            let ang = self.spawns as f32 * 2.399_963; // golden angle: never the same spot twice
+            let x = (emit[dom][0] + 0.08 * ang.cos()).clamp(0.2, 0.8);
+            let y = (emit[dom][1] + 0.08 * ang.sin()).clamp(0.15, 0.5);
+            let sign = if self.spawns.is_multiple_of(2) {
+                1.0
+            } else {
+                -1.0
+            };
+            let amp = sign * 0.3 * (0.4 + 0.6 * c(onset_strength)) * ceiling * (1.0 - 0.5 * calm);
+            let slot = usize::from(self.vort[1][3] > self.vort[0][3]); // the older one
+            self.vort[slot] = [x, y, amp, 0.0];
+            self.vhue[slot] = c(m.centroid);
+        }
+        mg_gfx::fluid::FluidParams {
+            emit,
+            swirl,
+            vort: self.vort,
+            flow: [self.speed, self.freq, self.phase, 0.012],
+            look: [self.tau, heat, self.exposure, 0.0],
+            misc: [self.vhue[0], self.vhue[1], 0.0, 0.0],
+        }
+    }
 }
 
 fn smoothstep(lo: f32, hi: f32, x: f32) -> f32 {
@@ -162,6 +387,7 @@ impl SceneMapper {
             onset_count: 0,
             slot_map,
             music: MusicFeatures::default(),
+            fluid: FluidMap::new(),
         }
     }
 
@@ -171,7 +397,6 @@ impl SceneMapper {
         self.music = if fresh { *m } else { MusicFeatures::default() };
     }
 
-    #[cfg_attr(not(test), allow(dead_code))] // first scene consumer lands in a later slice
     pub fn music(&self) -> &MusicFeatures {
         &self.music
     }
@@ -352,8 +577,18 @@ impl SceneMapper {
             let amp = self.tune.ring_amp * fin(input.onset_strength).clamp(0.0, 1.0);
             self.rings[0] = [0.0, amp.min(0.25)];
         }
+        // Fluid: its own block (never packed into the shared uniform); uses last frame's music features.
+        let fluid = self.fluid.update(
+            &self.music,
+            &f.group_medium,
+            silent,
+            if live { input.onsets } else { 0 },
+            input.onset_strength,
+            dt,
+        );
 
         SceneParams {
+            fluid,
             time: self.t,
             energy: s,
             glow,
@@ -730,5 +965,640 @@ mod tests {
         }
         origins.dedup_by(|a, b| (*a - *b).abs() < 1e-6);
         assert_eq!(origins.len(), 4, "every onset moves the impact point");
+    }
+}
+
+/// Fluid mapper checks (CPU only): real analyzer + mapper on synthetic fixtures, or hand-made features.
+#[cfg(test)]
+pub(crate) mod fluid_tests {
+    use super::*;
+    use crate::sim::{Sim, Tick};
+    use mg_dsp::synth;
+    use mg_gfx::fluid::FluidParams;
+
+    pub(crate) const SR: u32 = 48_000;
+
+    fn n(secs: f32) -> usize {
+        (secs * SR as f32) as usize
+    }
+
+    pub(crate) fn kick(secs: f32) -> Vec<f32> {
+        synth::kick_train(120.0, secs, 0.8, SR).0
+    }
+
+    /// Hi-hats: short noise bursts every 0.25 s at the demo fixture's hat level (broadband, treble-heavy).
+    pub(crate) fn hats(secs: f32) -> Vec<f32> {
+        synth::noise(9, 0.12, n(secs))
+            .iter()
+            .enumerate()
+            .map(|(i, w)| {
+                if (i as f32 / SR as f32 / 0.25).fract() < 0.12 {
+                    *w
+                } else {
+                    0.0
+                }
+            })
+            .collect()
+    }
+
+    /// Steady three-note pad with a 1.5 s fade-in (no attack transient).
+    pub(crate) fn pad(secs: f32) -> Vec<f32> {
+        let len = n(secs);
+        let notes: Vec<Vec<f32>> = [262.0f32, 330.0, 392.0]
+            .iter()
+            .map(|&f| synth::sine(f, 0.15, SR, len))
+            .collect();
+        (0..len)
+            .map(|i| {
+                let fade = (i as f32 / n(1.5) as f32).min(1.0);
+                fade * fade * (notes[0][i] + notes[1][i] + notes[2][i])
+            })
+            .collect()
+    }
+
+    pub(crate) fn run(x: &[f32], fps: f32) -> Vec<Tick> {
+        Sim::new(SR, fps, MapTuning::default()).run(x)
+    }
+
+    /// Times at which a vortex slot restarted (age back near 0 with an amplitude).
+    fn spawn_times(t: &[Tick]) -> Vec<f32> {
+        t.windows(2)
+            .filter(|w| {
+                (0..2).any(|s| {
+                    let (a, b) = (w[0].params.fluid.vort[s], w[1].params.fluid.vort[s]);
+                    b[2] != 0.0 && b[3] < a[3]
+                })
+            })
+            .map(|w| w[1].t)
+            .collect()
+    }
+
+    fn in_safe_zone(f: &FluidParams) -> bool {
+        let inside = |x: f32, y: f32| {
+            (FLUID_SAFE_X.0..=FLUID_SAFE_X.1).contains(&x)
+                && (FLUID_SAFE_Y.0..=FLUID_SAFE_Y.1).contains(&y)
+        };
+        f.emit
+            .iter()
+            .all(|e| inside(e[0], e[1]) && e[1] + e[3] < 0.62)
+            && f.vort.iter().all(|v| inside(v[0], v[1]))
+    }
+
+    fn all_finite(f: &FluidParams) -> bool {
+        f.emit
+            .iter()
+            .flatten()
+            .chain(&f.swirl)
+            .chain(f.vort.iter().flatten())
+            .chain(&f.flow)
+            .chain(&f.look)
+            .chain(&f.misc)
+            .all(|v| v.is_finite())
+    }
+
+    #[test]
+    fn fluid_kick_drives_the_bass_emitter_within_two_seconds() {
+        let t = run(&kick(2.0), 60.0);
+        let best = t
+            .iter()
+            .map(|k| k.params.fluid.emit[0][2])
+            .fold(0.0, f32::max);
+        assert!(best > 0.6, "bass emitter strength {best}");
+        assert!(t.iter().all(|k| in_safe_zone(&k.params.fluid)));
+    }
+
+    #[test]
+    fn fluid_pad_gives_no_impulses_and_slow_flow() {
+        let t = run(&pad(12.0), 60.0);
+        assert_eq!(spawn_times(&t), Vec::<f32>::new(), "a pad has no onsets");
+        let last = &t.last().unwrap().params.fluid;
+        // sustained sound flows at most half as fast as a kick pattern of similar loudness
+        let kick_speed = run(&kick(12.0), 60.0).last().unwrap().params.fluid.flow[0];
+        assert!(
+            last.flow[0] < 0.5 * kick_speed,
+            "pad flow speed {} vs kick {kick_speed}",
+            last.flow[0]
+        );
+        assert!(last.vort.iter().all(|v| v[2] == 0.0));
+        assert!(
+            last.emit.iter().any(|e| e[2] > 0.2),
+            "a pad still paints: {:?}",
+            last.emit
+        );
+    }
+
+    #[test]
+    fn fluid_silence_stops_injection_within_1_2_s_and_keeps_a_speed_floor() {
+        let mut x = kick(4.0);
+        let stop = x.len() as f32 / SR as f32;
+        x.extend(vec![0.0; n(6.0)]);
+        let t = run(&x, 60.0);
+        assert!(
+            t.iter()
+                .filter(|k| k.t < stop)
+                .any(|k| k.params.fluid.emit[0][2] > 0.3)
+        );
+        for k in t.iter().filter(|k| k.t >= stop + 1.2) {
+            let f = &k.params.fluid;
+            assert!(
+                f.emit.iter().all(|e| e[2] == 0.0) && f.swirl[3] == 0.0 && f.look[1] == 0.0,
+                "t={} still injecting {:?}",
+                k.t,
+                f.emit
+            );
+        }
+        assert!(
+            t.iter()
+                .all(|k| k.params.fluid.flow[0] >= FLUID_SPEED_FLOOR - 1e-6)
+        );
+        let last = &t.last().unwrap().params.fluid;
+        assert!(last.flow[0] < 0.012, "silent flow {}", last.flow[0]);
+        assert!(last.look[0] < 3.2, "silent memory tau {}", last.look[0]);
+        assert!(
+            spawn_times(&t).iter().all(|&s| s < stop + 0.4),
+            "no impulse in silence"
+        );
+    }
+
+    fn live_frame() -> AudioFrame {
+        AudioFrame {
+            silent: false,
+            band_count: mg_dsp::MAX_BANDS,
+            rms_db: -12.0,
+            group_medium: [0.5; mg_dsp::GROUPS],
+            energy: 0.7,
+            ..AudioFrame::default()
+        }
+    }
+
+    /// Steady features for `secs` at `fps` (an onset every `onset_every` frames, 0 = none): every frame's params.
+    fn steady(m: &MusicFeatures, secs: f32, fps: f32, onset_every: usize) -> Vec<FluidParams> {
+        let mut map = SceneMapper::new(MapTuning::default());
+        let f = live_frame();
+        (0..(secs * fps) as usize)
+            .map(|i| {
+                map.observe_music(m, true);
+                let onsets = u32::from(onset_every > 0 && i % onset_every == 0);
+                map.update(
+                    &Input {
+                        frame: &f,
+                        onsets,
+                        onset_strength: 0.8,
+                        fresh: true,
+                        mode: SceneMode::Live,
+                    },
+                    1.0 / fps,
+                )
+                .fluid
+            })
+            .collect()
+    }
+
+    #[test]
+    fn calm_music_raises_the_fluid_memory() {
+        let base = MusicFeatures {
+            level: 0.8,
+            long: [0.6; mg_dsp::GROUPS],
+            ..MusicFeatures::default()
+        };
+        let calm = steady(&MusicFeatures { calm: 1.0, ..base }, 8.0, 60.0, 0);
+        let busy = steady(&MusicFeatures { calm: 0.0, ..base }, 8.0, 60.0, 0);
+        let (tc, tb) = (calm.last().unwrap().look[0], busy.last().unwrap().look[0]);
+        assert!(tc > tb + 3.0, "calm tau {tc} vs busy {tb}");
+        assert!((3.5..=9.0).contains(&tc) && (3.4..=9.0).contains(&tb));
+        let (sc, sb) = (calm.last().unwrap().flow[0], busy.last().unwrap().flow[0]);
+        assert!(sc < sb, "calm flows slower: {sc} vs {sb}");
+    }
+
+    #[test]
+    fn fluid_vortices_are_spaced_and_at_most_two_live() {
+        let m = MusicFeatures {
+            level: 0.9,
+            calm: 0.0,
+            long: [0.7; mg_dsp::GROUPS],
+            short: [1.0; mg_dsp::GROUPS],
+            accent: [0.6; mg_dsp::GROUPS],
+            ..MusicFeatures::default()
+        };
+        let ps = steady(&m, 10.0, 144.0, 1); // an onset on every frame
+        let mut spawns = Vec::new();
+        let mut signs = Vec::new();
+        for (i, w) in ps.windows(2).enumerate() {
+            for s in 0..2 {
+                if w[1].vort[s][2] != 0.0 && w[1].vort[s][3] < w[0].vort[s][3] {
+                    spawns.push((i + 1) as f32 / 144.0);
+                    signs.push(w[1].vort[s][2].signum());
+                }
+            }
+            assert!(w[1].vort.iter().filter(|v| v[2] != 0.0).count() <= 2);
+        }
+        assert!(spawns.len() >= 30, "spawns {}", spawns.len());
+        assert!(
+            spawns
+                .windows(2)
+                .all(|s| s[1] - s[0] >= FLUID_VORTEX_GAP_S - 1e-3),
+            "{spawns:?}"
+        );
+        // consecutive vortices spin in opposite directions (no twinning) and are capped
+        assert!(signs.windows(2).all(|s| s[0] != s[1]));
+        assert!(ps.iter().flat_map(|p| p.vort).all(|v| v[2].abs() <= 0.3));
+    }
+
+    #[test]
+    fn fluid_emitters_and_vortices_stay_in_the_safe_zone() {
+        let mut map = SceneMapper::new(MapTuning::default());
+        let f = live_frame();
+        for i in 0..(30 * 60 * 30) {
+            let t = i as f32 / 30.0;
+            let s = |k: f32| 0.5 + 0.5 * (t * k).sin();
+            let m = MusicFeatures {
+                level: s(0.1),
+                calm: s(0.07),
+                build: s(0.3),
+                centroid: s(0.05),
+                long: [s(0.2); mg_dsp::GROUPS],
+                short: [s(3.0); mg_dsp::GROUPS],
+                accent: [s(5.0); mg_dsp::GROUPS],
+                ..MusicFeatures::default()
+            };
+            map.observe_music(&m, true);
+            let p = map.update(
+                &Input {
+                    frame: &f,
+                    onsets: u32::from(i % 7 == 0),
+                    onset_strength: 1.0,
+                    fresh: true,
+                    mode: SceneMode::Live,
+                },
+                1.0 / 30.0,
+            );
+            assert!(in_safe_zone(&p.fluid), "t={t}: {:?}", p.fluid);
+        }
+    }
+
+    #[test]
+    fn fluid_outputs_are_finite_and_bounded_for_hostile_input() {
+        let m = MusicFeatures {
+            agc: [f32::NAN; mg_dsp::GROUPS],
+            short: [f32::INFINITY; mg_dsp::GROUPS],
+            long: [f32::NEG_INFINITY; mg_dsp::GROUPS],
+            accent: [f32::NAN; mg_dsp::GROUPS],
+            level: f32::INFINITY,
+            centroid: f32::NAN,
+            onset_event: true,
+            onset_density: f32::NAN,
+            crest_db: f32::INFINITY,
+            calm: f32::NAN,
+            build: 1e30,
+        };
+        let f = AudioFrame {
+            rms_db: f32::NAN,
+            energy: f32::INFINITY,
+            ..live_frame()
+        };
+        let mut map = SceneMapper::new(MapTuning::default());
+        for k in 0..2000 {
+            map.observe_music(&m, k % 3 != 0);
+            let dt = [f32::NAN, f32::INFINITY, -1.0, 0.0, 1e-9, 0.016, 5.0][k % 7];
+            let p = map
+                .update(
+                    &Input {
+                        frame: &f,
+                        onsets: u32::MAX,
+                        onset_strength: f32::NAN,
+                        fresh: k % 5 != 0,
+                        mode: SceneMode::Live,
+                    },
+                    dt,
+                )
+                .fluid;
+            assert!(all_finite(&p), "{p:?}");
+            assert!(in_safe_zone(&p), "{p:?}");
+            assert!(p.emit.iter().all(|e| (0.0..=1.3).contains(&e[2])));
+            assert!((FLUID_SPEED_FLOOR - 1e-6..=0.5).contains(&p.flow[0]));
+            assert!((2.4..=4.0).contains(&p.flow[1]) && (0.0..256.0).contains(&p.flow[2]));
+            assert!((3.0 - 1e-3..=9.0).contains(&p.look[0]) && (0.5..=1.5).contains(&p.look[2]));
+        }
+    }
+}
+
+/// Fluid on the GPU (headless; skipped without a hardware device): real analyzer + mapper on synthetic fixtures,
+/// the simulation stepped exactly as the live loop steps it (fixed 1/60 s steps from the scene time).
+#[cfg(test)]
+mod fluid_gpu_tests {
+    use super::fluid_tests::{SR, hats, kick, pad, run};
+    use super::*;
+    use crate::sim::Tick;
+    use mg_gfx::context::{Headless, init_headless};
+    use mg_gfx::scene::{SceneKind, SceneSet};
+
+    const RES: (u32, u32) = (320, 180);
+    /// uv height below which the artwork, lyrics and control bar live.
+    const SPLIT: f32 = 0.62;
+
+    fn device() -> Option<Headless> {
+        init_headless()
+            .map_err(|e| eprintln!("SKIPPED (no hardware GPU in this environment): {e}"))
+            .ok()
+    }
+
+    fn scene(h: &Headless, tier: u8) -> SceneSet {
+        let mut s = SceneSet::new_headless(&h.device);
+        s.set_fluid_tier(tier);
+        s
+    }
+
+    /// Dye energy (sum of the three dye channels) above and below uv y = 0.62.
+    fn energy(s: &SceneSet, h: &Headless) -> (f64, f64) {
+        let (w, hh, d) = s.fluid_dye(&h.device, &h.queue).expect("dye readback");
+        let (mut up, mut lo) = (0.0, 0.0);
+        for y in 0..hh {
+            let upper = (y as f32 + 0.5) / (hh as f32) < SPLIT;
+            for x in 0..w {
+                let i = ((y * w + x) * 4) as usize;
+                let e = f64::from(d[i] + d[i + 1] + d[i + 2]);
+                if upper {
+                    up += e;
+                } else {
+                    lo += e;
+                }
+            }
+        }
+        (up, lo)
+    }
+
+    /// Steps the sim through every tick as the live loop does while Fluid is shown; `each` sees every tick.
+    fn drive(
+        s: &mut SceneSet,
+        h: &Headless,
+        ticks: &[Tick],
+        mut each: impl FnMut(&SceneSet, &Tick),
+    ) {
+        for t in ticks {
+            s.fluid_advance(&h.device, &h.queue, RES, &t.params);
+            each(s, t);
+        }
+    }
+
+    fn render(s: &SceneSet, h: &Headless, t: &Tick) -> Vec<u8> {
+        s.render_offscreen_scenes(
+            &h.device,
+            &h.queue,
+            RES,
+            &t.params,
+            SceneKind::Fluid,
+            None,
+            &|_, _| {},
+        )
+        .expect("render")
+    }
+
+    #[test]
+    fn fluid_kicks_paint_more_than_hats_and_stay_above_the_lyrics_band_headless() {
+        let Some(h) = device() else { return };
+        for tier in [0u8, 1] {
+            let mut out = Vec::new();
+            for x in [kick(6.0), hats(6.0)] {
+                let mut s = scene(&h, tier);
+                let mut worst_low = 0.0f64;
+                drive(&mut s, &h, &run(&x, 60.0), |s, t| {
+                    if t.t > 1.0 && ((t.t * 60.0).round() as usize).is_multiple_of(30) {
+                        let (u, l) = energy(s, &h);
+                        if u + l > 1e-3 {
+                            worst_low = worst_low.max(l / (u + l));
+                        }
+                    }
+                });
+                out.push((energy(&s, &h).0, worst_low));
+            }
+            eprintln!(
+                "FLUID T{tier} upper energy kick={:.1} hats={:.1}, worst share below 0.62: kick={:.3} hats={:.3}",
+                out[0].0, out[1].0, out[0].1, out[1].1
+            );
+            assert!(
+                out[0].0 > 1.5 * out[1].0,
+                "T{tier}: kick {:.1} vs hats {:.1}",
+                out[0].0,
+                out[1].0
+            );
+            assert!(
+                out.iter().all(|o| o.1 < 0.25),
+                "T{tier}: dye below the lyrics line {out:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn fluid_fades_after_the_music_stops_headless() {
+        let Some(h) = device() else { return };
+        let mut x = kick(6.0);
+        let stop = x.len() as f32 / SR as f32;
+        x.extend(vec![0.0; SR as usize * 9]);
+        let mut s = scene(&h, 1);
+        let mut at = [None; 3];
+        drive(&mut s, &h, &run(&x, 60.0), |s, t| {
+            for (k, dt) in [0.0f32, 2.0, 8.0].into_iter().enumerate() {
+                if at[k].is_none() && t.t >= stop + dt {
+                    let (u, l) = energy(s, &h);
+                    at[k] = Some(u + l);
+                }
+            }
+        });
+        let [Some(e0), Some(e2), Some(e8)] = at else {
+            panic!("probes missing {at:?}")
+        };
+        eprintln!(
+            "FLUID fade: stop={e0:.1} +2s={:.3} +8s={:.3}",
+            e2 / e0,
+            e8 / e0
+        );
+        assert!(e0 > 1.0, "kicks painted something: {e0}");
+        assert!(e2 >= 0.4 * e0, "+2 s keeps {:.3}", e2 / e0);
+        assert!(e8 <= 0.12 * e0, "+8 s keeps {:.3}", e8 / e0);
+    }
+
+    /// Per-pixel luminance 0..1.
+    fn lum(img: &[u8]) -> Vec<f32> {
+        img.chunks_exact(4)
+            .map(|p| (f32::from(p[0]) + f32::from(p[1]) + f32::from(p[2])) / 765.0)
+            .collect()
+    }
+
+    /// 32x18 box-filtered RGB thumbnail (0..1) of a 320x180 frame.
+    fn thumb(img: &[u8]) -> Vec<f32> {
+        let mut t = vec![0.0f32; 32 * 18 * 3];
+        for y in 0..180usize {
+            for x in 0..320usize {
+                for c in 0..3 {
+                    t[((y / 10) * 32 + x / 10) * 3 + c] +=
+                        f32::from(img[(y * 320 + x) * 4 + c]) / 255.0 / 100.0;
+                }
+            }
+        }
+        t
+    }
+
+    #[test]
+    fn fluid_frames_never_flash_and_fixtures_look_different_headless() {
+        let Some(h) = device() else { return };
+        let sine = |f: f32, a: f32| mg_dsp::synth::sine(f, a, SR, SR as usize * 8);
+        let demo = crate::sim::fixture("demo", SR).expect("demo");
+        let fixtures: [(&str, Vec<f32>); 7] = [
+            ("silence", vec![0.0; SR as usize * 8]),
+            ("kick", kick(8.0)),
+            ("hats", hats(8.0)),
+            ("pad", pad(8.0)),
+            ("bass", sine(70.0, 0.5)),
+            ("treble", sine(9000.0, 0.4)),
+            ("demo", demo[..SR as usize * 8].to_vec()),
+        ];
+        let mut finals = Vec::new();
+        for (name, x) in &fixtures {
+            let mut s = scene(&h, 1);
+            let (mut worst_mean, mut worst_p95) = (0.0f32, 0.0f32);
+            let mut prev: Option<Vec<f32>> = None;
+            let mut last = Vec::new();
+            drive(&mut s, &h, &run(x, 60.0), |s, t| {
+                let img = render(s, &h, t);
+                let l = lum(&img);
+                if let Some(p) = &prev {
+                    let mut d: Vec<f32> = l.iter().zip(p).map(|(a, b)| (a - b).abs()).collect();
+                    let mean_d =
+                        (l.iter().sum::<f32>() - p.iter().sum::<f32>()).abs() / l.len() as f32;
+                    worst_mean = worst_mean.max(mean_d);
+                    let k = d.len() * 95 / 100;
+                    d.select_nth_unstable_by(k, f32::total_cmp);
+                    worst_p95 = worst_p95.max(d[k]);
+                }
+                prev = Some(l);
+                last = img;
+            });
+            eprintln!(
+                "FLUID {name:8} worst mean-lum delta/frame={worst_mean:.4} worst p95 pixel delta={worst_p95:.4}"
+            );
+            assert!(
+                worst_mean <= 0.02,
+                "{name}: mean luminance jumped {worst_mean}"
+            );
+            assert!(worst_p95 <= 0.06, "{name}: p95 pixel delta {worst_p95}");
+            assert!(last.chunks_exact(4).all(|p| p[3] == 255));
+            if let Ok(dir) = std::env::var("MG_SCENE_DUMP") {
+                let _ = std::fs::write(
+                    format!("{dir}/fluid-test-{name}.png"),
+                    mg_media::synth::png_rgba(RES.0, RES.1, &last),
+                );
+            }
+            finals.push((*name, thumb(&last)));
+        }
+        let mut alike = Vec::new();
+        for a in 0..finals.len() {
+            for b in a + 1..finals.len() {
+                let (x, y) = (&finals[a].1, &finals[b].1);
+                let d = x.iter().zip(y).map(|(p, q)| (p - q).abs()).sum::<f32>() / x.len() as f32;
+                eprintln!("FLUID thumb {} vs {}: {d:.4}", finals[a].0, finals[b].0);
+                if d <= 0.03 {
+                    alike.push(format!("{} and {} ({d:.4})", finals[a].0, finals[b].0));
+                }
+            }
+        }
+        assert!(alike.is_empty(), "fixtures look alike: {alike:?}");
+    }
+
+    #[test]
+    fn fluid_is_deterministic_and_frame_rate_independent_headless() {
+        let Some(h) = device() else { return };
+        let demo = crate::sim::fixture("demo", SR).expect("demo");
+        let ticks = run(&demo[..SR as usize * 4], 60.0);
+        let dye = |ticks: &[Tick]| {
+            let mut s = scene(&h, 1);
+            drive(&mut s, &h, ticks, |_, _| {});
+            s.fluid_dye(&h.device, &h.queue).expect("dye").2
+        };
+        let (a, b) = (dye(&ticks), dye(&ticks));
+        assert!(
+            a == b,
+            "two runs of the same input must give the same field"
+        );
+        // the same 10 s of kicks shown at 30, 60 and 144 Hz end with the same amount of dye (within 5%)
+        let x = kick(10.0);
+        let mut e = Vec::new();
+        for fps in [30.0f32, 60.0, 144.0] {
+            let mut s = scene(&h, 1);
+            drive(&mut s, &h, &run(&x, fps), |_, _| {});
+            let (u, l) = energy(&s, &h);
+            e.push(u + l);
+        }
+        eprintln!(
+            "FLUID energy at 10 s: 30 Hz {:.1}, 60 Hz {:.1}, 144 Hz {:.1}",
+            e[0], e[1], e[2]
+        );
+        for (i, fps) in [(0, 30), (2, 144)] {
+            assert!(
+                (e[i] - e[1]).abs() <= 0.05 * e[1],
+                "{fps} Hz {:.1} vs 60 Hz {:.1}",
+                e[i],
+                e[1]
+            );
+        }
+    }
+
+    /// Ten simulated minutes of extreme, then hostile, input on T0 (no rendering): the field stays finite and bounded.
+    #[test]
+    fn fluid_ten_minute_extreme_soak_stays_finite_headless() {
+        let Some(h) = device() else { return };
+        let mut s = scene(&h, 0);
+        let mut map = SceneMapper::new(MapTuning::default());
+        let loud = MusicFeatures {
+            agc: [1.0; mg_dsp::GROUPS],
+            short: [1.0; mg_dsp::GROUPS],
+            long: [1.0; mg_dsp::GROUPS],
+            accent: [1.0; mg_dsp::GROUPS],
+            level: 1.0,
+            centroid: 1.0,
+            onset_event: true,
+            onset_density: 10.0,
+            crest_db: 40.0,
+            calm: 0.0,
+            build: 1.0,
+        };
+        let hostile = MusicFeatures {
+            short: [f32::NAN; mg_dsp::GROUPS],
+            level: f32::INFINITY,
+            centroid: f32::NAN,
+            ..loud
+        };
+        let frame = AudioFrame {
+            silent: false,
+            band_count: mg_dsp::MAX_BANDS,
+            rms_db: -3.0,
+            energy: 1.0,
+            group_medium: [1.0; mg_dsp::GROUPS],
+            ..AudioFrame::default()
+        };
+        // 20 frames per second, three fixed steps each: 12 000 frames = 600 simulated seconds
+        for i in 0..12_000u32 {
+            let m = if i < 9_000 { &loud } else { &hostile };
+            map.observe_music(m, true);
+            let p = map.update(
+                &Input {
+                    frame: &frame,
+                    onsets: u32::from(i % 3 == 0),
+                    onset_strength: 1.0,
+                    fresh: true,
+                    mode: SceneMode::Live,
+                },
+                0.05,
+            );
+            s.fluid_step(&h.device, &h.queue, RES, &p, 3);
+            if i % 3_000 == 2_999 {
+                let (_, _, d) = s.fluid_dye(&h.device, &h.queue).expect("dye");
+                let max = d.iter().cloned().fold(0.0f32, f32::max);
+                eprintln!("FLUID soak {} s: max texel {max:.3}", (i + 1) / 20);
+                assert!(
+                    d.iter().all(|v| v.is_finite() && (0.0..=3.0).contains(v)),
+                    "at frame {i}"
+                );
+            }
+        }
     }
 }

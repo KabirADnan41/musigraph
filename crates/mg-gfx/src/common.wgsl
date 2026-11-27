@@ -1,6 +1,8 @@
 // Shared prelude for every scene shader (concatenated in front of the scene's own WGSL at build time).
 // One uniform block for all scenes: the CPU mapper fills the common fields every frame and the
-// scene-specific ones (ex0..ex3); each scene reads only what it needs.
+// scene-specific ones (ex0..ex5); each scene reads only what it needs. Fluid reuses NONE of ex0..ex5 or c: it
+// reads its own block `FU` at @group(1) (fluid.wgsl, packed by fluid::FluidParams), so a crossfade between Fluid
+// and Aurora/Focus/Orb can never feed one scene the other's fields. Fluid reads res, time, mode and pal0..pal3 here.
 
 struct U {
     res: vec2<f32>,

@@ -165,6 +165,8 @@ pub struct SceneOpts {
     pub lyrics_dir: Option<std::path::PathBuf>,
     /// Control bar visibility: `Auto` (idle timer) or `Always` (developer flag for screenshots and draw-cost measurement).
     pub controls: ControlsMode,
+    /// Fluid quality tier 0..=3 (developer flag `--fluid-tier`; auto-tier is a TODO).
+    pub fluid_tier: u8,
 }
 
 #[derive(Debug, PartialEq, Clone, Copy)]
@@ -187,6 +189,7 @@ pub fn parse(args: &[String], source: Source) -> Result<SceneOpts, String> {
         auto_scenes: None,
         lyrics_dir: None,
         controls: ControlsMode::Auto,
+        fluid_tier: mg_gfx::fluid::DEFAULT_TIER,
     };
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -197,7 +200,7 @@ pub fn parse(args: &[String], source: Source) -> Result<SceneOpts, String> {
                 o.style = it
                     .next()
                     .and_then(|v| SceneKind::parse(v))
-                    .ok_or("--style needs spectrum|focus|orb|aurora")?;
+                    .ok_or("--style needs spectrum|focus|orb|aurora|fluid")?;
             }
             "--auto-scenes" => {
                 o.auto_scenes = Some(
@@ -261,6 +264,13 @@ pub fn parse(args: &[String], source: Source) -> Result<SceneOpts, String> {
                     .and_then(|v| v.parse::<f32>().ok())
                     .filter(|s| s.is_finite() && (0.25..=1.0).contains(s))
                     .ok_or("--scale needs 0.25..=1.0")?;
+            }
+            "--fluid-tier" => {
+                o.fluid_tier = it
+                    .next()
+                    .and_then(|v| v.parse::<u8>().ok())
+                    .filter(|t| *t <= 3)
+                    .ok_or("--fluid-tier needs 0..=3")?;
             }
             other => return Err(format!("unknown option {other}")),
         }
@@ -432,11 +442,9 @@ impl ApplicationHandler for App {
                     "adapter={:?} backend={:?} present_mode={:?} surface_format={:?}",
                     gpu.info.name, gpu.info.backend, gpu.config.present_mode, gpu.config.format
                 );
-                self.scene = Some(SceneSet::new(
-                    &gpu.device,
-                    gpu.config.format,
-                    self.opts.scale,
-                ));
+                let mut scene = SceneSet::new(&gpu.device, gpu.config.format, self.opts.scale);
+                scene.set_fluid_tier(self.opts.fluid_tier);
+                self.scene = Some(scene);
                 self.overlay = Some(Overlay::new(&gpu.device, &gpu.queue, gpu.config.format));
                 self.gpu = Some(gpu);
             }
@@ -742,7 +750,7 @@ impl App {
         let anchor = match self.switch.target() {
             SceneKind::Spectrum => 0.70,
             SceneKind::Aurora => 0.72,
-            SceneKind::Orb => 0.72,
+            SceneKind::Orb | SceneKind::Fluid => 0.72,
             SceneKind::Focus if self.pres.layout() == Layout::Center => 0.80,
             SceneKind::Focus => 0.72,
         };
@@ -1315,5 +1323,26 @@ mod tests {
             SceneKind::Orb
         );
         assert_eq!(SceneKind::parse("focus"), Some(SceneKind::Focus));
+    }
+
+    #[test]
+    fn parses_the_fluid_style_and_tier() {
+        let o = parse(&a(&["--style", "fluid", "--fluid-tier", "3"]), Source::Live).unwrap();
+        assert_eq!((o.style, o.fluid_tier), (SceneKind::Fluid, 3));
+        assert_eq!(parse(&a(&[]), Source::Live).unwrap().fluid_tier, 1);
+        for t in ["0", "1", "2"] {
+            let tier = parse(&a(&["--fluid-tier", t]), Source::Live)
+                .unwrap()
+                .fluid_tier;
+            assert_eq!(tier.to_string(), t);
+        }
+        for bad in [
+            &["--fluid-tier"][..],
+            &["--fluid-tier", "4"],
+            &["--fluid-tier", "-1"],
+            &["--fluid-tier", "high"],
+        ] {
+            assert!(parse(&a(bad), Source::Live).is_err(), "{bad:?}");
+        }
     }
 }

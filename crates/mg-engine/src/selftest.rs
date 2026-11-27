@@ -134,7 +134,7 @@ fn presentation_previews(failures: &mut Vec<String>) -> bool {
             pres.set_lyric_anchor(match kind {
                 SceneKind::Spectrum => 0.70,
                 SceneKind::Aurora => 0.72,
-                SceneKind::Orb => 0.72,
+                SceneKind::Orb | SceneKind::Fluid => 0.72,
                 SceneKind::Focus if layout == Layout::Center => 0.80,
                 SceneKind::Focus => 0.72,
             });
@@ -523,6 +523,119 @@ fn orb_checks(failures: &mut Vec<String>) -> bool {
     true
 }
 
+/// Fluid (F1, Experimental): the real analyzer + mapper on synthetic fixtures drive the dye simulation exactly as
+/// the live loop does (fixed 1/60 s steps from the scene time), rendered headless at `RES` after every tick.
+/// Checks: finite field, a flicker bound like Orb's, and silence / bass / treble frames that differ. With
+/// `MG_SCENE_DUMP=<dir>` writes 960x540 PNGs; with `MG_FLUID_PERF=1` prints GPU ms per tier (sim step, 1080p draw).
+fn fluid_checks(failures: &mut Vec<String>) -> bool {
+    let Ok(h) = headless() else { return false };
+    let mut scene = SceneSet::new_headless(&h.device);
+    let mad = |a: &[u8], b: &[u8]| {
+        a.iter()
+            .zip(b)
+            .map(|(x, y)| u64::from(x.abs_diff(*y)))
+            .sum::<u64>() as f64
+            / a.len() as f64
+    };
+    let dump = std::env::var("MG_SCENE_DUMP").ok();
+    let mut frames = Vec::new();
+    for name in ["silence", "bass", "treble", "kick", "demo"] {
+        let x = fixture(name, SR).expect("fixture");
+        let ticks = Sim::new(SR, FPS, MapTuning::default()).run(&x[..x.len().min(SR as usize * 8)]);
+        scene.fluid_release(); // every fixture starts from a clear field, like a scene entry
+        let mut lum = Vec::with_capacity(ticks.len());
+        let mut last = Vec::new();
+        for t in &ticks {
+            scene.fluid_advance(&h.device, &h.queue, RES, &t.params);
+            let Ok(img) = scene.render_offscreen_scenes(
+                &h.device,
+                &h.queue,
+                RES,
+                &t.params,
+                SceneKind::Fluid,
+                None,
+                &|_, _| {},
+            ) else {
+                failures.push(format!("fluid/{name}: render failed"));
+                return true;
+            };
+            lum.push(region_lum(&img, 0, RES.0, 0, RES.1));
+            last = img;
+        }
+        let finite = scene
+            .fluid_dye(&h.device, &h.queue)
+            .is_ok_and(|(_, _, d)| d.iter().all(|v| v.is_finite()));
+        let flicker = max_delta_100ms(&lum);
+        let upper = region_lum(&last, 0, RES.0, 0, 50);
+        let lower = region_lum(&last, 0, RES.0, 62, RES.1);
+        println!(
+            "FLUID {name:8} finite={finite} max_lum_delta_100ms={flicker:.3} mean_lum={:.3} upper_lum={upper:.3} lower_lum={lower:.3}",
+            mean(&lum)
+        );
+        if !finite {
+            failures.push(format!("fluid/{name}: non-finite dye"));
+        }
+        if !(flicker.is_finite() && flicker < 0.10) {
+            failures.push(format!(
+                "fluid/{name}: luminance changed by {flicker:.3} within 100 ms"
+            ));
+        }
+        if let Some(dir) = &dump {
+            let p = &ticks.last().expect("ticks").params;
+            if let Ok(big) = scene.render_offscreen_scenes(
+                &h.device,
+                &h.queue,
+                (960, 540),
+                p,
+                SceneKind::Fluid,
+                None,
+                &|_, _| {},
+            ) {
+                let _ = std::fs::write(
+                    format!("{dir}/fluid-{name}.png"),
+                    mg_media::synth::png_rgba(960, 540, &big),
+                );
+            }
+        }
+        frames.push((name, last));
+    }
+    if let [(_, s), (_, b), (_, t), ..] = &frames[..] {
+        for (what, d, min) in [
+            ("silence vs bass", mad(s, b), 1.0),
+            ("silence vs treble", mad(s, t), 0.5),
+            ("bass vs treble", mad(b, t), 0.5),
+        ] {
+            println!("FLUID {what}: mad={d:.3} (min {min})");
+            if d < min {
+                failures.push(format!(
+                    "fluid: {what} frames too similar (mad {d:.3} < {min})"
+                ));
+            }
+        }
+    }
+    if std::env::var("MG_FLUID_PERF").is_ok_and(|v| v == "1") {
+        let x = fixture("demo", SR).expect("demo");
+        let ticks = Sim::new(SR, FPS, MapTuning::default()).run(&x[..SR as usize * 8]);
+        let p = &ticks.last().expect("ticks").params;
+        for tier in 0..=3u8 {
+            scene.set_fluid_tier(tier);
+            scene.fluid_release();
+            for t in &ticks {
+                scene.fluid_advance(&h.device, &h.queue, (1920, 1080), &t.params);
+            }
+            match scene.fluid_gpu_ms(&h.device, &h.queue, (1920, 1080), p, 120) {
+                Ok((sim, draw)) => println!(
+                    "FLUID PERF tier {tier} grid {:?}: sim_step_ms={sim:.3} draw_1080p_ms={draw:.3} (headless, submit-to-completion, {})",
+                    scene.fluid_grid(),
+                    h.info.name
+                ),
+                Err(e) => failures.push(format!("fluid perf T{tier}: {e}")),
+            }
+        }
+    }
+    true
+}
+
 pub fn run(allow_no_gpu: bool) -> i32 {
     let mut failures = Vec::new();
     let mut gpu_seen = false;
@@ -646,6 +759,7 @@ pub fn run(allow_no_gpu: bool) -> i32 {
     gpu_seen |= presentation_previews(&mut failures);
     gpu_seen |= controls_previews(&mut failures);
     gpu_seen |= orb_checks(&mut failures);
+    gpu_seen |= fluid_checks(&mut failures);
     if !gpu_seen {
         println!(
             "NOTE: no hardware GPU device available; rendered-pixel checks were NOT run (parameter checks ran)."

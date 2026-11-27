@@ -1,6 +1,7 @@
 //! wgpu rendering, frame pacing and scenes.
 
 pub mod context;
+pub mod fluid;
 pub mod fullscreen;
 pub mod overlay;
 pub mod report;
