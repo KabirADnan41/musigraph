@@ -1014,6 +1014,7 @@ impl App {
         let tr = self
             .switch
             .update(dt as f32, |_| scene_luma(&params.palette));
+        params.fx = tr.fx();
         let label = self.label(fresh);
         if label != self.title {
             if let Some(w) = &self.window {

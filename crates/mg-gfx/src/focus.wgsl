@@ -192,6 +192,7 @@ fn pocket(col: vec3<f32>, p: vec2<f32>, r: vec4<f32>, on: f32, cap: f32) -> vec3
 
 @fragment
 fn fs(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
+    if (u.ex2.w >= 1.0) { return vec4<f32>(bridge_colour(frag.xy), 1.0); }
     let aspect = u.res.x / u.res.y;
     let p = frag.xy / u.res.y;                  // screen heights, origin top-left
     let uvs = frag.xy / u.res;
@@ -224,6 +225,7 @@ fn fs(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
     col = pocket(col, p, fu.ink[3], fu.ink_on.w, fu.ink_cap.w);
 
     col = mode_marker(col, frag, aspect, 0.92);
+    col = veil_global(col, frag.xy);
     col += (hash21(frag.xy) - 0.5) / 255.0;
     return vec4<f32>(clamp(col, vec3<f32>(0.0), vec3<f32>(1.0)), 1.0);
 }

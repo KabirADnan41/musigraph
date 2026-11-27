@@ -979,6 +979,7 @@ impl SceneMapper {
             orb_flow: [self.orb_flow, self.orb_rot, self.orb_az[0], self.orb_az[1]],
             orb_band,
             front_x0: (self.onset_count as f32 * 0.618_034).fract(),
+            fx: mg_gfx::scene::Fx::default(), // the runner fills it from the scene switch
             // the runner adds geometry, cover weights, text pocket and bar to the music fields
             album,
             rings: self.rings,

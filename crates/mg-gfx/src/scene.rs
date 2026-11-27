@@ -24,6 +24,19 @@ pub enum SceneMode {
     NoAudio,
 }
 
+/// Scene-transition look (all zero = the scene exactly as drawn without a transition). Veils run 0 visible .. 1
+/// hidden: per layer (atmosphere, geometry, particles) for the layered scenes, and a global one (last) for the
+/// scenes without separable layers. Packed into the free `ex2` and `ex3.xzw` slots; see `common.wgsl`.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Fx {
+    pub veil: [f32; 4],
+    /// Relative luminance of the palette bridge the veil fades towards.
+    pub bridge_luma: f32,
+    /// Bridge breathing amplitude (lightness fraction) and iris strength (0 or 1).
+    pub breathing: f32,
+    pub iris: f32,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct SceneParams {
     pub time: f32,
@@ -56,6 +69,7 @@ pub struct SceneParams {
     /// Album Focus environment: its own block (`FocusParams::pack`, `@group(1)` of focus.wgsl), never part of `pack()`.
     pub album: FocusParams,
     pub mode: SceneMode,
+    pub fx: Fx,
     pub bars: [f32; SLOTS],
     pub peaks: [f32; SLOTS],
     pub bright: [f32; SLOTS],
@@ -88,6 +102,7 @@ impl Default for SceneParams {
             fluid: crate::fluid::FluidParams::default(),
             album: FocusParams::default(),
             mode: SceneMode::NoAudio,
+            fx: Fx::default(),
             bars: [0.0; SLOTS],
             peaks: [0.0; SLOTS],
             bright: [0.0; SLOTS],
@@ -138,9 +153,17 @@ impl SceneParams {
         }
         put(&mut o, &self.aurora_phase);
         put(&mut o, &self.aurora_band);
-        // ex2 and ex3.xzw are free (Album Focus reads its own block, `FocusParams`)
-        put(&mut o, &[0.0; 4]);
-        put(&mut o, &[0.0, self.front_x0, 0.0, 0.0]);
+        // ex2 = transition veils, ex3.xzw = bridge luma, breathing, iris (Album Focus reads its own block)
+        put(&mut o, &self.fx.veil);
+        put(
+            &mut o,
+            &[
+                self.fx.bridge_luma,
+                self.front_x0,
+                self.fx.breathing,
+                self.fx.iris,
+            ],
+        );
         put(&mut o, &self.orb_flow);
         put(&mut o, &self.orb_band);
         debug_assert_eq!(o.len(), UNIFORM_BYTES);
@@ -1414,6 +1437,172 @@ mod tests {
             .render_offscreen(&h.device, &h.queue, (840, 360), &p)
             .unwrap();
         assert!(mean_lum(&wide, 840, 0, 840, 0, 360) > 0.0);
+    }
+
+    #[test]
+    fn transition_fx_packs_into_the_free_ex2_and_ex3_slots_and_zero_changes_nothing() {
+        let p = SceneParams {
+            front_x0: 0.7,
+            fx: Fx {
+                veil: [0.1, 0.2, 0.3, 0.4],
+                bridge_luma: 0.16,
+                breathing: 0.02,
+                iris: 1.0,
+            },
+            ..Default::default()
+        };
+        let (z, b) = (SceneParams::default().pack((1, 1)), p.pack((1, 1)));
+        let f = |b: &[u8], o: usize| f32::from_ne_bytes(b[o..o + 4].try_into().unwrap());
+        // ex2 at 1312, ex3 at 1328 (ex4 is at 1344)
+        assert_eq!(
+            [f(&b, 1312), f(&b, 1316), f(&b, 1320), f(&b, 1324)],
+            [0.1, 0.2, 0.3, 0.4]
+        );
+        assert_eq!(
+            [f(&b, 1328), f(&b, 1332), f(&b, 1336), f(&b, 1340)],
+            [0.16, 0.7, 0.02, 1.0]
+        );
+        assert!(z[1312..1328].iter().all(|&x| x == 0) && f(&z, 1328) == 0.0 && f(&z, 1340) == 0.0);
+        // everything else is byte-identical
+        assert_eq!(
+            z[..1312],
+            SceneParams {
+                front_x0: 0.5,
+                ..p.clone()
+            }
+            .pack((1, 1))[..1312]
+        );
+        assert_eq!(b.len(), UNIFORM_BYTES);
+    }
+
+    #[test]
+    fn transition_fx_fades_every_scene_to_one_flat_palette_bridge_headless() {
+        let Some((h, scene)) = headless() else { return };
+        let res = (320u32, 180u32);
+        let mut base = SceneParams {
+            mode: SceneMode::Live,
+            energy: 0.6,
+            glow: 0.6,
+            orb_band: [0.6, 0.3, 0.5, 0.4],
+            aurora_band: [0.5, 0.6, 0.4, 0.3],
+            aurora_phase: [0.1, 0.4, 0.7, 0.9],
+            ..Default::default()
+        };
+        for i in 0..SLOTS {
+            base.bars[i] = 0.2 + 0.6 * ((i as f32 * 0.37).sin() * 0.5 + 0.5);
+            base.bright[i] = 0.7;
+        }
+        let render = |k: SceneKind, fx: Fx| {
+            let p = SceneParams { fx, ..base.clone() };
+            scene
+                .render_offscreen_scenes(&h.device, &h.queue, res, &p, k, None, &|_, _| {})
+                .unwrap()
+        };
+        let lum = |i: &[u8], x0, x1, y0, y1| mean_lum(i, res.0, x0, x1, y0, y1);
+        let bridge = Fx {
+            veil: [1.0; 4],
+            bridge_luma: 0.16,
+            ..Fx::default()
+        };
+        let flat = render(SceneKind::Spectrum, bridge);
+        // the bridge: a quiet gradient, not black, near the requested luminance
+        let y = lum(&flat, 0, res.0, 0, res.1);
+        assert!((0.08..0.30).contains(&y), "bridge luminance {y}");
+        assert!(
+            lum(&flat, 140, 180, 70, 110) > lum(&flat, 0, 40, 0, 40) * 0.9,
+            "radial lift, no hole"
+        );
+        for k in SceneKind::ALL {
+            let idle = render(k, Fx::default());
+            // veils at zero with the other fields set: the scene is untouched (early outs and exact multiplies)
+            let inert = Fx {
+                veil: [0.0; 4],
+                bridge_luma: 0.16,
+                breathing: 0.02,
+                iris: 1.0,
+            };
+            assert_eq!(render(k, inert), idle, "{k:?}: zero veil is bit-identical");
+            // fully veiled: every scene shows the very same bridge (no scene content leaks)
+            assert_eq!(render(k, bridge), flat, "{k:?}: fully veiled == bridge");
+            // half veiled differs from both ends
+            let half = render(
+                k,
+                Fx {
+                    veil: [0.5; 4],
+                    bridge_luma: 0.16,
+                    ..Fx::default()
+                },
+            );
+            assert!(
+                half != idle && half != flat,
+                "{k:?}: half veil is a different picture"
+            );
+        }
+        // layered scenes: one layer's veil removes only that layer; monolithic scenes ignore the layer veils
+        for k in [SceneKind::Spectrum, SceneKind::Aurora, SceneKind::Orb] {
+            let idle = render(k, Fx::default());
+            let l_all = lum(&idle, 0, res.0, 0, res.1);
+            let geom = render(
+                k,
+                Fx {
+                    veil: [0.0, 1.0, 0.0, 0.0],
+                    bridge_luma: 0.16,
+                    ..Fx::default()
+                },
+            );
+            assert!(
+                geom != idle && lum(&geom, 0, res.0, 0, res.1) < l_all,
+                "{k:?}: geometry veil removes the bars/ribbons/body"
+            );
+            let atmo = render(
+                k,
+                Fx {
+                    veil: [0.6, 0.0, 0.0, 0.0],
+                    bridge_luma: 0.16,
+                    ..Fx::default()
+                },
+            );
+            assert!(atmo != idle, "{k:?}: atmosphere veil");
+        }
+        for k in [SceneKind::Focus, SceneKind::Fluid] {
+            let idle = render(k, Fx::default());
+            let layers = Fx {
+                veil: [1.0, 1.0, 1.0, 0.0],
+                bridge_luma: 0.16,
+                ..Fx::default()
+            };
+            assert_eq!(
+                render(k, layers),
+                idle,
+                "{k:?}: layer veils do nothing here"
+            );
+        }
+        // iris: closes from the corners inward, so the middle stays visible longer than with a plain fade
+        let v = |iris: f32| {
+            render(
+                SceneKind::Focus,
+                Fx {
+                    veil: [0.0, 0.0, 0.0, 0.5],
+                    bridge_luma: 0.16,
+                    iris,
+                    ..Fx::default()
+                },
+            )
+        };
+        let dist =
+            |a: &[u8], x0, x1, y0, y1| (lum(a, x0, x1, y0, y1) - lum(&flat, x0, x1, y0, y1)).abs();
+        let (with, without) = (v(1.0), v(0.0));
+        assert!(with != without, "iris changes the picture");
+        let (cw, co) = (
+            dist(&with, 140, 180, 70, 110),
+            dist(&without, 140, 180, 70, 110),
+        );
+        assert!(cw >= co - 1e-4, "the middle closes last: {cw} vs {co}");
+        let (kw, ko) = (dist(&with, 0, 40, 0, 40), dist(&without, 0, 40, 0, 40));
+        assert!(
+            (kw - ko).abs() < 0.02,
+            "corners are already fully on the veil curve: {kw} vs {ko}"
+        );
     }
 
     #[test]

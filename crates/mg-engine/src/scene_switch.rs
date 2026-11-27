@@ -9,7 +9,7 @@
 //! * Rapid switching shortens the phases (`shorten`) and a luminance-swing guard (WCAG 2.3.1 spirit) holds the
 //!   bridge instead of flashing: never more than 3 swings above `SWING_AMP` per second, per-frame change capped.
 
-use mg_gfx::scene::SceneKind;
+use mg_gfx::scene::{Fx, SceneKind};
 
 /// Phase lengths in seconds plus which effects are on.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -98,6 +98,18 @@ pub struct Frame {
     /// Bridge breathing amplitude (0 or 0.02) and iris strength (0 or 1).
     pub breathing: f32,
     pub iris: f32,
+}
+
+impl Frame {
+    /// The shader-side look of this frame (all zero when idle).
+    pub fn fx(&self) -> Fx {
+        Fx {
+            veil: self.veil,
+            bridge_luma: self.bridge_luma,
+            breathing: self.breathing,
+            iris: self.iris,
+        }
+    }
 }
 
 /// Veil of one layer-set at time `x` (0..1) inside an exit (0 visible -> 1 hidden) or enter (1 -> 0) phase.
