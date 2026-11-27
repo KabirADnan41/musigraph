@@ -244,6 +244,7 @@ fn fl_total(uv: vec2<f32>) -> f32 {
 
 @fragment
 fn fs(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
+    if (u.ex2.w >= 1.0) { return vec4<f32>(bridge_colour(frag.xy), 1.0); }
     let aspect = u.res.x / u.res.y;
     let p = frag.xy / u.res;
     let dims = vec2<f32>(textureDimensions(dye));
@@ -275,6 +276,7 @@ fn fs(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
     let vc = (p - vec2<f32>(0.5)) * vec2<f32>(1.0, 1.1);
     col *= 1.0 - 0.3 * smoothstep(0.3, 0.9, length(vc) * 1.25);
     col = mode_marker(col, frag, aspect, 0.62);
+    col = veil_global(col, frag.xy);
     // triangular dither (two uniform hashes): no banding in the dark gradients
     col += (hash21(frag.xy) + hash21(frag.xy + vec2<f32>(17.3, 41.9)) - 1.0) / 255.0;
     return vec4<f32>(clamp(col, vec3<f32>(0.0), vec3<f32>(1.0)), 1.0);

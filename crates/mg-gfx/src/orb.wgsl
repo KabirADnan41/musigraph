@@ -77,6 +77,7 @@ fn orb_normal(p: vec3<f32>) -> vec3<f32> {
 
 @fragment
 fn fs(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
+    if (layers_veil() >= 1.0) { return vec4<f32>(bridge_colour(frag.xy), 1.0); }
     let aspect = u.res.x / u.res.y;
     let p = frag.xy / u.res;
     let t = u.time;
@@ -135,7 +136,7 @@ fn fs(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
                    + u.c.w * exp(-u.c.z * 2.0) * smoothstep(0.0, 0.08, u.c.z), 0.2);
             lit += u.pal2.rgb * rf * 0.6 * fres;
             // soft silhouette: grazing rays that end within 0.004..0.02 of the surface blend in (no hard shimmering edge)
-            col = mix(col, lit * expo * 1.25, 1.0 - smoothstep(0.004, 0.02, d));
+            col = mix(col, lit * expo * 1.25, (1.0 - smoothstep(0.004, 0.02, d)) * keep_geom());
         }
     }
 
@@ -144,5 +145,6 @@ fn fs(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
     col *= 1.0 - 0.34 * smoothstep(0.25, 0.85, length(vc) * 1.25);
     col = mode_marker(col, frag, aspect, 0.92);
     col += (hash21(frag.xy) - 0.5) / 255.0;
+    col = veil_layers(col, frag.xy);
     return vec4<f32>(clamp(col, vec3<f32>(0.0), vec3<f32>(1.0)), 1.0);
 }

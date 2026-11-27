@@ -112,7 +112,6 @@ fn render_focus(
             THUMB_SIZE,
             p,
             SceneKind::Focus,
-            None,
             &|enc, view| ov.draw(queue, enc, view, &op),
         )
         .ok();
@@ -142,7 +141,7 @@ pub fn generate(device: &Device, queue: &Queue) -> Thumbs {
             render_focus(&mut scene, device, queue, &mut p)
         } else {
             scene
-                .render_offscreen_scenes(device, queue, THUMB_SIZE, &p, kind, None, &|_, _| {})
+                .render_offscreen_scenes(device, queue, THUMB_SIZE, &p, kind, &|_, _| {})
                 .ok()
         };
         if kind == SceneKind::Fluid {

@@ -71,6 +71,7 @@ fn dust_layer(p: vec2<f32>, aspect: f32, cell: f32, phase: f32, lanes: f32, dens
 
 @fragment
 fn fs(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
+    if (layers_veil() >= 1.0) { return vec4<f32>(bridge_colour(frag.xy), 1.0); }
     let aspect = u.res.x / u.res.y;
     var p = frag.xy / u.res;                       // 0..1, y down
     let t = u.time;
@@ -111,8 +112,8 @@ fn fs(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
     let dens = 0.012 + 0.05 * u.energy;
     let dust = dust_layer(p, aspect, 0.022, u.pal0.w, 1.0, dens, 3.0)
              + 0.6 * dust_layer(p, aspect, 0.040, u.pal0.w, 0.25, dens * 0.8, 9.0);
-    col += mix(u.pal2.rgb, vec3<f32>(1.0), 0.5) * dust * (0.12 + 0.55 * glow) * mix(1.0, 0.3, below);
-    col += spectrum(p.x, d_up, glow);
+    col += mix(u.pal2.rgb, vec3<f32>(1.0), 0.5) * dust * (0.12 + 0.55 * glow) * mix(1.0, 0.3, below) * keep_part();
+    col += spectrum(p.x, d_up, glow) * keep_geom();
 
     // ---- reflection and ring ripples below the horizon -------------------------------------
     if (p.y > yh) {
@@ -120,7 +121,7 @@ fn fs(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
         let ring_amp = max(u.c.y * exp(-u.c.x / 0.8), u.c.w * exp(-u.c.z / 0.8));
         let ripple = 0.0022 * sin(dr * 70.0 - t * 1.6) * (0.25 + 3.0 * ring_amp);
         let fade = exp(-dr * 9.0) * 0.30;
-        col += spectrum(p.x + ripple, dr * 1.15, glow * 0.6) * fade;
+        col += spectrum(p.x + ripple, dr * 1.15, glow * 0.6) * fade * keep_geom();
         // expanding elliptical rings on the water plane (impulses affect geometry/glow only, never colour)
         let qd = vec2<f32>((p.x - 0.5) * aspect, dr * aspect * 2.4);
         let r = length(qd);
@@ -128,7 +129,7 @@ fn fs(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
         let r2 = u.c.z * 0.55;
         let ring1 = exp(-sq((r - r1) / 0.035)) * u.c.y * exp(-u.c.x / 0.8);
         let ring2 = exp(-sq((r - r2) / 0.035)) * u.c.w * exp(-u.c.z / 0.8);
-        col += u.pal2.rgb * (ring1 + ring2) * 1.0 * smoothstep(0.0, 0.02, dr);
+        col += u.pal2.rgb * (ring1 + ring2) * 1.0 * smoothstep(0.0, 0.02, dr) * keep_geom();
     }
 
     // ---- vignette, mode markers, tone map -------------------------------------------------------
@@ -146,5 +147,6 @@ fn fs(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
     }
     var outc = aces(col * 1.05);
     outc += (hash21(frag.xy) - 0.5) / 255.0;        // dither against gradient banding
+    outc = veil_layers(outc, frag.xy);
     return vec4<f32>(outc, 1.0);
 }

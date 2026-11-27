@@ -31,6 +31,7 @@ fn ribbon(i: i32, xw: f32, p: vec2<f32>, glow: f32, swell: f32) -> vec3<f32> {
 
 @fragment
 fn fs(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
+    if (layers_veil() >= 1.0) { return vec4<f32>(bridge_colour(frag.xy), 1.0); }
     let aspect = u.res.x / u.res.y;
     let p = frag.xy / u.res;                    // 0..1, y down
     let t = u.time;
@@ -57,8 +58,8 @@ fn fs(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
     let sf = fract(sg) - vec2<f32>(0.5);
     let star = step(0.992, hash21(sid)) * (1.0 - smoothstep(0.0, 0.12, length(sf)))
         * (0.5 + 0.5 * sin(t * 0.6 + hash21(sid + 3.0) * 6.2831853));
-    col += mix(u.pal2.rgb, vec3<f32>(1.0), 0.6) * star * 0.5 * (1.0 - clamp(lum * 3.0, 0.0, 1.0));
-    col += total;
+    col += mix(u.pal2.rgb, vec3<f32>(1.0), 0.6) * star * 0.5 * (1.0 - clamp(lum * 3.0, 0.0, 1.0)) * keep_part();
+    col += total * keep_geom();
 
     // ridge silhouette
     let ridge = 0.86 + 0.03 * (vnoise(vec2<f32>(p.x * aspect * 3.0, 1.0)) - 0.5) * 2.0
@@ -72,5 +73,6 @@ fn fs(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
     col *= 1.0 - 0.30 * smoothstep(0.25, 0.85, length(vc) * 1.25);
     col = mode_marker(col, frag, aspect, 0.9);
     col += (hash21(frag.xy) - 0.5) / 255.0;
+    col = veil_layers(col, frag.xy);
     return vec4<f32>(clamp(col, vec3<f32>(0.0), vec3<f32>(1.0)), 1.0);
 }

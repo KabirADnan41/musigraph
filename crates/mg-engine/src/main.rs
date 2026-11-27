@@ -18,6 +18,7 @@ mod scene_run;
 mod scene_switch;
 mod scene_thumbs;
 mod selftest;
+mod selftest_transition;
 mod sim;
 
 use std::io::Write as _;
