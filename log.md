@@ -313,3 +313,23 @@ Untested: real music (thresholds PRESENT_*, 2x median, SEED_S tuned on synthetic
 - Limitations: tuned on synthetic fixtures only; kick/hats energy margin is smaller than before; the 9 kHz veil is soft (laminar), not filamentary; regrid resample not checked in a live window; leakage discount may under-read a 100-200 Hz bass under loud 250-500 Hz content. Independent review (section 27) pending.
 ## 2026-11-27 - Correction to the entry "Fix independent-review findings (seek, overlay contrast, HITCH, capture ms)"
 The mg-media test count there should read 33 for commit 3eb9341 (36 included 3 uncommitted display.rs tests). Corrective re-review of 3eb9341: PASS WITH SUGGESTIONS (all 7 findings resolved). Deferred LOW: the focus ring pops off on fade-out; the focused progress backing margin at scale <1 (BACKLOG CB1).
+
+## 2026-11-27 - Album Focus slice, part 0: typography engine + display-only metadata (main session)
+- Branch: feature/poc-audio-fullscreen. Commit: the one following 2c61845. Part of the Album Focus/typography slice; the slice review covers it.
+- **mg-text lib.rs / dwrite.rs:**
+  - `Cut::{Display, Text}`, probing the "Segoe UI Variable Display/Text" families (Segoe UI fallback; `has_variable_cuts()`).
+  - LineStyle gains `max_lines`: 1 keeps the old no-wrap per-character trimming; 2..=4 gives word wrap with emergency break and a word-granularity ellipsis.
+  - LineStyle also gains `tracking_em` (Latin/Greek/Cyrillic only, `tracking_safe`), `line_height` and `cut`, plus a Default.
+  - RTL reading direction from the first strong character (`is_rtl`).
+  - Drawing now uses the text layout (DrawTextLayout) with its max width set to the ink width, so tracking applies and RTL/right-aligned ink stays inside the bitmap.
+  - windows_numerics::Vector2 is not re-exported by `windows`, so the origin is built by a size-checked transmute under a scoped, justified clippy allow rather than adding a direct dependency.
+- **mg-media display.rs (new):** `display_meta(title, artist)`, display only:
+  - version suffixes (remaster, radio edit, live, deluxe...) move to a meta line;
+  - feat. credits move to the artist line;
+  - more than 3 artists become "A, B & N more";
+  - the title is never emptied; raw strings for matching are unchanged.
+- **presentation.rs:** LineStyle literals use `..Default::default()`; behaviour is unchanged.
+- **Verification:**
+  - mg-text 8 tests (new: wrapping bounds incl. CJK, Latin-only tracking, RTL ink inside the bitmap, both cuts render); mg-media 36 (3 new display tests).
+  - fmt check and clippy (mg-text, mg-media, mg-engine) clean.
+  - Not verified: the Segoe UI fallback path (this machine has the variable cuts), and on-screen use (part 1 wires it in).

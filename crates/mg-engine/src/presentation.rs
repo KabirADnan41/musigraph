@@ -739,6 +739,7 @@ pub fn process_text(r: &mg_text::TextRenderer, t: &TextJob) -> Ready {
                 px,
                 weight,
                 max_width: t.max_width,
+                ..Default::default()
             },
         )
     };
@@ -782,6 +783,7 @@ pub fn process_line(
                 px,
                 weight: 500,
                 max_width,
+                ..Default::default()
             },
         )
     });
@@ -835,6 +837,7 @@ pub fn process_job(text: Option<&mg_text::TextRenderer>, job: Job) -> Ready {
                         px,
                         weight: 500,
                         max_width: (px * 10.0) as u32,
+                        ..Default::default()
                     },
                 )
             }),

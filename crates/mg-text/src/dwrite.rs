@@ -5,20 +5,22 @@
 //! API (stride x height checked against the buffer size). COM is initialised per thread (MTA) and released when
 //! the renderer is dropped (after its interfaces); keep the renderer on the thread that created it.
 
-use crate::{LineStyle, MAX_SIDE, TextBitmap, bound_text};
+use crate::{Cut, LineStyle, MAX_SIDE, TextBitmap, bound_text, is_rtl, tracking_safe};
 use windows::Win32::Graphics::Direct2D::Common::{
-    D2D_RECT_F, D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_PIXEL_FORMAT,
+    D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_PIXEL_FORMAT,
 };
 use windows::Win32::Graphics::Direct2D::{
-    D2D1_DRAW_TEXT_OPTIONS_NONE, D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_FEATURE_LEVEL_DEFAULT,
+    D2D1_DRAW_TEXT_OPTIONS_CLIP, D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_FEATURE_LEVEL_DEFAULT,
     D2D1_RENDER_TARGET_PROPERTIES, D2D1_RENDER_TARGET_TYPE_DEFAULT, D2D1_RENDER_TARGET_USAGE_NONE,
     D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE, D2D1CreateFactory, ID2D1Factory,
 };
 use windows::Win32::Graphics::DirectWrite::{
     DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL,
-    DWRITE_FONT_WEIGHT, DWRITE_MEASURING_MODE_NATURAL, DWRITE_TEXT_METRICS, DWRITE_TRIMMING,
-    DWRITE_TRIMMING_GRANULARITY_CHARACTER, DWRITE_WORD_WRAPPING_NO_WRAP, DWriteCreateFactory,
-    IDWriteFactory,
+    DWRITE_FONT_WEIGHT, DWRITE_LINE_SPACING_METHOD_UNIFORM, DWRITE_READING_DIRECTION_RIGHT_TO_LEFT,
+    DWRITE_TEXT_METRICS, DWRITE_TEXT_RANGE, DWRITE_TRIMMING, DWRITE_TRIMMING_GRANULARITY_CHARACTER,
+    DWRITE_TRIMMING_GRANULARITY_WORD, DWRITE_WORD_WRAPPING_EMERGENCY_BREAK,
+    DWRITE_WORD_WRAPPING_NO_WRAP, DWRITE_WORD_WRAPPING_WRAP, DWriteCreateFactory, IDWriteFactory,
+    IDWriteFontCollection, IDWriteTextLayout1,
 };
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows::Win32::Graphics::Imaging::{
@@ -28,9 +30,33 @@ use windows::Win32::Graphics::Imaging::{
 use windows::Win32::System::Com::{
     CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoUninitialize,
 };
-use windows::core::{PCWSTR, w};
+use windows::core::Interface;
+use windows::core::{BOOL, PCWSTR, w};
 
-const FAMILY: PCWSTR = w!("Segoe UI");
+const FALLBACK: PCWSTR = w!("Segoe UI");
+const VAR_DISPLAY: PCWSTR = w!("Segoe UI Variable Display");
+const VAR_TEXT: PCWSTR = w!("Segoe UI Variable Text");
+
+/// `name` if the system font collection has that family, else the Segoe UI fallback.
+///
+/// # Safety
+/// `dw` must be a live factory; `name` a static NUL-terminated string.
+unsafe fn probe_family(dw: &IDWriteFactory, name: PCWSTR) -> PCWSTR {
+    let mut coll: Option<IDWriteFontCollection> = None;
+    let (mut idx, mut exists) = (0u32, BOOL(0));
+    // SAFETY: out-pointers are locals that outlive the calls.
+    let found = unsafe {
+        dw.GetSystemFontCollection(&mut coll, false).is_ok()
+            && coll
+                .as_ref()
+                .is_some_and(|c| c.FindFamilyName(name, &mut idx, &mut exists).is_ok())
+    };
+    if found && exists.as_bool() {
+        name
+    } else {
+        FALLBACK
+    }
+}
 
 /// Uninitialises COM on drop; owned by `TextRenderer` as its last field so it runs after the interfaces.
 struct ComGuard(bool);
@@ -48,6 +74,9 @@ pub struct TextRenderer {
     d2d: ID2D1Factory,
     dwrite: IDWriteFactory,
     wic: IWICImagingFactory,
+    /// Resolved once at startup: Segoe UI Variable Display/Text, or Segoe UI where missing.
+    display: PCWSTR,
+    text: PCWSTR,
     /// Declared last so COM is uninitialised only after every interface above has been released.
     _com: ComGuard,
 }
@@ -67,15 +96,31 @@ impl TextRenderer {
                 CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER).ok()?;
             (d2d, dwrite, wic)
         };
+        // SAFETY: live factory, static names.
+        let (display, text) = unsafe {
+            (
+                probe_family(&dwrite, VAR_DISPLAY),
+                probe_family(&dwrite, VAR_TEXT),
+            )
+        };
         Some(Self {
             d2d,
             dwrite,
             wic,
+            display,
+            text,
             _com: guard,
         })
     }
 
-    /// Renders one line of text. `None` for empty/whitespace-only text or on any API failure.
+    /// True when the Segoe UI Variable cuts were found (false = Segoe UI fallback, e.g. Windows 10).
+    pub fn has_variable_cuts(&self) -> bool {
+        self.display != FALLBACK && self.text != FALLBACK
+    }
+
+    /// Renders one line (or, with `max_lines > 1`, a wrapped block) of text. `None` for empty/whitespace-only
+    /// text or on any API failure. RTL text (see `is_rtl`) is laid out right-to-left and right-aligned in the
+    /// bitmap; the bitmap is cropped to the ink box so callers align it to their column's start edge.
     pub fn render_line(&self, text: &str, style: &LineStyle) -> Option<TextBitmap> {
         let text = bound_text(text);
         if text.trim().is_empty() || !style.px.is_finite() || style.px < 4.0 || style.px > 400.0 {
@@ -83,14 +128,24 @@ impl TextRenderer {
         }
         let pad = (style.px * 0.3).ceil() as u32;
         let max_text_w = style.max_width.clamp(8, MAX_SIDE - 2 * pad);
+        let lines = style.max_lines.clamp(1, 4);
+        let lh = if style.line_height.is_finite() && style.line_height >= 0.8 {
+            style.line_height.min(2.0)
+        } else {
+            1.2
+        };
         let wide: Vec<u16> = text.encode_utf16().collect();
+        let family = match style.cut {
+            Cut::Display => self.display,
+            Cut::Text => self.text,
+        };
         // SAFETY: all calls below use interfaces owned by `self`/locals with valid arguments; the pixel
         // buffer is read only while the WIC lock is alive and only within the length the API reports.
         unsafe {
             let fmt = self
                 .dwrite
                 .CreateTextFormat(
-                    FAMILY,
+                    family,
                     None,
                     DWRITE_FONT_WEIGHT(i32::from(style.weight.clamp(100, 900))),
                     DWRITE_FONT_STYLE_NORMAL,
@@ -99,27 +154,68 @@ impl TextRenderer {
                     w!(""),
                 )
                 .ok()?;
-            fmt.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP).ok()?;
+            if is_rtl(text) {
+                fmt.SetReadingDirection(DWRITE_READING_DIRECTION_RIGHT_TO_LEFT)
+                    .ok()?;
+            }
+            let granularity = if lines == 1 {
+                fmt.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP).ok()?;
+                DWRITE_TRIMMING_GRANULARITY_CHARACTER
+            } else {
+                // emergency break keeps space-less runs (CJK, URLs) inside the column; older systems: wrap
+                if fmt
+                    .SetWordWrapping(DWRITE_WORD_WRAPPING_EMERGENCY_BREAK)
+                    .is_err()
+                {
+                    fmt.SetWordWrapping(DWRITE_WORD_WRAPPING_WRAP).ok()?;
+                }
+                fmt.SetLineSpacing(
+                    DWRITE_LINE_SPACING_METHOD_UNIFORM,
+                    style.px * lh,
+                    style.px * lh * 0.8,
+                )
+                .ok()?;
+                DWRITE_TRIMMING_GRANULARITY_WORD
+            };
             let sign = self.dwrite.CreateEllipsisTrimmingSign(&fmt).ok()?;
             let trimming = DWRITE_TRIMMING {
-                granularity: DWRITE_TRIMMING_GRANULARITY_CHARACTER,
+                granularity,
                 delimiter: 0,
                 delimiterCount: 0,
             };
             fmt.SetTrimming(&trimming, &sign).ok()?;
+            let box_h = if lines == 1 {
+                style.px * 3.0
+            } else {
+                style.px * lh * f32::from(lines)
+            };
             let layout = self
                 .dwrite
-                .CreateTextLayout(&wide, &fmt, max_text_w as f32, style.px * 3.0)
+                .CreateTextLayout(&wide, &fmt, max_text_w as f32, box_h)
                 .ok()?;
+            if style.tracking_em != 0.0 && style.tracking_em.is_finite() && tracking_safe(text) {
+                let sp = style.tracking_em.clamp(-0.05, 0.2) * style.px;
+                let range = DWRITE_TEXT_RANGE {
+                    startPosition: 0,
+                    length: wide.len() as u32,
+                };
+                if let Ok(l1) = layout.cast::<IDWriteTextLayout1>() {
+                    l1.SetCharacterSpacing(sp * 0.5, sp * 0.5, 0.0, range)
+                        .ok()?;
+                }
+            }
             let mut m = DWRITE_TEXT_METRICS::default();
             layout.GetMetrics(&mut m).ok()?;
-            let w = (m
+            let ink_w = (m
                 .widthIncludingTrailingWhitespace
                 .min(max_text_w as f32)
                 .ceil() as u32)
-                .max(1)
-                + 2 * pad;
-            let h = (m.height.ceil() as u32).max(1) + 2 * pad;
+                .max(1);
+            // draw in a box exactly as wide as the text so RTL/right-aligned lines land inside the bitmap
+            layout.SetMaxWidth(ink_w as f32).ok()?;
+            layout.GetMetrics(&mut m).ok()?;
+            let w = ink_w + 2 * pad;
+            let h = (m.height.min(box_h).ceil() as u32).max(1) + 2 * pad;
             if w > MAX_SIDE || h > MAX_SIDE {
                 return None;
             }
@@ -155,20 +251,12 @@ impl TextRenderer {
                 b: 0.0,
                 a: 0.0,
             }));
-            let area = D2D_RECT_F {
-                left: pad as f32,
-                top: pad as f32,
-                right: (pad + max_text_w) as f32,
-                bottom: h as f32,
-            };
-            rt.DrawText(
-                &wide,
-                &fmt,
-                &area,
-                &brush,
-                D2D1_DRAW_TEXT_OPTIONS_NONE,
-                DWRITE_MEASURING_MODE_NATURAL,
-            );
+            // The origin type (windows_numerics::Vector2, repr(C) {X: f32, Y: f32}) is not re-exported by the
+            // `windows` crate; build it from two f32s rather than adding a direct dependency.
+            #[allow(clippy::missing_transmute_annotations)]
+            // the target type cannot be named, see above
+            let origin = std::mem::transmute::<[f32; 2], _>([pad as f32, pad as f32]);
+            rt.DrawTextLayout(origin, &layout, &brush, D2D1_DRAW_TEXT_OPTIONS_CLIP);
             rt.EndDraw(None, None).ok()?;
 
             let rect = WICRect {
@@ -212,6 +300,7 @@ mod tests {
             px: 40.0,
             weight: 600,
             max_width,
+            ..LineStyle::default()
         }
     }
 
@@ -262,6 +351,102 @@ mod tests {
         assert!(right, "ellipsis expected at the trimmed end");
     }
 
+    fn ink_cols(b: &TextBitmap) -> (usize, usize) {
+        let w = b.width as usize;
+        let cols: Vec<usize> = (0..w)
+            .filter(|&x| (0..b.height as usize).any(|y| b.coverage[y * w + x] > 24))
+            .collect();
+        (cols[0], *cols.last().unwrap())
+    }
+
+    #[test]
+    fn wrapping_is_opt_in_bounded_by_lines_and_width() {
+        let r = TextRenderer::new().unwrap();
+        let title = "An extremely long song title that will certainly need two lines here and more";
+        let one = r.render_line(title, &style(600)).unwrap();
+        let two = r
+            .render_line(
+                title,
+                &LineStyle {
+                    max_lines: 2,
+                    line_height: 1.1,
+                    ..style(600)
+                },
+            )
+            .unwrap();
+        let adv = 40.0 * 1.1;
+        let body = |b: &TextBitmap| (b.height - 2 * b.pad) as f32;
+        assert!(body(&one) < adv * 1.6, "default stays one line");
+        assert!(
+            body(&two) > adv * 1.6 && body(&two) <= adv * 2.0 + 1.0,
+            "two lines, never three: {}",
+            body(&two)
+        );
+        assert!(two.width <= 600 + 2 * two.pad);
+        // a CJK run without spaces still wraps inside the column (emergency break / CJK line breaking)
+        let cjk = r
+            .render_line(
+                &"歌曲の名前".repeat(30),
+                &LineStyle {
+                    max_lines: 2,
+                    ..style(500)
+                },
+            )
+            .unwrap();
+        assert!(cjk.width <= 500 + 2 * cjk.pad && body(&cjk) > 40.0 * 1.6);
+    }
+
+    #[test]
+    fn tracking_applies_to_latin_only_and_rtl_ink_stays_inside() {
+        let r = TextRenderer::new().unwrap();
+        let tracked = |s: &str, em: f32| {
+            r.render_line(
+                s,
+                &LineStyle {
+                    tracking_em: em,
+                    ..style(2000)
+                },
+            )
+            .unwrap()
+            .width
+        };
+        assert!(tracked("Midnight City", -0.04) < tracked("Midnight City", 0.0));
+        assert_eq!(
+            tracked("مرحبا بالعالم", -0.04),
+            tracked("مرحبا بالعالم", 0.0)
+        );
+        for s in ["مرحبا بالعالم", "שלום עולם"] {
+            let b = r
+                .render_line(
+                    s,
+                    &LineStyle {
+                        max_lines: 2,
+                        ..style(1200)
+                    },
+                )
+                .unwrap();
+            let (l, rt) = ink_cols(&b);
+            assert!(
+                l >= b.pad as usize - 2 && rt <= (b.width - b.pad) as usize + 2,
+                "{s}: ink {l}..{rt} in width {} pad {}",
+                b.width,
+                b.pad
+            );
+        }
+    }
+
+    #[test]
+    fn display_and_text_cuts_both_render() {
+        let r = TextRenderer::new().unwrap();
+        for cut in [Cut::Display, Cut::Text] {
+            let b = r
+                .render_line("Album Focus", &LineStyle { cut, ..style(2000) })
+                .unwrap();
+            assert!(b.ink() > 200);
+        }
+        eprintln!("variable cuts available: {}", r.has_variable_cuts());
+    }
+
     #[test]
     fn empty_and_absurd_requests_are_refused() {
         let r = TextRenderer::new().unwrap();
@@ -271,6 +456,7 @@ mod tests {
             px,
             weight: 400,
             max_width: 100,
+            ..LineStyle::default()
         };
         assert!(r.render_line("x", &bad(f32::NAN)).is_none());
         assert!(r.render_line("x", &bad(5000.0)).is_none());

@@ -22,6 +22,7 @@ pub use art::decode_art;
 pub use session::NowPlayingWatcher;
 
 pub mod control;
+pub mod display;
 pub mod lrc;
 pub mod palette;
 pub mod synth;
