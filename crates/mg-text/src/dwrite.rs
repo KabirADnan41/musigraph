@@ -482,7 +482,7 @@ mod tests {
             .unwrap()
             .width
         };
-        assert!(tracked("Midnight City", -0.04) < tracked("Midnight City", 0.0));
+        assert!(tracked("Midnight Harbour", -0.04) < tracked("Midnight Harbour", 0.0));
         assert_eq!(
             tracked("مرحبا بالعالم", -0.04),
             tracked("مرحبا بالعالم", 0.0)
@@ -526,8 +526,8 @@ mod tests {
         let fb = TextRenderer::new_forced_fallback().unwrap();
         assert!(!fb.has_variable_cuts());
         for s in [
-            "Midnight City",
-            "Bohemian Rhapsody (Live at Wembley)",
+            "Midnight Harbour",
+            "The Lantern Parade (Live at the Pier)",
             "مرحبا بالعالم",
             "歌曲の名前",
             "আমার সোনার বাংলা",
