@@ -647,3 +647,10 @@ The mg-media test count there should read 33 for commit 3eb9341 (36 included 3 u
 - **LOW (unenforced claim):** the test now ASSERTS the fallback width is within 3% of the variable cuts (when the machine has them), instead of only printing. Measured earlier: <=1.4%.
 - **Deferred LOW (reviewer):** version-suffix stripping also moves bracketed/dashed titles like "Song (Live and Let Die)" to the meta line (cosmetic; raw title for lyrics untouched); pad-on-pink-noise still raises bass_emit (0.75 -> 0.94; gate bounds leakage but cannot subtract it from real noise); focus ring absent during fade-in (CB2); scissor overdraw ~3s px; no test for relative/empty APPDATA (env mutation is racy in tests).
 - Checks: mg-text 8 pass in debug AND release; clippy clean.
+
+## 2026-11-28 - G1: release-mode tests and release build in the verification gate (owner approved)
+- Branch feature/poc-audio-fullscreen (base 0ce4974). Only `scripts/verify.ps1` changed (plus BACKLOG G1 status and CLAUDE.md section 28 wording).
+- Added `Step 'test (release)' { cargo test --workspace --release --locked }` after the debug test step and `Step 'build (release)' { cargo build --workspace --release --locked }` after the debug build. All existing steps and debug tests are kept; the existing `Step` helper throws on a nonzero `$LASTEXITCODE`, so a release failure fails the gate. No new dependency.
+- Why: the has_variable_cuts pointer-compare bug passed debug tests and failed only in release (`mg-text` test `fallback...`).
+- Trade-off: the gate is slower (a second full compile of the workspace in release profile).
+- Verification: to be recorded after the full gate on the final commit (not yet run at the time of this entry). Independent review: pending.

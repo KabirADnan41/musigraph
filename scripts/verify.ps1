@@ -16,7 +16,10 @@ function Find-Tool($cmd, $rel) { $c = Get-Command $cmd -ErrorAction SilentlyCont
 Step 'fmt'    { cargo fmt --all -- --check }
 Step 'clippy' { cargo clippy --workspace --all-targets --locked -- -D warnings }
 Step 'test'   { cargo test --workspace --locked }
+# G1: release-mode tests too; optimised builds have failed where debug passed (font-family check, 2026-11-28).
+Step 'test (release)' { cargo test --workspace --release --locked }
 Step 'build'  { cargo build --workspace --locked }
+Step 'build (release)' { cargo build --workspace --release --locked }
 Step 'run engine skeleton' { cargo run --locked -q -p mg-engine }
 & {
 $ErrorActionPreference = 'Stop'
