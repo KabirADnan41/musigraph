@@ -13,8 +13,10 @@ mod music_summary;
 mod nowplaying;
 mod presentation;
 mod scene_map;
+mod scene_panel;
 mod scene_run;
 mod scene_switch;
+mod scene_thumbs;
 mod selftest;
 mod sim;
 

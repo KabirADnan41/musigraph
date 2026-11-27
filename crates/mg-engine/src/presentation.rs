@@ -382,6 +382,10 @@ pub enum Job {
         text: String,
         px: f32,
     },
+    /// Render the scene panel's labels (atlas label cells) at this UI scale.
+    PanelLabels {
+        scale: f32,
+    },
 }
 
 pub enum Ready {
@@ -414,6 +418,11 @@ pub enum Ready {
         slot: usize,
         bitmap: Option<TextBitmap>,
     },
+    /// The scene panel's label bitmaps by atlas label cell (None = could not be rendered).
+    PanelLabels {
+        scale: f32,
+        cells: Box<[Option<TextBitmap>; mg_gfx::overlay::LABEL_CELLS]>,
+    },
 }
 
 /// What the GPU side must do (applied by the render loop; uploads happen once per track change).
@@ -426,6 +435,10 @@ pub enum GpuOp {
     ClearPrevArt,
     SetText(usize, TextBitmap),
     ClearText(usize),
+    /// Scene-panel thumbnails (one sRGB RGBA8 picture per scene index, made once by `scene_thumbs`).
+    SetThumbs(Box<crate::scene_thumbs::Thumbs>),
+    /// Scene-panel label bitmaps (one per atlas label cell), written into the atlas.
+    SetPanelLabels(Box<[Option<TextBitmap>; mg_gfx::overlay::LABEL_CELLS]>),
 }
 
 impl GpuOp {
@@ -463,6 +476,20 @@ impl GpuOp {
                 ov.set_text(device, queue, i, (b.width, b.height), &b.coverage);
             }
             GpuOp::ClearText(i) => ov.clear_text(device, i),
+            GpuOp::SetPanelLabels(cells) => {
+                for (i, b) in cells.iter().enumerate() {
+                    if let Some(b) = b {
+                        ov.set_panel_label(device, queue, i, (b.width, b.height), &b.coverage);
+                    }
+                }
+            }
+            GpuOp::SetThumbs(t) => {
+                for (i, img) in t.iter().enumerate() {
+                    if let Some(img) = img {
+                        ov.set_panel_thumb(device, queue, i, img);
+                    }
+                }
+            }
         }
     }
 }
@@ -1222,7 +1249,7 @@ impl Presentation {
     pub fn on_ready(&mut self, r: Ready) {
         match r {
             r @ (Ready::Lyrics { .. } | Ready::Line { .. }) => self.lyrics.on_ready(r),
-            Ready::Clock { .. } => {} // the control bar owns these (controls.rs)
+            Ready::Clock { .. } | Ready::PanelLabels { .. } => {} // owned by controls.rs / scene_panel.rs
             Ready::Art {
                 track_id,
                 image,
@@ -2011,6 +2038,10 @@ pub fn process_job(text: Option<&mg_text::TextRenderer>, job: Job) -> Ready {
                 )
             }),
         },
+        Job::PanelLabels { scale } => Ready::PanelLabels {
+            scale,
+            cells: Box::new(crate::scene_panel::render_labels(text, scale)),
+        },
     }
 }
 
@@ -2025,7 +2056,7 @@ fn run_worker(rx: Receiver<Job>, tx: Sender<Ready>) {
                 Job::Art { .. } => art = Some(j),
                 Job::Text(_) => txt = Some(j),
                 Job::Lyrics { .. } => lyr = Some(j),
-                Job::Line { .. } | Job::Clock { .. } => lines.push(j),
+                Job::Line { .. } | Job::Clock { .. } | Job::PanelLabels { .. } => lines.push(j),
             }
         }
         // cheap, visible things first; the (bounded but slower) artwork decode last
@@ -2254,7 +2285,7 @@ mod tests {
                     idx,
                     bitmap: Some(fake(&style).bitmap),
                 },
-                Job::Clock { .. } => continue,
+                Job::Clock { .. } | Job::PanelLabels { .. } => continue,
             };
             p.on_ready(r);
         }

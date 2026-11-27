@@ -5,7 +5,7 @@ use crate::report::block_on;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-pub use wgpu::{Device, PresentMode, Queue};
+pub use wgpu::{Device, PresentMode, Queue, TextureFormat};
 
 /// Backend requested by the caller. Explicit on purpose: no silent fallback between backends.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -128,6 +128,77 @@ pub struct Headless {
 /// resource limit of the machine, not a defect to hide, so the devices are serialised instead.
 static HEADLESS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// Runs `f` inside Validation and OutOfMemory error scopes: an error raised by its GPU work comes back as `Err`
+/// instead of reaching the uncaptured-error handler (which ends the app). Blocks only to read the scope results.
+pub fn with_error_scope<T>(device: &Device, f: impl FnOnce() -> T) -> Result<T, String> {
+    let validation = device.push_error_scope(wgpu::ErrorFilter::Validation);
+    let oom = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+    let value = f();
+    let (o, v) = (block_on(oom.pop()), block_on(validation.pop()));
+    match (v, o) {
+        (None, None) => Ok(value),
+        (v, o) => Err(v.or(o).map_or_else(String::new, |e| e.to_string())),
+    }
+}
+
+/// Waits (at most 10 s) until the GPU finished everything submitted so far, so dropped resources are freed.
+/// For startup work only: never call it from the frame loop.
+pub fn wait_idle(device: &Device) {
+    let _ = device.poll(wgpu::PollType::Wait {
+        submission_index: None,
+        timeout: Some(std::time::Duration::from_secs(10)),
+    });
+}
+
+/// Test hook: provokes a wgpu validation error (a zero-sized texture), to prove an error scope catches it.
+#[doc(hidden)]
+pub fn invalid_texture(device: &Device) -> wgpu::Texture {
+    device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("invalid on purpose"),
+        size: wgpu::Extent3d {
+            width: 0,
+            height: 1,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    })
+}
+
+/// Records a pass that clears `view` to a uniform grey `v` (tests and the self-test: a known backdrop under overlays).
+pub fn clear_view(enc: &mut wgpu::CommandEncoder, view: &wgpu::TextureView, v: f64) {
+    drop(enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+        label: Some("backdrop"),
+        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+            view,
+            depth_slice: None,
+            resolve_target: None,
+            ops: wgpu::Operations {
+                load: wgpu::LoadOp::Clear(wgpu::Color {
+                    r: v,
+                    g: v,
+                    b: v,
+                    a: 1.0,
+                }),
+                store: wgpu::StoreOp::Store,
+            },
+        })],
+        depth_stencil_attachment: None,
+        timestamp_writes: None,
+        occlusion_query_set: None,
+        multiview_mask: None,
+    }));
+}
+/// Live GPU allocations in bytes where the backend reports them (diagnostics and tests).
+pub fn allocated_bytes(device: &Device) -> Option<u64> {
+    device
+        .generate_allocator_report()
+        .map(|r| r.total_allocated_bytes)
+}
 /// Creates a headless hardware device using the first backend of `AUTO_ORDER` that works.
 /// Software adapters are rejected, so tests can never silently measure a CPU renderer.
 pub fn init_headless() -> Result<Headless, String> {

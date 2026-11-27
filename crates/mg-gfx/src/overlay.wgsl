@@ -215,10 +215,8 @@ fn icon_cov(id: u32, u: vec2<f32>, fw: f32) -> f32 {
         d = sd_tri(u - vec2<f32>(0.08, 0.0), vec2<f32>(-0.5, -0.66), vec2<f32>(-0.5, 0.66), vec2<f32>(0.62, 0.0)) - 0.08;
     } else if (id == 2u) {          // pause
         d = sd_box(vec2<f32>(abs(u.x) - 0.34, u.y), vec2<f32>(0.17, 0.6)) - 0.07;
-    } else if (id == 4u) {          // next scene: stacked layers
-        let back = abs(sd_box(u - vec2<f32>(-0.2, -0.2), vec2<f32>(0.5, 0.5)) - 0.08) - 0.06;
-        let front = sd_box(u - vec2<f32>(0.22, 0.22), vec2<f32>(0.5, 0.5)) - 0.08;
-        d = min(max(back, -(front - 0.16)), front);
+    } else if (id == 4u) {          // scenes: a 2 x 2 grid of rounded squares
+        d = sd_box(abs(u) - vec2<f32>(0.36), vec2<f32>(0.26)) - 0.08;
     } else if (id == 5u) {          // lyrics: text lines
         let l0 = sd_seg(u, vec2<f32>(-0.7, -0.5), vec2<f32>(0.7, -0.5));
         let l1 = sd_seg(u, vec2<f32>(-0.7, 0.0), vec2<f32>(0.2, 0.0));
@@ -345,4 +343,151 @@ fn fs_controls(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
         o = over(o, c.fg.rgb, te * ta);
     }
     return o;
+}
+
+// ---- scene panel (third draw of the same pass, `fs_panel`, whole surface) --------------------------------------
+// The panel dims the picture a little (black 0.45, 0.65 towards the bottom, no blur: the visualisation keeps
+// running underneath) and floats scene tiles on it. Thumbnails and labels come from ONE atlas (binding 13): the
+// thumbnails above (3 x 2 cells of 256 x 144, cell = scene index), the label cells below (3 x 3 cells of 256 x 64,
+// white with the glyph coverage in alpha, drawn 1:1). Layout constants mirror overlay.rs (THUMB_SIZE, LABEL_SIZE,
+// LABEL_ORIGIN_Y, ATLAS_SIZE; a test checks them). All geometry is final surface pixels computed on the CPU.
+struct P {
+    res: vec4<f32>,       // surface w, h, master alpha, ui scale
+    accent: vec4<f32>,    // accent rgb, heading alpha
+    pill_t: vec4<f32>,    // "Current" text w, h; "EXPERIMENTAL" pill text w, h
+    head: vec4<f32>,      // heading text rect (left, top, w, h); w 0 = none
+    n: vec4<f32>,         // tile count
+    cap: vec4<f32>,       // caption text rect (left, top, w, h); w 0 = none
+    // per tile, 6 vec4: rect (cx, cy, half w, half h); (alpha, hover, selected, focus); (experimental, has thumb,
+    // atlas cell, 0); label rect; "Current" pill (cx, cy, half w, half h); "EXPERIMENTAL" pill
+    t: array<vec4<f32>, 30>,
+};
+@group(0) @binding(13) var atlas_tex: texture_2d<f32>;
+@group(0) @binding(14) var<uniform> pn: P;
+
+const ATLAS_SIZE = vec2<f32>(960.0, 480.0);
+const LABEL_CELL = vec2<f32>(320.0, 64.0);
+const L_CURRENT = 5u;
+const L_PILL = 6u;
+const L_HEADING = 7u;
+const L_CAPTION = 8u;
+// opacities shared with overlay.rs (PANEL_*_ALPHA; a test compares them and computes the contrast from them)
+const SCRIM_TOP = 0.45;
+const SCRIM_BOTTOM = 0.65;
+const PLATE_ALPHA = 0.75;
+const LABEL_ALPHA = 0.92;
+const HEADING_ALPHA = 0.78;
+const PILL_BACK_ALPHA = 0.80;
+const PILL_TEXT_ALPHA = 0.85;
+const KEYLINE_ALPHA = 0.90;
+const THUMB_SIZE = vec2<f32>(256.0, 144.0);
+const LABEL_ORIGIN_Y = 288.0;
+
+// Coverage of atlas label `cell` drawn 1:1 into `rect` (integer left/top; 0 outside or when absent).
+fn label_cov(cell: u32, rect: vec4<f32>, p: vec2<f32>) -> f32 {
+    if (rect.z <= 0.0) { return 0.0; }
+    let q = floor(p - rect.xy);
+    if (q.x < 0.0 || q.y < 0.0 || q.x >= rect.z || q.y >= rect.w) { return 0.0; }
+    let org = vec2<f32>(f32(cell % 3u) * LABEL_CELL.x, LABEL_ORIGIN_Y + f32(cell / 3u) * LABEL_CELL.y);
+    return textureLoad(atlas_tex, vec2<i32>(org + q), 0).a;
+}
+
+// A label bitmap of size `sz` centred on `c` (pixel aligned).
+fn centred(c: vec2<f32>, sz: vec2<f32>) -> vec4<f32> {
+    return vec4<f32>(floor(c - 0.5 * sz + vec2<f32>(0.5)), sz);
+}
+
+// A soft dark plate behind a label so white text keeps its contrast over any scene (pale ones included).
+fn label_plate(dst: vec4<f32>, p: vec2<f32>, rect: vec4<f32>, s: f32, al: f32) -> vec4<f32> {
+    if (rect.z <= 0.0) { return dst; }
+    let half = 0.5 * rect.zw + vec2<f32>(6.0 * s, 6.0 * s);
+    let d = sd_round_box(p - rect.xy - 0.5 * rect.zw, half, min(half.y, 8.0 * s));
+    return over(dst, vec3<f32>(0.0), PLATE_ALPHA * al * (1.0 - smoothstep(-6.0 * s, 3.0 * s, d)));
+}
+
+fn panel_tile(dst: vec4<f32>, p: vec2<f32>, i: u32) -> vec4<f32> {
+    let b = i * 6u;
+    let r = pn.t[b];
+    let v1 = pn.t[b + 1u];
+    let v2 = pn.t[b + 2u];
+    let lab = pn.t[b + 3u];
+    let cp = pn.t[b + 4u];
+    let ep = pn.t[b + 5u];
+    let al = v1.x;
+    if (al <= 0.001 || r.z <= 0.0) { return dst; }
+    let s = pn.res.w;
+    let rad = 10.0 * s;
+    let q = p - r.xy;
+    // cheap reject: only the tile plus its shadow and focus ring (40 design px), or its label, can change this pixel
+    let near_tile = all(abs(q) <= r.zw + vec2<f32>(40.0 * s));
+    let m = 12.0 * s;
+    let near_label = lab.z > 0.0 && p.x >= lab.x - m && p.x < lab.x + lab.z + m && p.y >= lab.y - m && p.y < lab.y + lab.w + m;
+    if (!near_tile && !near_label) { return dst; }
+    let d = sd_round_box(q, r.zw, rad);
+    let inside = cov(d, 0.75);
+    var o2 = dst;
+    // soft shadow under the floating tile (not under the tile itself)
+    o2 = over(o2, vec3<f32>(0.0), 0.40 * al * box_shadow(p, r.xy + vec2<f32>(0.0, 6.0 * s), r.zw, rad, 18.0 * s) * (1.0 - inside));
+    // thumbnail (or a clean placeholder), experimental tiles desaturated to 0.70, brightness 0.80 -> 1.0
+    let uv01 = clamp(q / (2.0 * r.zw) + vec2<f32>(0.5), vec2<f32>(0.0), vec2<f32>(1.0));
+    var tex = mix(vec3<f32>(0.045, 0.05, 0.06), vec3<f32>(0.11, 0.12, 0.14), uv01.y);
+    if (v2.y > 0.5) {
+        let cell = u32(v2.z + 0.5);
+        let org = vec2<f32>(f32(cell % 3u) * THUMB_SIZE.x, f32(cell / 3u) * THUMB_SIZE.y);
+        let t = clamp(uv01 * THUMB_SIZE, vec2<f32>(0.5), THUMB_SIZE - vec2<f32>(0.5));
+        tex = textureSampleLevel(atlas_tex, smp, (org + t) / ATLAS_SIZE, 0.0).rgb;
+    }
+    let luma = dot(tex, vec3<f32>(0.2126, 0.7152, 0.0722));
+    tex = mix(vec3<f32>(luma), tex, mix(1.0, 0.70, v2.x));
+    tex = tex * mix(0.80, 1.0, max(v1.y, v1.z));
+    o2 = over(o2, tex, inside * al);
+    // 1 px stroke (white 0.12 at rest, 0.35 on hover)
+    let ring = 1.0 - smoothstep(0.0, 1.0, abs(d + 0.5) - 0.5);
+    o2 = over(o2, vec3<f32>(1.0), mix(0.12, 0.35, v1.y) * ring * al);
+    // current scene: 2 px accent outline just inside the edge (and the "Current" pill: not colour alone)
+    o2 = over(o2, pn.accent.rgb, v1.z * cov(abs(d + s) - s, 0.75) * al);
+    if (v1.z > 0.5 && cp.z > 0.0) {
+        o2 = over(o2, pn.accent.rgb, cov(sd_round_box(p - cp.xy, cp.zw, cp.w), 0.75) * al);
+        o2 = over(o2, vec3<f32>(0.03, 0.035, 0.04), label_cov(L_CURRENT, centred(cp.xy, pn.pill_t.xy), p) * al);
+    }
+    // experimental: a small outlined pill, neutral colours (no warning colours)
+    if (v2.x > 0.5 && ep.z > 0.0) {
+        let pd = sd_round_box(p - ep.xy, ep.zw, ep.w);
+        o2 = over(o2, vec3<f32>(0.0), PILL_BACK_ALPHA * cov(pd, 0.75) * al);
+        o2 = over(o2, vec3<f32>(1.0), 0.30 * (1.0 - smoothstep(0.0, 1.0, abs(pd + 0.5) - 0.5)) * al);
+        o2 = over(o2, vec3<f32>(1.0), PILL_TEXT_ALPHA * label_cov(L_PILL, centred(ep.xy, pn.pill_t.zw), p) * al);
+    }
+    // label below the tile: a soft plate, a light shadow, then white
+    o2 = label_plate(o2, p, lab, s, al);
+    let cell = u32(v2.z + 0.5);
+    o2 = over(o2, vec3<f32>(0.0), 0.5 * label_cov(cell, lab + vec4<f32>(0.0, 1.0, 0.0, 0.0), p) * al);
+    o2 = over(o2, vec3<f32>(1.0), LABEL_ALPHA * label_cov(cell, lab, p) * al);
+    // keyboard focus ring: white 2 px, 3 px outside the tile, between two black keylines, so it reads on any scene
+    if (v1.w > 0.5) {
+        let rw = max(1.0, s);
+        let g = 3.0 * s;
+        o2 = over(o2, vec3<f32>(0.0), KEYLINE_ALPHA * cov(abs(d - (g - 0.5 * rw)) - 0.5 * rw, 0.75) * al);
+        o2 = over(o2, vec3<f32>(0.0), KEYLINE_ALPHA * cov(abs(d - (g + 2.5 * rw)) - 0.5 * rw, 0.75) * al);
+        o2 = over(o2, vec3<f32>(1.0), cov(abs(d - (g + rw)) - rw, 0.75) * al);
+    }
+    return o2;
+}
+
+@fragment
+fn fs_panel(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
+    let p = frag.xy;
+    let a = pn.res.z;
+    // scrim: black 0.45, rising to 0.65 near the bottom
+    let g = SCRIM_TOP + (SCRIM_BOTTOM - SCRIM_TOP) * smoothstep(0.55, 1.0, p.y / pn.res.y);
+    var col = over(vec4<f32>(0.0), vec3<f32>(0.0), g * a);
+    col = label_plate(col, p, pn.head, pn.res.w, pn.accent.w);
+    col = over(col, vec3<f32>(1.0), HEADING_ALPHA * pn.accent.w * label_cov(L_HEADING, pn.head, p));
+    col = label_plate(col, p, pn.cap, pn.res.w, pn.accent.w);
+    col = over(col, vec3<f32>(1.0), HEADING_ALPHA * pn.accent.w * label_cov(L_CAPTION, pn.cap, p));
+    let n = u32(pn.n.x + 0.5);
+    for (var i = 0u; i < 5u; i = i + 1u) {
+        if (i >= n) { break; }
+        col = panel_tile(col, p, i);
+    }
+    return col;
 }

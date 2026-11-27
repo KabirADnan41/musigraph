@@ -19,6 +19,7 @@ use crate::media_feed::MediaFeed;
 use crate::music_summary::MusicSummary;
 use crate::presentation::{GpuOp, Layout, Presentation, Ready, Worker, apply_album};
 use crate::scene_map::{Input, MapTuning, SceneMapper};
+use crate::scene_panel::{PanelEvent, PanelKey, ScenePanel};
 use crate::scene_switch::SceneSwitch;
 use mg_audio::capture::Loopback;
 use mg_dsp::features::{MusicFeatures, MusicTracker};
@@ -51,6 +52,8 @@ enum KeyAction {
     NextScene,
     /// Zero-based position in `SceneKind::selector()`.
     SceneAt(usize),
+    /// Open or close the scene panel (the Scene button).
+    TogglePanel,
     ToggleLyrics,
     CycleArtwork,
     ToggleFullscreen,
@@ -102,12 +105,96 @@ fn button_action(b: ButtonId) -> KeyAction {
         ButtonId::Previous => KeyAction::Media(MediaCommand::Previous),
         ButtonId::PlayPause => KeyAction::Media(MediaCommand::TogglePlayPause),
         ButtonId::Next => KeyAction::Media(MediaCommand::Next),
-        ButtonId::Scene => KeyAction::NextScene,
+        ButtonId::Scene => KeyAction::TogglePanel,
         ButtonId::Lyrics => KeyAction::ToggleLyrics,
         ButtonId::Artwork => KeyAction::CycleArtwork,
         ButtonId::Fullscreen => KeyAction::ToggleFullscreen,
         ButtonId::Exit => KeyAction::Exit,
     }
+}
+
+/// The keys the open scene panel takes before the global key map (so Esc closes the panel, not the app, and the
+/// arrows move the panel focus instead of changing track). Enter ignores key repeat; Space, `[` `]`, the digits,
+/// L, A and F stay global.
+/// Where an Esc press goes: an open panel closes (and the key is then "held": its auto-repeat is swallowed until it
+/// is released); a panel still fading out swallows it too, so a second Esc cannot exit the app by accident.
+#[derive(Debug, PartialEq)]
+enum EscRoute {
+    Panel,
+    Swallow,
+    App,
+}
+
+/// `repeat` is the OS auto-repeat flag; `held_after_close` is true from the press that closed the panel until that
+/// key is released. A NEW press (not a repeat, not held) always reaches the app, even during the fade-out.
+fn route_esc(
+    panel_open: bool,
+    panel_visible: bool,
+    repeat: bool,
+    held_after_close: bool,
+) -> EscRoute {
+    if panel_open {
+        EscRoute::Panel
+    } else if held_after_close || (repeat && panel_visible) {
+        EscRoute::Swallow
+    } else {
+        EscRoute::App
+    }
+}
+
+/// The Esc key's state across events: `held` from the press that closed the panel until that key is released
+/// (or the window loses focus, when no release event will come). The real key handler drives this.
+#[derive(Debug, Default)]
+struct EscState {
+    held: bool,
+}
+
+impl EscState {
+    /// An Esc press event (`repeat` = OS auto-repeat): where it goes; the press that closes the panel is held.
+    fn press(&mut self, panel_open: bool, panel_visible: bool, repeat: bool) -> EscRoute {
+        let r = route_esc(panel_open, panel_visible, repeat, self.held);
+        if r == EscRoute::Panel {
+            self.held = true;
+        }
+        r
+    }
+
+    fn release(&mut self) {
+        self.held = false;
+    }
+
+    fn focus_lost(&mut self) {
+        self.held = false;
+    }
+}
+
+/// The `--auto-scenes` tour clock, pure so it can be tested with a fake clock: while the panel is up the timer is
+/// reset to `now` every frame (nothing is due, nothing accumulates), so closing it neither switches at once nor
+/// catches up. Returns (new last-switch time, a switch is due).
+fn tour_step(last: Instant, now: Instant, every_s: u64, panel_up: bool) -> (Instant, bool) {
+    if panel_up {
+        (now, false)
+    } else if now.duration_since(last).as_secs() >= every_s {
+        (now, true)
+    } else {
+        (last, false)
+    }
+}
+
+fn panel_key(code: KeyCode, shift: bool, repeat: bool) -> Option<PanelKey> {
+    Some(match code {
+        KeyCode::Escape => PanelKey::Escape,
+        KeyCode::Tab if shift => PanelKey::BackTab,
+        KeyCode::Tab => PanelKey::Tab,
+        KeyCode::ArrowUp => PanelKey::Up,
+        KeyCode::ArrowDown => PanelKey::Down,
+        KeyCode::ArrowLeft => PanelKey::Left,
+        KeyCode::ArrowRight => PanelKey::Right,
+        KeyCode::Home => PanelKey::Home,
+        KeyCode::End => PanelKey::End,
+        KeyCode::Enter | KeyCode::NumpadEnter if !repeat => PanelKey::Enter,
+        _ => return None,
+    })
 }
 
 /// Seek delta (seconds) for a key while the progress line has keyboard focus: Left/Right step 5 s back/forward
@@ -363,6 +450,13 @@ struct App {
     last_seq: u64,
     last_change: Instant,
     ctl: ControlsUi,
+    panel: ScenePanel,
+    /// Pointer position in surface pixels (None while outside the window).
+    pointer: Option<(f32, f32)>,
+    /// The last input was the keyboard (the panel shows its focus ring only then).
+    keyboard_input: bool,
+    /// Esc closed the panel and is still held: its auto-repeat must not reach the app (cleared on release).
+    esc: EscState,
     cursor_hidden: bool,
     mods: ModifiersState,
     last_unsupported_note: Option<Instant>,
@@ -452,6 +546,12 @@ impl ApplicationHandler for App {
                 scene.set_fluid_tier(self.opts.fluid_tier);
                 self.scene = Some(scene);
                 self.overlay = Some(Overlay::new(&gpu.device, &gpu.queue, gpu.config.format));
+                // Scene-panel thumbnails: rendered once, here, before the first frame is presented (a throwaway
+                // scene set, error-scoped, released at once). Failure leaves placeholders; nothing runs later.
+                self.panel.on_thumbs(crate::scene_thumbs::generate_guarded(
+                    &gpu.device,
+                    &gpu.queue,
+                ));
                 self.gpu = Some(gpu);
             }
             Err(e) => {
@@ -478,8 +578,18 @@ impl ApplicationHandler for App {
                     // alt-tab while a button is held: no release event will come, so nothing may stay pressed
                     self.mods = ModifiersState::empty();
                     self.ctl.focus_lost();
+                    self.esc.focus_lost();
                 }
             }
+            WindowEvent::KeyboardInput {
+                event:
+                    KeyEvent {
+                        physical_key: PhysicalKey::Code(KeyCode::Escape),
+                        state: ElementState::Released,
+                        ..
+                    },
+                ..
+            } => self.esc.release(),
             WindowEvent::KeyboardInput {
                 event:
                     KeyEvent {
@@ -492,10 +602,18 @@ impl ApplicationHandler for App {
             } => self.on_key(el, code, repeat),
             WindowEvent::CursorMoved { position, .. } => {
                 self.sync_view();
+                self.pointer = Some((position.x as f32, position.y as f32));
+                self.keyboard_input = false;
+                self.panel
+                    .pointer_moved((position.x as f32, position.y as f32));
                 self.ctl
                     .pointer_moved((position.x as f32, position.y as f32));
             }
-            WindowEvent::CursorLeft { .. } => self.ctl.pointer_left(),
+            WindowEvent::CursorLeft { .. } => {
+                self.pointer = None;
+                self.panel.pointer_left();
+                self.ctl.pointer_left()
+            }
             WindowEvent::MouseInput {
                 state,
                 button: MouseButton::Left,
@@ -557,6 +675,10 @@ impl App {
                     .map_or((0, 0), |g| (g.config.width, g.config.height));
                 self.pres.set_layout(self.pres.layout().next(), surface);
             }
+            KeyAction::TogglePanel => {
+                let keyboard = self.keyboard_input;
+                self.panel.toggle(self.switch.target(), keyboard);
+            }
             KeyAction::PrevScene | KeyAction::NextScene | KeyAction::SceneAt(_) => {
                 let from = self.switch.target();
                 let to = match action {
@@ -567,6 +689,7 @@ impl App {
                 };
                 if let Some(to) = to {
                     self.switch.request(to);
+                    self.panel.follow(self.switch.target()); // no-op while the panel is closed
                     self.last_auto_switch = Instant::now(); // a manual choice restarts the tour timer
                 }
             }
@@ -599,6 +722,7 @@ impl App {
             .map_or(1.0, |w| w.scale_factor() as f32);
         let s = self.surface();
         self.ctl.set_view(s, dpi);
+        self.panel.set_view(s, dpi);
     }
 
     fn availability(&self) -> Availability {
@@ -611,6 +735,28 @@ impl App {
     fn on_key(&mut self, el: &ActiveEventLoop, code: KeyCode, repeat: bool) {
         self.sync_view();
         self.ctl.key_activity();
+        self.keyboard_input = true;
+        if code == KeyCode::Escape {
+            match self
+                .esc
+                .press(self.panel.is_open(), self.panel.visible(), repeat)
+            {
+                EscRoute::Panel => {
+                    let ev = self.panel.key(PanelKey::Escape);
+                    return self.on_panel_event(ev);
+                }
+                EscRoute::Swallow => return,
+                EscRoute::App => {}
+            }
+        }
+        // an open scene panel takes its keys first (Esc closes only the panel)
+        if self.panel.is_open()
+            && toggle_allowed(self.mods)
+            && let Some(k) = panel_key(code, self.mods.shift_key(), repeat)
+        {
+            let ev = self.panel.key(k);
+            return self.on_panel_event(ev);
+        }
         // the focused progress line takes Left/Right/Home/End (key repeat allowed: holding an arrow keeps seeking)
         if toggle_allowed(self.mods)
             && self.ctl.progress_focused(&self.availability())
@@ -646,6 +792,15 @@ impl App {
         }
     }
 
+    /// What the panel decided: a selection is a scene request (the crossfade and its latest-wins rule live in
+    /// `SceneSwitch`); a manual choice restarts the tour timer like the keys do.
+    fn on_panel_event(&mut self, ev: PanelEvent) {
+        if let PanelEvent::Select(k) = ev {
+            self.switch.request(k);
+            self.last_auto_switch = Instant::now();
+        }
+    }
+
     /// A bar button (click or keyboard activation): the same action as its key, but its own exit reason.
     fn run_button(&mut self, el: &ActiveEventLoop, b: ButtonId) {
         self.run_action(el, button_action(b));
@@ -656,6 +811,17 @@ impl App {
 
     fn on_left_button(&mut self, el: &ActiveEventLoop, down: bool) {
         self.sync_view();
+        self.keyboard_input = false;
+        // a click outside the control bar belongs to the open panel (a tile selects, empty space closes)
+        if down
+            && self.panel.is_open()
+            && let Some(p) = self.pointer
+            && !self.ctl.geometry().area.contains(p)
+        {
+            self.ctl.key_activity();
+            let ev = self.panel.click(p);
+            return self.on_panel_event(ev);
+        }
         let av = self.availability();
         match self.ctl.mouse_left(down, &av) {
             Some(Click::Button(b)) => self.run_button(el, b),
@@ -745,6 +911,7 @@ impl App {
                 self.motion_reduced = r;
                 self.mapper.set_reduced_motion(r);
                 self.pres.set_reduced_motion(r);
+                self.panel.set_reduced(r);
             }
         }
         let t_poll = Instant::now();
@@ -762,6 +929,7 @@ impl App {
         while let Some(r) = self.worker.try_recv() {
             match r {
                 Ready::Clock { .. } => self.ctl.on_ready(r),
+                Ready::PanelLabels { .. } => self.panel.on_ready(r),
                 r => self.pres.on_ready(r),
             }
         }
@@ -778,6 +946,10 @@ impl App {
         };
         // While the bar is visible the lyrics ride above it. The bar advances first so the lift follows this
         // frame's bar alpha (applied after the lyric easing: no lag, no overlap with a visible bar).
+        // the scene panel: its "current" follows the switch's destination; while open it holds the one idle timer
+        self.panel.set_current(self.switch.target());
+        self.panel.advance(dt as f32);
+        self.ctl.vis.set_hold(self.panel.is_open());
         self.ctl.advance(dt as f32);
         self.pres.set_lyric_anchor(anchor);
         self.pres.set_lyric_lift(self.ctl.lyric_lift(anchor));
@@ -813,7 +985,11 @@ impl App {
             fg: overlay_params.colors.title,
             tint: overlay_params.accent,
         });
+        overlay_params.panel = self.panel.frame(overlay_params.accent);
         for job in self.ctl.take_jobs() {
+            self.worker.submit(job);
+        }
+        for job in self.panel.take_jobs() {
             self.worker.submit(job);
         }
         // Album Focus room light: the presentation owns the light rectangle (one source of truth with the cover
@@ -821,8 +997,9 @@ impl App {
         self.pres.merge_focus(&mut params.album);
         params.album.bar = bar_vis;
         if let Some(every) = self.opts.auto_scenes {
-            if now.duration_since(self.last_auto_switch).as_secs() >= every {
-                self.last_auto_switch = now;
+            let (last, due) = tour_step(self.last_auto_switch, now, every, self.panel.visible());
+            self.last_auto_switch = last;
+            if due {
                 self.switch.request(self.switch.target().next());
             }
         }
@@ -859,6 +1036,7 @@ impl App {
                 .take_ops()
                 .into_iter()
                 .chain(self.ctl.take_ops())
+                .chain(self.panel.take_ops())
                 .collect();
             for op in ops {
                 op.apply(ov, scene, &g.device, &g.queue);
@@ -1039,6 +1217,10 @@ pub fn run(opts: SceneOpts) -> i32 {
         last_seq: 0,
         last_change: Instant::now(),
         ctl: ControlsUi::new(controls_always),
+        panel: ScenePanel::new(),
+        pointer: None,
+        keyboard_input: false,
+        esc: EscState::default(),
         cursor_hidden: false,
         mods: ModifiersState::empty(),
         last_unsupported_note: None,
@@ -1163,7 +1345,8 @@ mod tests {
         assert_eq!(button_action(ButtonId::PlayPause), key(KeyCode::Space));
         assert_eq!(button_action(ButtonId::Previous), key(KeyCode::ArrowLeft));
         assert_eq!(button_action(ButtonId::Next), key(KeyCode::ArrowRight));
-        assert_eq!(button_action(ButtonId::Scene), key(KeyCode::BracketRight));
+        assert_eq!(button_action(ButtonId::Scene), KeyAction::TogglePanel);
+        assert_eq!(ButtonId::Scene.name(), "Scenes");
         assert_eq!(button_action(ButtonId::Lyrics), key(KeyCode::KeyL));
         assert_eq!(button_action(ButtonId::Artwork), key(KeyCode::KeyA));
         assert_eq!(button_action(ButtonId::Fullscreen), key(KeyCode::KeyF));
@@ -1213,6 +1396,155 @@ mod tests {
         assert_eq!(k(KeyCode::Escape), Some(Exit));
         assert_eq!(k(KeyCode::KeyQ), None);
         assert_eq!(k(KeyCode::ArrowUp), None);
+    }
+
+    #[test]
+    fn esc_distinguishes_the_press_that_closed_the_panel_from_a_new_press() {
+        // open: Esc closes the panel, nothing else
+        assert_eq!(route_esc(true, true, false, false), EscRoute::Panel);
+        // the closing press is held: its auto-repeat (during or after the fade) never exits
+        assert_eq!(route_esc(false, true, true, true), EscRoute::Swallow);
+        assert_eq!(route_esc(false, false, true, true), EscRoute::Swallow);
+        // a repeat during the fade without the held flag is swallowed too
+        assert_eq!(route_esc(false, true, true, false), EscRoute::Swallow);
+        // a NEW press (not a repeat, key released) exits as before, also while the panel still fades
+        assert_eq!(route_esc(false, false, false, false), EscRoute::App);
+        assert_eq!(route_esc(false, true, false, false), EscRoute::App);
+        assert_eq!(
+            key_action(KeyCode::Escape, ModifiersState::empty(), false),
+            Some(KeyAction::Exit)
+        );
+        // sequence: press (closes), repeats (swallowed), release, new press (exits)
+        let mut held = false;
+        let mut routes = Vec::new();
+        for (open, visible, repeat, release) in [
+            (true, true, false, false),
+            (false, true, true, false),
+            (false, false, true, false),
+            (false, false, false, true),
+            (false, false, false, false),
+        ] {
+            if release {
+                held = false;
+                continue;
+            }
+            let r = route_esc(open, visible, repeat, held);
+            if r == EscRoute::Panel {
+                held = true;
+            }
+            routes.push(r);
+        }
+        assert_eq!(
+            routes,
+            [
+                EscRoute::Panel,
+                EscRoute::Swallow,
+                EscRoute::Swallow,
+                EscRoute::App
+            ]
+        );
+    }
+
+    /// Drives the production `EscState` (the one the window handler uses) through real event sequences.
+    #[test]
+    fn esc_state_swallows_only_the_closing_presses_repeats_and_a_release_or_focus_loss_ends_it() {
+        // press closes the panel; its auto-repeats during and after the fade are swallowed; after the release a
+        // new press exits the app
+        let mut e = EscState::default();
+        assert_eq!(e.press(true, true, false), EscRoute::Panel);
+        assert_eq!(e.press(false, true, true), EscRoute::Swallow);
+        assert_eq!(e.press(false, false, true), EscRoute::Swallow);
+        assert_eq!(e.press(false, false, true), EscRoute::Swallow);
+        e.release();
+        assert_eq!(
+            e.press(false, false, false),
+            EscRoute::App,
+            "new press after release"
+        );
+        // a new press while the panel still fades (key already released) also exits
+        let mut e = EscState::default();
+        assert_eq!(e.press(true, true, false), EscRoute::Panel);
+        e.release();
+        assert_eq!(e.press(false, true, false), EscRoute::App);
+        // the window loses focus while Esc is held: no release event will come, a later press must still exit
+        let mut e = EscState::default();
+        assert_eq!(e.press(true, true, false), EscRoute::Panel);
+        e.focus_lost();
+        assert_eq!(e.press(false, false, false), EscRoute::App);
+        // no panel involved: Esc is never held and always exits
+        let mut e = EscState::default();
+        assert_eq!(e.press(false, false, false), EscRoute::App);
+        assert_eq!(e.press(false, false, true), EscRoute::App);
+    }
+
+    #[test]
+    fn the_auto_tour_never_runs_or_catches_up_while_or_after_the_panel_is_open() {
+        let t0 = Instant::now();
+        let at = |s: u64| t0 + Duration::from_secs(s);
+        assert_eq!(tour_step(t0, at(9), 10, false), (t0, false));
+        assert_eq!(tour_step(t0, at(10), 10, false), (at(10), true));
+        // 100 s with the panel up (60 fps): never due, the clock follows `now`
+        let mut last = t0;
+        let mut due_count = 0;
+        for f in 0..6000u64 {
+            let (l, d) = tour_step(last, t0 + Duration::from_millis(f * 1000 / 60), 10, true);
+            last = l;
+            due_count += u32::from(d);
+        }
+        assert_eq!(due_count, 0);
+        // the panel closes: no immediate switch and no burst; one switch per full period afterwards
+        let closed = t0 + Duration::from_millis(100_000);
+        let mut when = Vec::new();
+        for f in 0..(25 * 60u64) {
+            let now = closed + Duration::from_millis(f * 1000 / 60);
+            let (l, d) = tour_step(last, now, 10, false);
+            last = l;
+            if d {
+                when.push((now - closed).as_millis());
+            }
+        }
+        assert_eq!(when.len(), 2, "{when:?}");
+        assert!(
+            when[0] >= 9_900 && when[1] - when[0] >= 9_900,
+            "{when:?} ms after closing"
+        );
+    }
+
+    #[test]
+    fn the_open_panel_takes_esc_arrows_tab_and_enter_before_the_global_map() {
+        let k = |c, shift, repeat| panel_key(c, shift, repeat);
+        assert_eq!(k(KeyCode::Escape, false, false), Some(PanelKey::Escape));
+        assert_eq!(k(KeyCode::Tab, false, false), Some(PanelKey::Tab));
+        assert_eq!(k(KeyCode::Tab, true, false), Some(PanelKey::BackTab));
+        assert_eq!(
+            k(KeyCode::ArrowLeft, false, true),
+            Some(PanelKey::Left),
+            "arrows repeat"
+        );
+        assert_eq!(k(KeyCode::ArrowDown, false, false), Some(PanelKey::Down));
+        assert_eq!(k(KeyCode::Enter, false, false), Some(PanelKey::Enter));
+        assert_eq!(k(KeyCode::NumpadEnter, false, false), Some(PanelKey::Enter));
+        assert_eq!(
+            k(KeyCode::Enter, false, true),
+            None,
+            "Enter does not repeat"
+        );
+        // everything else stays global while the panel is open: play/pause, [ ], digits, L, A, F
+        for c in [
+            KeyCode::Space,
+            KeyCode::BracketLeft,
+            KeyCode::BracketRight,
+            KeyCode::Digit1,
+            KeyCode::KeyL,
+            KeyCode::KeyA,
+            KeyCode::KeyF,
+        ] {
+            assert_eq!(k(c, false, false), None, "{c:?}");
+            assert!(
+                key_action(c, ModifiersState::empty(), false).is_some(),
+                "{c:?}"
+            );
+        }
     }
 
     #[test]
