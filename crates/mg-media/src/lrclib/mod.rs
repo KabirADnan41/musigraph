@@ -11,6 +11,10 @@
 //! Privacy invariants: only title, artist, album, duration and a User-Agent are sent, to one HTTPS host;
 //! nothing is written to disk; nothing here logs; `Debug` output of queries and lyrics is redacted.
 //! Without consent no request is ever produced; revoking consent cancels, invalidates and clears.
+//!
+//! Usage: create ONE long-lived `LrclibClient` per process (the rate cap, Retry-After pause and
+//! negative cache live in it; a fresh client would reset them) and call `update` only from the
+//! engine/main thread. The transport is created on, and never leaves, the worker thread.
 
 mod client;
 #[cfg(windows)]
@@ -32,7 +36,8 @@ pub const ENDPOINT: &str = "https://lrclib.net/api/get";
 pub const ALLOWED_PREFIX: &str = "https://lrclib.net/api/";
 /// Largest response body accepted (bytes).
 pub const MAX_BODY_BYTES: usize = 512 * 1024;
-/// Returned duration must be within this many seconds of the playing track (LRCLIB's own rule).
+/// Returned duration must be within this many seconds of the playing track's unrounded duration
+/// (LRCLIB's own rule).
 pub const DURATION_TOLERANCE_S: f64 = 2.0;
 /// LRCLIB accepts durations 1..=3600 s.
 pub const MAX_DURATION_S: u32 = 3600;
@@ -45,7 +50,7 @@ pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(8);
 const RATE_WINDOW: Duration = Duration::from_secs(60);
 const DEFAULT_RETRY_AFTER: Duration = Duration::from_secs(60);
 const MIN_RETRY_AFTER: Duration = Duration::from_secs(1);
-const MAX_RETRY_AFTER: Duration = Duration::from_secs(600);
+const MAX_RETRY_AFTER: Duration = Duration::from_secs(3600);
 /// Small fixed margin on top of Retry-After (stands in for the jitter LRCLIB suggests).
 const RETRY_MARGIN: Duration = Duration::from_secs(1);
 const BACKOFF_MIN: Duration = Duration::from_secs(10);
@@ -69,12 +74,34 @@ pub fn is_allowed_url(url: &str) -> bool {
 }
 
 /// One strict lookup key: never title-only, duration always present. `Debug` is redacted.
-#[derive(Clone, PartialEq, Eq, Hash)]
+/// Identity (`Eq`/`Hash`) is what is sent; the unrounded duration only feeds the tolerance check.
+#[derive(Clone)]
 pub struct Query {
     title: String,
     artist: String,
     album: String,
     duration_s: u32,
+    duration_ms: u32,
+}
+
+impl Query {
+    fn key(&self) -> (&str, &str, &str, u32) {
+        (&self.title, &self.artist, &self.album, self.duration_s)
+    }
+}
+
+impl PartialEq for Query {
+    fn eq(&self, other: &Self) -> bool {
+        self.key() == other.key()
+    }
+}
+
+impl Eq for Query {}
+
+impl std::hash::Hash for Query {
+    fn hash<H: std::hash::Hasher>(&self, h: &mut H) {
+        self.key().hash(h);
+    }
 }
 
 impl fmt::Debug for Query {
@@ -88,7 +115,8 @@ impl Query {
     /// or outside 1..=3600 s once rounded.
     pub fn new(title: &str, artist: &str, album: &str, duration_s: Option<f64>) -> Option<Self> {
         let (title, artist) = (sanitize_text(title), sanitize_text(artist));
-        let d = duration_s?.round(); // NaN stays NaN and fails the range check
+        let raw = duration_s?;
+        let d = raw.round(); // NaN stays NaN and fails the range check
         if title.is_empty() || artist.is_empty() || !(1.0..=f64::from(MAX_DURATION_S)).contains(&d)
         {
             return None;
@@ -98,6 +126,7 @@ impl Query {
             artist,
             album: sanitize_text(album),
             duration_s: d as u32,
+            duration_ms: (raw * 1000.0).round() as u32, // raw is in [0.5, 3600.5) here
         })
     }
 
@@ -139,6 +168,7 @@ fn encode(s: &str, out: &mut String) {
 #[derive(Clone, Default, PartialEq)]
 pub struct Record {
     pub track_name: Option<String>,
+    pub artist_name: Option<String>,
     pub album_name: Option<String>,
     pub duration: Option<f64>,
     pub instrumental: Option<bool>,
@@ -155,7 +185,8 @@ pub enum Outcome {
     Unsynced(Vec<String>),
     /// 404: no record.
     NotFound,
-    /// A record came back but is not a reliable match (duration, instrumental, version words, no lyrics).
+    /// A record came back but is not a reliable match (title, artist, duration, instrumental, version
+    /// words, no lyrics).
     Rejected,
     /// 429/503: wait this long (bounded) before any further request.
     RetryAfter(Duration),
@@ -237,22 +268,31 @@ pub fn evaluate(q: &Query, r: Result<HttpResponse, TransportError>) -> Outcome {
     }
 }
 
-/// Strict match of a parsed record against the query.
+/// Strict match of a parsed record against the query: same song (title and artist), same recording
+/// (version words), duration within tolerance of the unrounded playing duration, not instrumental.
 pub fn judge(q: &Query, rec: &Record) -> Outcome {
-    let duration_ok = rec
-        .duration
-        .is_some_and(|d| (d - f64::from(q.duration_s)).abs() <= DURATION_TOLERANCE_S); // NaN fails
-    let Some(track) = &rec.track_name else {
+    let duration_ok = rec.duration.is_some_and(|d| {
+        ((d * 1000.0).round() - f64::from(q.duration_ms)).abs() <= DURATION_TOLERANCE_S * 1000.0
+    }); // NaN and infinities fail
+    let (Some(track), Some(artist)) = (&rec.track_name, &rec.artist_name) else {
         return Outcome::Rejected; // ambiguous
     };
     let theirs = format!("{track} {}", rec.album_name.as_deref().unwrap_or(""));
     if !duration_ok
         || rec.instrumental == Some(true)
         || version_words(&format!("{} {}", q.title, q.album)) != version_words(&theirs)
+        || core_title(&q.title) != core_title(track)
+        || !same_artist(&q.artist, artist)
     {
         return Outcome::Rejected;
     }
-    if let Some(Ok(l)) = rec.synced.as_ref().map(|s| lrc::parse(s.as_bytes())) {
+    // synced text whose timed lines are all empty is no lyrics: fall back to plain
+    if let Some(l) = rec
+        .synced
+        .as_deref()
+        .and_then(|s| lrc::parse(s.as_bytes()).ok())
+        .filter(|l| l.lines.iter().any(|line| !line.text.is_empty()))
+    {
         return Outcome::Synced(l);
     }
     let lines: Vec<String> = rec
@@ -300,6 +340,103 @@ fn version_words(s: &str) -> Vec<&'static str> {
     found.sort_unstable();
     found.dedup();
     found
+}
+
+/// Comparison key: Unicode lowercase with whitespace, punctuation and symbols removed. Letters and
+/// marks of every script are kept as they are (no normalisation). A string that folds to nothing is
+/// compared by its lowercase text instead, so punctuation-only names never all compare equal.
+fn fold(s: &str) -> String {
+    let s = sanitize_text(s);
+    let key: String = s
+        .chars()
+        .filter(|&c| !is_separator(c))
+        .flat_map(char::to_lowercase)
+        .collect();
+    if key.is_empty() {
+        s.to_lowercase()
+    } else {
+        key
+    }
+}
+
+/// Whitespace, ASCII punctuation/symbols and the common Unicode punctuation blocks (never a letter,
+/// digit or combining mark of any script).
+fn is_separator(c: char) -> bool {
+    !c.is_alphanumeric()
+        && (c.is_ascii()
+            || c.is_whitespace()
+            || c.is_control()
+            || matches!(c,
+                '\u{80}'..='\u{BF}' // Latin-1 punctuation and symbols
+                | '\u{60C}' | '\u{61B}' | '\u{61F}' | '\u{66A}'..='\u{66D}' // Arabic punctuation
+                | '\u{964}' | '\u{965}' // danda
+                | '\u{2000}'..='\u{206F}' // general punctuation: quotes, dashes, zero-width
+                | '\u{3000}'..='\u{303F}' // CJK punctuation
+                | '\u{FE10}'..='\u{FE6F}' | '\u{FF00}'..='\u{FF65}'))
+}
+
+/// Title key: bracketed or ` - ` segments that carry a version word (already compared) or a featured
+/// artist credit are dropped, remaining version words removed, the rest folded.
+fn core_title(s: &str) -> String {
+    let (head, tail) = s
+        .split_once(" - ")
+        .or_else(|| s.split_once(" \u{2013} "))
+        .unwrap_or((s, ""));
+    let (mut kept, mut segs, mut rest) = (String::new(), vec![tail], head);
+    while let Some(i) = rest.find(['(', '[']) {
+        kept.push_str(&rest[..i]);
+        let close = if rest[i..].starts_with('(') { ')' } else { ']' };
+        let inner = &rest[i + 1..];
+        let j = inner.find(close).unwrap_or(inner.len());
+        segs.push(&inner[..j]);
+        rest = inner.get(j + 1..).unwrap_or("");
+    }
+    kept.push_str(rest);
+    for seg in segs {
+        let credit = seg
+            .split(|c: char| !c.is_alphanumeric())
+            .find(|w| !w.is_empty())
+            .is_some_and(|w| {
+                ["feat", "ft", "featuring"]
+                    .iter()
+                    .any(|k| w.eq_ignore_ascii_case(k))
+            });
+        if !credit && version_words(seg).is_empty() {
+            kept.push(' ');
+            kept.push_str(seg);
+        }
+    }
+    let words: Vec<&str> = kept
+        .split_whitespace()
+        .filter(|w| version_words(w).is_empty())
+        .collect();
+    let key = fold(&words.join(" "));
+    if key.is_empty() { fold(s) } else { key }
+}
+
+/// Same artist: the whole credits match, or the first credited artists match.
+fn same_artist(sent: &str, theirs: &str) -> bool {
+    let p = fold(primary_artist(sent));
+    fold(sent) == fold(theirs) || (!p.is_empty() && p == fold(primary_artist(theirs)))
+}
+
+/// Text before the first `, `, ` & ` or featuring marker.
+fn primary_artist(s: &str) -> &str {
+    let lower = s.to_ascii_lowercase(); // same byte offsets as `s`
+    let cut = [
+        ", ",
+        " & ",
+        " feat.",
+        " (feat.",
+        " ft.",
+        " (ft.",
+        " featuring ",
+    ]
+    .iter()
+    .filter_map(|p| lower.find(p))
+    .min()
+    .unwrap_or(s.len());
+    &s[..cut]
 }
 
 /// Rejects JSON nested deeper than `MAX_JSON_DEPTH` (brackets outside strings).
@@ -350,6 +487,7 @@ pub fn parse_record(body: &[u8]) -> Option<Record> {
     };
     Some(Record {
         track_name: string("trackName"),
+        artist_name: string("artistName"),
         album_name: string("albumName"),
         duration: field("duration", JsonValueType::Number).and_then(|v| v.GetNumber().ok()),
         instrumental: field("instrumental", JsonValueType::Boolean)

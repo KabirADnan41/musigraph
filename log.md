@@ -417,3 +417,25 @@ The mg-media test count there should read 33 for commit 3eb9341 (36 included 3 u
   - Sonnet High security and correctness review (§27).
   - Joint interactive test against the live service with owner approval.
   - Public-release gate (terms and licence).
+## 2026-11-27 - LRCLIB review fixes (mg-media, mocked tests only)
+- **Branch:** feature/poc-audio-fullscreen on 79a37d7; uncommitted. Files: `crates/mg-media/src/lrclib/{mod.rs,client.rs,winrt.rs,tests.rs}`. No real network request was made.
+- **Fixes (RED observed first for each: 8 tests failed / 2 compile errors before the change; test in brackets):**
+  1. MEDIUM same-song check. `Record` now reads `artistName`; a missing one is Rejected. `judge` requires `core_title(sent) == core_title(trackName)` and `same_artist`. `fold` = sanitize, Unicode lowercase, drop whitespace / ASCII punctuation and symbols / common Unicode punctuation blocks. Letters and combining marks of every script are kept (no normalisation). Punctuation-only strings compare by their lowercase text, never as empty == empty. `core_title` drops `(...)`, `[...]` and ` - ` segments that hold a version word (already compared) or a feat./ft./featuring credit, then removes the remaining version words. `same_artist`: the whole folded credits are equal, or the non-empty primary artists are equal (cut at `, `, ` & `, ` feat.`, ` (feat.`, ` ft.`, ` (ft.`, ` featuring `) [a_different_song_with_the_same_duration_is_rejected, the_same_song_with_other_case_punctuation_or_spacing_is_accepted, non_latin_titles_match_only_when_identical (Bangla, Arabic, CJK; vowel-sign, virama and hamza differences rejected), featured_artist_variations_are_handled, json_hostile_values_are_rejected_not_panicking (wrong or missing artistName)].
+  2. LOW duration. `Query` keeps the unrounded duration in ms. The tolerance is checked in whole ms (+/-2000) against it; the rounded seconds are still sent. `Eq`/`Hash` cover only the sent fields, so SMTC jitter below rounding does not restart the debounce or bypass dedupe [duration_tolerance_uses_the_unrounded_playing_duration].
+  3. LOW thread affinity. `Com` holds `PhantomData<*const ()>`, so `WinRtTransport` is `!Send`. `LrclibClient::start` already builds the transport inside the worker via a `Send` factory, with no `Send` bound on `T`; only the docs changed [transport_is_not_send (compile-time ambiguity check), client_creates_the_transport_on_the_worker_without_sending].
+  4. LOW Retry-After cap 600 -> 3600 s [retry_after_is_honoured_up_to_one_hour; status_codes_are_classified u64::MAX now clamps to 3600].
+  5. LOW synced text whose timed lines are all empty after sanitising is not Synced. It falls back to plain, else Rejected [synced_text_without_any_words_falls_back_to_plain].
+  6. LOW `WinRtTransport` keeps the filter it built the client with, and the privacy test asserts on that one. Building the transport sends nothing [filter_has_the_privacy_settings].
+  7. Docs: one long-lived client per process; `update` only on the engine/main thread (mod.rs header).
+- **Verification:**
+  - `cargo test -p mg-media`: 78 passed.
+  - `cargo clippy -p mg-media --all-targets -- -D warnings`: clean.
+  - `rustfmt --edition 2024 --check` on the four files: clean.
+  - Cargo.lock unchanged.
+- **Limitations:**
+  - No Unicode normalisation (NFC vs NFD, fullwidth vs ASCII), so such pairs are rejected. This is strict on purpose.
+  - Title segments like "(with X)" or "(Part 2)" are kept, so they must match.
+  - A primary-artist match accepts different featured guests.
+  - `filter` is read only by the test (`allow(dead_code)` outside tests).
+  - The WinRT request path is still unexercised (no network).
+- **Remains:** the independent Sonnet High review (§27) of this diff.

@@ -16,6 +16,7 @@ fn qn(i: u32) -> Query {
 fn rec(duration: f64) -> Record {
     Record {
         track_name: Some("Synthetic Song".into()),
+        artist_name: Some("Test Artist".into()),
         album_name: Some("Test Album".into()),
         duration: Some(duration),
         instrumental: Some(false),
@@ -251,6 +252,194 @@ fn version_word_mismatch_is_rejected() {
     assert_eq!(judge(&live, &r), Outcome::Rejected);
 }
 
+fn qa(title: &str, artist: &str) -> Query {
+    Query::new(title, artist, "", Some(200.0)).unwrap()
+}
+
+fn named(title: &str, artist: &str) -> Record {
+    Record {
+        track_name: Some(title.into()),
+        artist_name: Some(artist.into()),
+        album_name: None,
+        ..rec(200.0)
+    }
+}
+
+fn accepted(q: &Query, r: &Record) -> bool {
+    matches!(judge(q, r), Outcome::Synced(_))
+}
+
+#[test]
+fn a_different_song_with_the_same_duration_is_rejected() {
+    for (t, a) in [
+        ("Another Song", "Test Artist"),
+        ("Synthetic Song Two", "Test Artist"),
+        ("Synthetic", "Test Artist"),
+        ("Synthetic Song", "Someone Else"),
+        ("Synthetic Song", "Test Artists"),
+        ("Synthetic Song", "Test"),
+    ] {
+        assert!(
+            !accepted(&qa("Synthetic Song", "Test Artist"), &named(t, a)),
+            "{t} / {a}"
+        );
+    }
+    // no artist on the record: ambiguous
+    let r = Record {
+        artist_name: None,
+        ..rec(200.0)
+    };
+    assert_eq!(judge(&q(), &r), Outcome::Rejected);
+    // titles of punctuation only do not fold to an empty, always-equal key
+    assert!(!accepted(
+        &qa("!!!", "Test Artist"),
+        &named("???", "Test Artist")
+    ));
+    assert!(accepted(
+        &qa("!!!", "Test Artist"),
+        &named("!!!", "Test Artist")
+    ));
+    assert!(!accepted(
+        &qa("Synthetic Song", "!!!"),
+        &named("Synthetic Song", "???")
+    ));
+}
+
+#[test]
+fn the_same_song_with_other_case_punctuation_or_spacing_is_accepted() {
+    let base = qa("Synthetic Song", "Test Artist");
+    for (t, a) in [
+        ("synthetic song", "test artist"),
+        ("SYNTHETIC SONG", "TEST ARTIST"),
+        ("Synthetic  Song!", "Test-Artist"),
+        ("Synthetic, Song.", "Test Artist."),
+        ("Synthetic Song (feat. Guest)", "Test Artist"),
+        ("Synthetic Song - Ft. Guest", "Test Artist"),
+    ] {
+        assert!(accepted(&base, &named(t, a)), "{t} / {a}");
+    }
+    assert!(accepted(
+        &qa("Don't Stop", "A"),
+        &named("Don\u{2019}t Stop", "A")
+    ));
+    // Unicode-aware case folding
+    assert!(accepted(
+        &qa("Ärger Über", "Ünïcödé"),
+        &named("ärger über", "ÜNÏCÖDÉ")
+    ));
+    // the already-compared version segment is removed before the title compare
+    let rm = qa("Synthetic Song (Remastered 2011)", "Test Artist");
+    for t in [
+        "Synthetic Song - Remastered 2011",
+        "synthetic song [remastered]",
+    ] {
+        assert!(accepted(&rm, &named(t, "Test Artist")), "{t}");
+    }
+}
+
+#[test]
+fn non_latin_titles_match_only_when_identical() {
+    let (bn_t, bn_a) = (
+        "\u{0986}\u{09AE}\u{09BE}\u{09B0} \u{09B8}\u{09CB}\u{09A8}\u{09BE}\u{09B0} \u{09AC}\u{09BE}\u{0982}\u{09B2}\u{09BE}",
+        "\u{09B0}\u{09AC}\u{09C0}\u{09A8}\u{09CD}\u{09A6}\u{09CD}\u{09B0}\u{09A8}\u{09BE}\u{09A5}",
+    );
+    let bn = qa(bn_t, bn_a);
+    assert!(accepted(&bn, &named(bn_t, bn_a)));
+    assert!(accepted(&bn, &named(&format!(" {bn_t}! "), bn_a)));
+    // one vowel sign different, or a dropped virama: a different word
+    assert!(!accepted(
+        &bn,
+        &named(&bn_t.replace('\u{09BE}', "\u{09BF}"), bn_a)
+    ));
+    assert!(!accepted(&bn, &named(bn_t, &bn_a.replace('\u{09CD}', ""))));
+    let (ar_t, ar_a) = (
+        "\u{0623}\u{063A}\u{0646}\u{064A}\u{0629}",
+        "\u{0641}\u{0646}\u{0627}\u{0646}",
+    );
+    let ar = qa(ar_t, ar_a);
+    assert!(accepted(&ar, &named(ar_t, ar_a)));
+    assert!(!accepted(
+        &ar,
+        &named(&ar_t.replace('\u{0623}', "\u{0627}"), ar_a)
+    ));
+    assert!(!accepted(
+        &ar,
+        &named("\u{0623}\u{063A}\u{0646}\u{064A}", ar_a)
+    ));
+    assert!(accepted(
+        &qa("\u{6B4C}", "\u{6B4C}\u{624B}"),
+        &named("\u{6B4C}", "\u{6B4C}\u{624B}")
+    ));
+}
+
+#[test]
+fn featured_artist_variations_are_handled() {
+    for (sent, theirs) in [
+        ("Test Artist", "Test Artist feat. Guest"),
+        ("Test Artist feat. Guest", "Test Artist"),
+        ("Test Artist FEAT. Guest", "test artist"),
+        ("Test Artist (feat. Guest)", "Test Artist"),
+        ("Test Artist ft. Guest", "Test Artist & Guest"),
+        ("Test Artist, Guest", "Test Artist"),
+        ("Test Artist & Guest", "test artist, guest"),
+    ] {
+        assert!(
+            accepted(
+                &qa("Synthetic Song", sent),
+                &named("Synthetic Song", theirs)
+            ),
+            "{sent} / {theirs}"
+        );
+    }
+    for (sent, theirs) in [
+        ("Guest", "Test Artist feat. Guest"),
+        ("Other, Test Artist", "Test Artist"),
+        ("Test Artist", "Other feat. Test Artist"),
+    ] {
+        assert!(
+            !accepted(
+                &qa("Synthetic Song", sent),
+                &named("Synthetic Song", theirs)
+            ),
+            "{sent} / {theirs}"
+        );
+    }
+}
+
+#[test]
+fn duration_tolerance_uses_the_unrounded_playing_duration() {
+    let at = |d: f64| Query::new("Synthetic Song", "Test Artist", "Test Album", Some(d)).unwrap();
+    let q = at(199.6);
+    assert_eq!(q.duration_s(), 200, "still sent rounded");
+    assert!(q.url().ends_with("&duration=200"));
+    assert_eq!(q, at(200.4), "identity is what is sent");
+    for d in [197.6, 199.6, 201.6] {
+        assert!(accepted(&q, &rec(d)), "{d}");
+    }
+    for d in [197.59, 201.61, 201.7, 202.0] {
+        assert_eq!(judge(&q, &rec(d)), Outcome::Rejected, "{d}");
+    }
+    let q = at(200.4);
+    for d in [198.4, 202.4] {
+        assert!(accepted(&q, &rec(d)), "{d}");
+    }
+    for d in [198.3, 198.39, 202.41] {
+        assert_eq!(judge(&q, &rec(d)), Outcome::Rejected, "{d}");
+    }
+}
+
+#[test]
+fn synced_text_without_any_words_falls_back_to_plain() {
+    let mut r = rec(200.0);
+    r.synced = Some("[00:01.00]\n[00:02.00]   \n[00:03.00]\u{202e}".into());
+    assert_eq!(
+        judge(&q(), &r),
+        Outcome::Unsynced(vec!["la la la".into(), "na na".into()])
+    );
+    r.plain = None;
+    assert_eq!(judge(&q(), &r), Outcome::Rejected);
+}
+
 // ---- status / transport policy ----
 
 #[test]
@@ -277,7 +466,26 @@ fn status_codes_are_classified() {
     assert_eq!(ra(503, Some(s(30))), Outcome::RetryAfter(s(30)));
     assert_eq!(ra(429, None), Outcome::RetryAfter(s(60)));
     assert_eq!(ra(429, Some(s(0))), Outcome::RetryAfter(s(1)));
-    assert_eq!(ra(429, Some(s(u64::MAX))), Outcome::RetryAfter(s(600)));
+    assert_eq!(ra(429, Some(s(u64::MAX))), Outcome::RetryAfter(s(3600)));
+}
+
+#[test]
+fn retry_after_is_honoured_up_to_one_hour() {
+    let ra = |secs| {
+        evaluate(
+            &q(),
+            Ok(HttpResponse {
+                status: 429,
+                retry_after: Some(Duration::from_secs(secs)),
+                body: Vec::new(),
+            }),
+        )
+    };
+    let s = Duration::from_secs;
+    assert_eq!(ra(601), Outcome::RetryAfter(s(601)));
+    assert_eq!(ra(1800), Outcome::RetryAfter(s(1800)));
+    assert_eq!(ra(3600), Outcome::RetryAfter(s(3600)));
+    assert_eq!(ra(3601), Outcome::RetryAfter(s(3600)));
 }
 
 #[test]
@@ -344,7 +552,7 @@ fn json_hostile_values_are_rejected_not_panicking() {
         assert!(matches!(out, Outcome::Rejected | Outcome::Error), "{d}");
     }
     // lone surrogate and control escapes inside lyrics: no panic, text sanitised
-    let body = r#"{"trackName":"Synthetic Song","albumName":"Test Album","duration":200,"instrumental":false,"plainLyrics":"a\ud800b\u0000c\u202Ed","syncedLyrics":null}"#;
+    let body = r#"{"trackName":"Synthetic Song","artistName":"Test Artist","albumName":"Test Album","duration":200,"instrumental":false,"plainLyrics":"a\ud800b\u0000c\u202Ed","syncedLyrics":null}"#;
     let Outcome::Unsynced(lines) = evaluate(&q(), ok(200, body)) else {
         panic!("expected unsynced")
     };
@@ -352,8 +560,13 @@ fn json_hostile_values_are_rejected_not_panicking() {
     assert!(lines[0].starts_with('a') && lines[0].ends_with('d'));
     assert!(!lines[0].contains('\0') && !lines[0].contains('\u{202e}'));
     // instrumental record
-    let body = r#"{"trackName":"Synthetic Song","albumName":"Test Album","duration":200,"instrumental":true,"plainLyrics":null,"syncedLyrics":null}"#;
+    let body = r#"{"trackName":"Synthetic Song","artistName":"Test Artist","albumName":"Test Album","duration":200,"instrumental":true,"plainLyrics":null,"syncedLyrics":null}"#;
     assert_eq!(evaluate(&q(), ok(200, body)), Outcome::Rejected);
+    // the artist is read from the body: a wrong or missing artistName is not a match
+    let other = json("200").replace("\"Test Artist\"", "\"Someone Else\"");
+    assert_eq!(evaluate(&q(), ok(200, &other)), Outcome::Rejected);
+    let missing = json("200").replace("\"artistName\"", "\"artistNom\"");
+    assert_eq!(evaluate(&q(), ok(200, &missing)), Outcome::Rejected);
 }
 
 // ---- requester state machine ----

@@ -26,8 +26,10 @@ pub struct LrclibClient {
 }
 
 impl LrclibClient {
-    /// Starts the worker. `make` runs ON the worker thread (so a transport can initialise COM there);
-    /// `None` means no transport: every request then ends as `Outcome::Error`. Consent starts OFF.
+    /// Starts the worker. `make` runs ON the worker thread and the transport never leaves it (it need
+    /// not be `Send`; the COM-owning `WinRtTransport` is not), so COM is initialised and released on
+    /// that one thread. `None` means no transport: every request then ends as `Outcome::Error`.
+    /// Consent starts OFF.
     pub fn start<T, F>(make: F) -> std::io::Result<Self>
     where
         T: Transport,

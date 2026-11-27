@@ -6,6 +6,7 @@ use super::{
     HttpResponse, MAX_BODY_BYTES, REQUEST_TIMEOUT, Transport, TransportError, is_allowed_url,
     user_agent,
 };
+use std::marker::PhantomData;
 use std::time::{Duration, Instant};
 use windows::Foundation::Uri;
 use windows::Storage::Streams::{Buffer, DataReader, InputStreamOptions};
@@ -44,13 +45,14 @@ macro_rules! await_op {
     }};
 }
 
-/// Balances one successful `CoInitializeEx` on the creating thread.
-struct Com;
+/// Balances one successful `CoInitializeEx` on the creating thread. `!Send` (raw-pointer marker), so it
+/// cannot be dropped on another thread.
+struct Com(PhantomData<*const ()>);
 
 impl Drop for Com {
     fn drop(&mut self) {
-        // SAFETY: only constructed after a successful CoInitializeEx on this thread; the transport is
-        // created and dropped on the same worker thread.
+        // SAFETY: only constructed after a successful CoInitializeEx on this thread, and `!Send`, so
+        // this runs on that same thread.
         #[allow(unsafe_code)]
         unsafe {
             CoUninitialize()
@@ -58,9 +60,13 @@ impl Drop for Com {
     }
 }
 
+/// `!Send`: build it on the thread that uses it (`LrclibClient::start(WinRtTransport::new)` does).
 pub struct WinRtTransport {
     client: HttpClient,
-    _com: Com, // declared last: dropped after `client`
+    /// The filter `client` was created with (kept so its privacy settings can be checked).
+    #[cfg_attr(not(test), allow(dead_code))]
+    filter: HttpBaseProtocolFilter,
+    _com: Com, // declared last: dropped after the WinRT objects
 }
 
 /// All privacy/safety settings of the HTTP stack, in one place.
@@ -85,14 +91,19 @@ impl WinRtTransport {
         if hr.is_err() {
             return None;
         }
-        let com = Com;
-        let client = HttpClient::Create(&filter().ok()?).ok()?;
+        let com = Com(PhantomData);
+        let filter = filter().ok()?;
+        let client = HttpClient::Create(&filter).ok()?;
         let ua_set = client
             .DefaultRequestHeaders()
             .ok()?
             .TryAppendWithoutValidation(h!("User-Agent"), &HSTRING::from(user_agent()))
             .ok()?;
-        ua_set.then_some(Self { client, _com: com })
+        ua_set.then_some(Self {
+            client,
+            filter,
+            _com: com,
+        })
     }
 }
 
@@ -180,11 +191,11 @@ fn read_body(
 mod tests {
     use super::*;
 
-    /// Network-free: builds the stack and reads the settings back.
+    /// Network-free: builds the stack and reads the settings back from the filter the client uses.
     #[test]
     fn filter_has_the_privacy_settings() {
-        let _t = WinRtTransport::new().expect("HTTP stack available");
-        let f = filter().unwrap();
+        let t = WinRtTransport::new().expect("HTTP stack available");
+        let f = &t.filter;
         assert!(!f.AllowAutoRedirect().unwrap());
         assert!(!f.AllowUI().unwrap());
         assert_eq!(
@@ -207,5 +218,32 @@ mod tests {
         ] {
             assert_eq!(t.get(url, &|| false), Err(TransportError::NotAllowed));
         }
+    }
+
+    /// Compile-time: the transport (and its COM guard) cannot move to another thread, so
+    /// `CoUninitialize` always runs on the thread that called `CoInitializeEx`. The call below is
+    /// ambiguous, and fails to compile, if `WinRtTransport` is `Send`.
+    #[test]
+    fn transport_is_not_send() {
+        trait AmbiguousIfSend<A> {
+            fn check() {}
+        }
+        impl<T: ?Sized> AmbiguousIfSend<()> for T {}
+        impl<T: ?Sized + Send> AmbiguousIfSend<u8> for T {}
+        <WinRtTransport as AmbiguousIfSend<_>>::check();
+    }
+
+    /// Network-free: the client builds the transport on its worker thread; without consent it
+    /// never sends anything, and drop shuts the worker down.
+    #[test]
+    fn client_creates_the_transport_on_the_worker_without_sending() {
+        let mut c = super::super::LrclibClient::start(WinRtTransport::new).unwrap();
+        let q = super::super::Query::new("Synthetic Song", "Test Artist", "", Some(200.0)).unwrap();
+        let t0 = Instant::now();
+        for i in 0..10u64 {
+            assert!(c.update(t0 + Duration::from_secs(i), Some(&q)).is_none());
+        }
+        assert_eq!(c.requests_sent(), 0);
+        drop(c);
     }
 }
