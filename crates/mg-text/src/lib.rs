@@ -81,6 +81,18 @@ impl Default for LineStyle {
 pub fn is_rtl(s: &str) -> bool {
     for c in s.chars() {
         let u = c as u32;
+        // Digits and combining marks are not strong directional characters: keep scanning.
+        if matches!(
+            u,
+            0x0660..=0x0669 | 0x06F0..=0x06F9 // Arabic-Indic digits
+            | 0x0591..=0x05BD | 0x05BF | 0x05C1..=0x05C2 | 0x05C4..=0x05C5 | 0x05C7 // Hebrew points
+            | 0x0610..=0x061A | 0x064B..=0x065F | 0x0670 | 0x06D6..=0x06DC | 0x06DF..=0x06E4
+            | 0x06E7..=0x06E8 | 0x06EA..=0x06ED // Arabic marks
+            | 0x0711 | 0x0730..=0x074A | 0x07A6..=0x07B0 | 0x07EB..=0x07F3 | 0x08D3..=0x08FF
+            | 0xFB1E | 0xFE20..=0xFE2F
+        ) {
+            continue;
+        }
         if matches!(u, 0x0590..=0x08FF | 0xFB1D..=0xFDFF | 0xFE70..=0xFEFF | 0x10800..=0x10FFF | 0x1E800..=0x1EFFF)
         {
             return true;
@@ -135,6 +147,20 @@ mod tests {
         assert!(!is_rtl("Hello مرحبا"));
         assert!(!is_rtl("123 আমার"));
         assert!(!is_rtl(""));
+        assert!(
+            !is_rtl("١٢٣ Hello"),
+            "Arabic-Indic digits are not strong RTL"
+        );
+        assert!(!is_rtl("۱۲۳ Hello"), "extended Arabic-Indic digits");
+        assert!(
+            !is_rtl("\u{64B} Hello"),
+            "a combining mark is not strong RTL"
+        );
+        assert!(
+            is_rtl("١٢٣ مرحبا"),
+            "digits are skipped, the first letter decides"
+        );
+        assert!(is_rtl("\u{5B0}שלום"));
         assert!(tracking_safe("Ünïcödé Ελλάδα Привет 123 ✓"));
         assert!(!tracking_safe("Hello আমার"));
         assert!(!tracking_safe("歌曲"));

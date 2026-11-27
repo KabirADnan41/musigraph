@@ -85,6 +85,16 @@ pub struct TextRenderer {
 impl TextRenderer {
     /// Creates the factories on the current thread. `None` if DirectWrite/Direct2D/WIC are unavailable.
     pub fn new() -> Option<Self> {
+        Self::create(false)
+    }
+
+    /// Like `new`, but always uses the Segoe UI fallback faces (the Windows 10 path), so tests and tooling can
+    /// verify the layout without the Variable cuts.
+    pub fn new_forced_fallback() -> Option<Self> {
+        Self::create(true)
+    }
+
+    fn create(force_fallback: bool) -> Option<Self> {
         // SAFETY: plain apartment initialisation; an Err (already initialised differently) is not balanced.
         let hr = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
         let guard = ComGuard(hr.is_ok());
@@ -98,11 +108,15 @@ impl TextRenderer {
             (d2d, dwrite, wic)
         };
         // SAFETY: live factory, static names.
-        let (display, text) = unsafe {
-            (
-                probe_family(&dwrite, VAR_DISPLAY),
-                probe_family(&dwrite, VAR_TEXT),
-            )
+        let (display, text) = if force_fallback {
+            (FALLBACK, FALLBACK)
+        } else {
+            unsafe {
+                (
+                    probe_family(&dwrite, VAR_DISPLAY),
+                    probe_family(&dwrite, VAR_TEXT),
+                )
+            }
         };
         Some(Self {
             d2d,
@@ -391,9 +405,7 @@ mod tests {
         );
     }
 
-    #[test]
-    fn margins_stay_empty_and_long_text_is_trimmed_to_the_width() {
-        let r = TextRenderer::new().unwrap();
+    fn margins_stay_empty_and_long_text_is_trimmed_to_the_width(r: &TextRenderer) {
         let long =
             "A very long song title that cannot possibly fit in the available width ".repeat(3);
         let b = r.render_line(&long, &style(500)).unwrap();
@@ -422,9 +434,7 @@ mod tests {
         (cols[0], *cols.last().unwrap())
     }
 
-    #[test]
-    fn wrapping_is_opt_in_bounded_by_lines_and_width() {
-        let r = TextRenderer::new().unwrap();
+    fn wrapping_is_opt_in_bounded_by_lines_and_width(r: &TextRenderer) {
         let title = "An extremely long song title that will certainly need two lines here and more";
         let one = r.render_line(title, &style(600)).unwrap();
         let two = r
@@ -459,9 +469,7 @@ mod tests {
         assert!(cjk.width <= 500 + 2 * cjk.pad && body(&cjk) > 40.0 * 1.6);
     }
 
-    #[test]
-    fn tracking_applies_to_latin_only_and_rtl_ink_stays_inside() {
-        let r = TextRenderer::new().unwrap();
+    fn tracking_applies_to_latin_only_and_rtl_ink_stays_inside(r: &TextRenderer) {
         let tracked = |s: &str, em: f32| {
             r.render_line(
                 s,
@@ -495,6 +503,46 @@ mod tests {
                 b.width,
                 b.pad
             );
+        }
+    }
+
+    /// Runs a layout expectation with the variable-cut renderer and with the forced Segoe UI fallback.
+    fn both(check: fn(&TextRenderer)) {
+        check(&TextRenderer::new().expect("directwrite available"));
+        check(&TextRenderer::new_forced_fallback().expect("directwrite available"));
+    }
+
+    #[test]
+    fn layout_expectations_hold_with_variable_cuts_and_with_the_segoe_ui_fallback() {
+        both(margins_stay_empty_and_long_text_is_trimmed_to_the_width);
+        both(wrapping_is_opt_in_bounded_by_lines_and_width);
+        both(tracking_applies_to_latin_only_and_rtl_ink_stays_inside);
+    }
+
+    #[test]
+    fn fallback_widths_are_reported_next_to_the_variable_widths() {
+        let var = TextRenderer::new().unwrap();
+        let fb = TextRenderer::new_forced_fallback().unwrap();
+        assert!(!fb.has_variable_cuts());
+        for s in [
+            "Midnight City",
+            "Bohemian Rhapsody (Live at Wembley)",
+            "مرحبا بالعالم",
+            "歌曲の名前",
+            "আমার সোনার বাংলা",
+        ] {
+            for cut in [Cut::Text, Cut::Display] {
+                let w = |r: &TextRenderer| {
+                    r.render_line(s, &LineStyle { cut, ..style(2000) })
+                        .map(|b| b.width - 2 * b.pad)
+                };
+                eprintln!(
+                    "width {s:?} {cut:?}: variable {:?} fallback {:?}",
+                    w(&var),
+                    w(&fb)
+                );
+                assert!(w(&fb).is_some_and(|x| x > 0));
+            }
         }
     }
 

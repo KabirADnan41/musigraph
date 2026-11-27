@@ -617,3 +617,11 @@ The mg-media test count there should read 33 for commit 3eb9341 (36 included 3 u
   - weak-test notes (rate-cap assert, revoke allowance assert) and years inside "Live 1986/1992" version segments recorded as LOW.
 - **Tests:** mg-media 90 pass, mg-engine lyrics_consent 14 pass, clippy -D warnings clean.
 - Integration conditions from the reviewer are recorded in AUTOPILOT-PROGRESS.md.
+
+## 2026-11-27 - Review fixes: display.rs panic-free, whole-word versions, Segoe UI fallback tests, is_rtl
+
+- Branch feature/poc-audio-fullscreen (base fbaf138), uncommitted.
+- crates/mg-media/src/display.rs: `split_feat` matched on `to_lowercase()` and sliced the original with those offsets (U+0130, Kelvin sign changed byte length: panic or dropped credit). Now uses `to_ascii_lowercase()` (offset-preserving) and `get(..)` everywhere; `split_version` also uses `get`. `is_version` matches whole words (split on non-alphanumerics, ASCII-case-insensitive; multi-word entries as word sequences); "remastered" added to VERSION_WORDS. Tests: unicode_lowercase_length_changes_cannot_panic_or_drop_credits, version_words_match_whole_words_only, mixed_unicode_never_panics (3000-iteration LCG fuzz plus 100k-char strings). RED before fix: all three failed (panic at display.rs:43, "Song (Alive)" stripped).
+- crates/mg-text/src/lib.rs: `is_rtl` skips Arabic-Indic digits and Hebrew/Arabic combining marks (not strong directional). Test extended; RED before fix.
+- crates/mg-text/src/dwrite.rs: `TextRenderer::new_forced_fallback()` (shared private `create(force_fallback)`) selects Segoe UI for both cuts. The margin, wrapping/CJK and tracking/RTL tests now run for both renderers; a test prints widths. All expectations hold with the fallback; widths differ only slightly (Display cut, 40px weight 600: "Bohemian Rhapsody (Live at Wembley)" 700 variable vs 709 fallback; Text cut identical).
+- Verification: cargo test -p mg-media (93 pass), cargo test -p mg-text (8 pass), clippy -D warnings clean for both crates, rustfmt --check on the three files OK. Not run: UI/E2E.
