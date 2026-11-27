@@ -55,6 +55,8 @@ struct Ctx<'a> {
     h: &'a Headless,
     scene: SceneSet,
     p: SceneParams,
+    /// Frame time of the run (1/60, 1/30, 1/20).
+    dt: f32,
 }
 
 impl Ctx<'_> {
@@ -116,9 +118,9 @@ fn run_pair(c: &mut Ctx, from: SceneKind, to: SceneKind, pace: Pace, animate: bo
     let t0 = c.p.time;
     let (mut frames, mut imgs, mut lifecycle_ok) = (Vec::new(), Vec::new(), true);
     for _ in 0..600 {
-        let f = s.update(DT, |k| scene_luma(k, &pal));
+        let f = s.update(c.dt, |k| scene_luma(k, &pal));
         if animate {
-            c.p.time += DT;
+            c.p.time += c.dt;
         }
         imgs.push(c.render(f.scene, f.fx(), None)?);
         lifecycle_ok &= c.lifecycle_ok(f.scene);
@@ -209,6 +211,7 @@ pub fn transition_checks(failures: &mut Vec<String>) -> bool {
         h: &h,
         scene: SceneSet::new_headless(&h.device),
         p: base.clone(),
+        dt: DT,
     };
     println!(
         "TRANSITION note: the flash guard and bridge luminance use a PALETTE-level proxy (scene_luma), not measured screen luminance; the checks below measure the real rendered luminance"
@@ -231,7 +234,11 @@ pub fn transition_checks(failures: &mut Vec<String>) -> bool {
             c.p.album.rect = [0.9, 0.5, 0.2, 0.2];
             c.p.album.spill = 1.0;
         }
-        scenario_checks(&mut c, sc, failures);
+        for fps in [60u32, 30, 20] {
+            c.dt = 1.0 / fps as f32;
+            scenario_checks(&mut c, sc, fps, failures);
+        }
+        c.dt = DT;
         if sc.white_cover {
             c.scene.set_focus_art(&h.queue, None);
         }
@@ -242,8 +249,8 @@ pub fn transition_checks(failures: &mut Vec<String>) -> bool {
     true
 }
 
-fn scenario_checks(c: &mut Ctx, sc: &Scenario, failures: &mut Vec<String>) {
-    let dump = if sc.name == "demo" {
+fn scenario_checks(c: &mut Ctx, sc: &Scenario, fps: u32, failures: &mut Vec<String>) {
+    let dump = if sc.name == "demo" && fps == 60 {
         std::env::var("MG_SCENE_DUMP").ok()
     } else {
         None
@@ -269,7 +276,7 @@ fn scenario_checks(c: &mut Ctx, sc: &Scenario, failures: &mut Vec<String>) {
     let (mut worst_dl, mut worst_sw, mut worst_dip, mut count) = (0.0f32, 0usize, 0.0f32, 0);
     for animate in [false, true] {
         // the animated variant (time advances, FULL breathes, Fluid steps) only for the demo scenario
-        if animate && sc.name != "demo" {
+        if animate && (sc.name != "demo" || fps != 60) {
             continue;
         }
         for pace in [Pace::Quick, Pace::Full, Pace::Reduced] {
@@ -279,8 +286,13 @@ fn scenario_checks(c: &mut Ctx, sc: &Scenario, failures: &mut Vec<String>) {
                         continue;
                     }
                     let name = format!(
-                        "[{}{}] {from:?}->{to:?}/{pace:?}",
+                        "[{}{}{}] {from:?}->{to:?}/{pace:?}",
                         sc.name,
+                        if fps == 60 {
+                            String::new()
+                        } else {
+                            format!(" {fps}fps")
+                        },
                         if animate { " animated" } else { "" }
                     );
                     let Some(r) = run_pair(c, from, to, pace, animate) else {
@@ -295,7 +307,7 @@ fn scenario_checks(c: &mut Ctx, sc: &Scenario, failures: &mut Vec<String>) {
                         .windows(2)
                         .map(|w| (w[1] - w[0]).abs())
                         .fold(0.0, f32::max);
-                    let per_s = SwingTracker::max_per_second(&ys, 60);
+                    let per_s = SwingTracker::max_per_second(&ys, (1.0 / c.dt).round() as usize);
                     let floor = 0.5 * ysrc.min(ydst).min(0.04);
                     let last_f = r.frames.last().expect("frames");
                     let bridge_ys: Vec<f32> = r
@@ -319,7 +331,7 @@ fn scenario_checks(c: &mut Ctx, sc: &Scenario, failures: &mut Vec<String>) {
                     worst_dl = worst_dl.max(max_dl);
                     worst_sw = worst_sw.max(per_s);
                     worst_dip = worst_dip.max(dip);
-                    let secs = r.frames.len() as f32 * DT;
+                    let secs = r.frames.len() as f32 * c.dt;
                     let mut bad = Vec::new();
                     if last_f.phase != Phase::Idle
                         || last_f.scene != to
@@ -336,14 +348,14 @@ fn scenario_checks(c: &mut Ctx, sc: &Scenario, failures: &mut Vec<String>) {
                         ));
                     }
                     if max_dl > 0.105 {
-                        bad.push(format!("per-frame luminance step {max_dl:.3} > 0.1"));
+                        bad.push(format!("per-frame luminance step {max_dl:.3} > 0.105 (MAX_DL 0.1 plus a 0.005 margin for dither and rounding)"));
                     }
                     if per_s > 3 {
                         bad.push(format!("{per_s} luminance swings within 1 s"));
                     }
-                    if !animate {
+                    if !animate && fps == 60 {
                         let first = mad(&r.imgs[0], &idle[from.index()]);
-                        let tol = if to == SceneKind::Fluid { 3.0 } else { 0.5 };
+                        let tol = if to == SceneKind::Fluid { 3.0 } else { 0.0 };
                         let last = mad(r.imgs.last().expect("imgs"), &idle[to.index()]);
                         if first > 1.5 {
                             bad.push(format!(
@@ -410,11 +422,11 @@ fn scenario_checks(c: &mut Ctx, sc: &Scenario, failures: &mut Vec<String>) {
         }
     }
     println!(
-        "TRANSITION [{}] {count} pair runs: worst per-frame dY {worst_dl:.3}, worst swings/s {worst_sw}, worst dip below scenes/bridge {worst_dip:.3}",
+        "TRANSITION [{}] {fps} fps: {count} pair runs: worst per-frame dY {worst_dl:.3}, worst swings/s {worst_sw}, worst dip below scenes/bridge {worst_dip:.3}",
         sc.name
     );
     let floor = 0.5 * idle.iter().map(|i| y_of(i)).fold(0.04f32, f32::min);
-    churn_check(c, sc.name, floor, failures);
+    churn_check(c, &format!("{} {fps}fps", sc.name), floor, failures);
 }
 
 /// The overlay is drawn after the scene and never fades: strong overlay pixels (icons, text) over every frame of a
@@ -546,7 +558,7 @@ fn churn_check(c: &mut Ctx, tag: &str, floor: f32, failures: &mut Vec<String>) {
     let (mut rng, mut bad, mut warm) = (99u32, 0u32, None);
     let mut ys = Vec::new();
     let mut tags = Vec::new();
-    // 240 requests: spaced 3..34 frames; the last 100 hammer every 5..8 frames
+    // 340 requests: the first 240 spaced 3..34 frames (the first 40 are warm-up), the last 100 hammer every 5..8 frames
     for i in 0..340 {
         if i == 40 {
             // the first 40 requests warm the allocator pools; growth is judged after that
@@ -562,8 +574,8 @@ fn churn_check(c: &mut Ctx, tag: &str, floor: f32, failures: &mut Vec<String>) {
             5 + (rng >> 30)
         };
         for _ in 0..gap {
-            let f = s.update(DT, |k| scene_luma(k, &pal));
-            c.p.time += DT;
+            let f = s.update(c.dt, |k| scene_luma(k, &pal));
+            c.p.time += c.dt;
             match c.render(f.scene, f.fx(), None) {
                 Some(img) => {
                     ys.push(y_of(&img));
@@ -581,7 +593,7 @@ fn churn_check(c: &mut Ctx, tag: &str, floor: f32, failures: &mut Vec<String>) {
         .windows(2)
         .map(|w| (w[1] - w[0]).abs())
         .fold(0.0, f32::max);
-    let per_s = SwingTracker::max_per_second(&ys, 60);
+    let per_s = SwingTracker::max_per_second(&ys, (1.0 / c.dt).round() as usize);
     let worst_at = (1..ys.len())
         .max_by(|&a, &b| {
             (ys[a] - ys[a - 1])
@@ -595,7 +607,7 @@ fn churn_check(c: &mut Ctx, tag: &str, floor: f32, failures: &mut Vec<String>) {
         _ => "allocator bytes not reported on this backend".to_string(),
     };
     println!(
-        "TRANSITION [{tag}] churn: {} measured frames of 300 requests (240 random + 100 hammer, 40 warm-up), render/lifecycle failures {bad}, min Y {min_y:.3} (floor {floor:.3}), max per-frame dY {max_dl:.3}, swings/s {per_s}, {mem}",
+        "TRANSITION [{tag}] churn: {} measured frames of 300 measured requests (200 random + 100 hammer; 40 warm-up before), render/lifecycle failures {bad}, min Y {min_y:.3} (floor {floor:.3}), max per-frame dY {max_dl:.3}, swings/s {per_s}, {mem}",
         ys.len()
     );
     if bad > 0 {

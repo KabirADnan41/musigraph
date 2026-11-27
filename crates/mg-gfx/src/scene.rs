@@ -1617,6 +1617,27 @@ mod tests {
                 geom != idle && part != idle && geom != part,
                 "{k:?}: the geometry and particle veils remove different layers"
             );
+            // geometry veil 1 mixes the bridge in by the mean of the layer veils (1/3): away from the geometry the
+            // picture is exactly (2/3) idle + (1/3) bridge; where the geometry was, it is darker than that
+            let expect: Vec<u8> = idle
+                .iter()
+                .zip(&flat)
+                .map(|(&i, &b)| (f32::from(i) * (2.0 / 3.0) + f32::from(b) / 3.0).round() as u8)
+                .collect();
+            let corner = |a: &[u8]| lum(a, 0, 40, 0, 30);
+            assert!(
+                (corner(&geom) - corner(&expect)).abs() < 0.01,
+                "{k:?}: off the geometry the bridge mix is 1/3 ({} vs {})",
+                corner(&geom),
+                corner(&expect)
+            );
+            let body = |a: &[u8]| lum(a, 100, 220, 50, 100);
+            assert!(
+                body(&geom) < body(&expect) - 0.005,
+                "{k:?}: the geometry itself is gone ({} vs {})",
+                body(&geom),
+                body(&expect)
+            );
             let atmo = render(
                 k,
                 Fx {
@@ -1625,7 +1646,18 @@ mod tests {
                     ..Fx::default()
                 },
             );
-            assert!(atmo != idle, "{k:?}: atmosphere veil");
+            // the atmosphere veil only mixes (0.6 / 3 = 0.2) towards the bridge, it dims nothing on its own
+            let worst = atmo
+                .iter()
+                .zip(idle.iter().zip(&flat))
+                .map(|(&a, (&i, &b))| {
+                    (f32::from(a) - (f32::from(i) * 0.8 + f32::from(b) * 0.2)).abs()
+                })
+                .fold(0.0f32, f32::max);
+            assert!(
+                worst <= 2.0,
+                "{k:?}: atmosphere veil is a pure 20% bridge mix (off by {worst})"
+            );
         }
         for k in [SceneKind::Focus, SceneKind::Fluid] {
             let idle = render(k, Fx::default());
@@ -1749,6 +1781,42 @@ mod tests {
             maxd(&render(&scene, &p, SceneKind::Fluid), &idle) <= 1,
             "released = clear"
         );
+    }
+
+    #[test]
+    fn fluid_is_not_stepped_while_fully_veiled_and_resumes_with_bounded_catch_up_headless() {
+        let Some((h, mut scene)) = headless() else {
+            return;
+        };
+        let res = (320u32, 180u32);
+        let mut p = SceneParams {
+            mode: SceneMode::Live,
+            ..Default::default()
+        };
+        for e in &mut p.fluid.emit {
+            e[2] = 1.0;
+        }
+        p.fluid.flow[0] = 0.08;
+        // allocate and run for a while
+        for i in 0..30 {
+            p.time = i as f32 / 60.0;
+            scene.prepare(&h.device, &h.queue, res, &p, SceneKind::Fluid);
+        }
+        let dye = |s: &SceneSet| s.fluid_dye(&h.device, &h.queue).unwrap().2;
+        let before = dye(&scene);
+        // fully veiled (the bridge) for 1 s of scene time: the field must not move
+        p.fx.veil = [1.0; 4];
+        for i in 30..90 {
+            p.time = i as f32 / 60.0;
+            scene.prepare(&h.device, &h.queue, res, &p, SceneKind::Fluid);
+        }
+        assert_eq!(dye(&scene), before, "no steps while veiled");
+        // resuming owes 1 s of steps but at most MAX_STEPS_PER_FRAME run in one call (see `FluidTime::steps`)
+        p.fx.veil = [0.0; 4];
+        p.time = 90.0 / 60.0;
+        scene.prepare(&h.device, &h.queue, res, &p, SceneKind::Fluid);
+        let after = dye(&scene);
+        assert_ne!(after, before, "the field moves again");
     }
 
     #[test]

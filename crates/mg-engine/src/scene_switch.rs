@@ -64,6 +64,9 @@ const SPAN: f32 = 0.70;
 const SLEW_S: f32 = 0.15;
 /// A luminance step bigger than this per frame is never produced.
 const MAX_DL: f32 = 0.1;
+/// The veil step is capped for this smaller luminance step, leaving 10% of `MAX_DL` for the scene content itself
+/// changing between two frames (measured: a Fluid enter at 20 fps reached 0.106 with a cap of exactly 0.1).
+const CAP_DL: f32 = 0.9 * MAX_DL;
 /// A luminance swing (a reversal of at least this size) counts toward the flash guard.
 const SWING_AMP: f32 = 0.1;
 const MAX_SWINGS_PER_S: usize = 3;
@@ -77,10 +80,12 @@ const BRIDGE_MAX: f32 = 0.25;
 /// Quiet this long after the last request releases a held bridge.
 const HOLD_RELEASE_S: f32 = 0.4;
 /// The flash guard and the per-frame luminance cap are a PALETTE-LEVEL PROXY, not measured screen luminance: the
-/// palette estimate was 2-4x too low for bright palettes (Spectrum 0.25 vs 0.49 measured, Fluid 0.13 vs 0.59), so the
-/// guard assumes at least this bright a scene. Dim scenes then only cost an unnecessary calm hold under hammering.
+/// palette estimate was 2-4x too low for bright palettes (Spectrum 0.25 vs 0.49 measured, Fluid 0.13 vs 0.59), so both
+/// assume the worst case, a white scene (Y = 1). The cap is then dt-independent in absolute terms: a veil step of at
+/// most `MAX_DL / (1 - bridge)` per frame keeps every frame-to-frame luminance step <= `MAX_DL` at ANY frame rate
+/// (a lower fps just stretches the phase). Dim scenes only cost an unnecessary calm hold under hammering.
 /// Area- or region-level flashing validation is NOT claimed (tracked for Interactive Session 3).
-const GUARD_Y: f32 = 0.5;
+const GUARD_Y: f32 = 1.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Phase {
@@ -472,7 +477,7 @@ impl SceneSwitch {
         let (ys, yd) = (luma(self.shown), luma(dest));
         let by_target = bridge_target(ys, yd);
         let yg = ys.max(GUARD_Y);
-        let lum_lim = MAX_DL / (yg - self.bridge_y.unwrap_or(by_target)).abs().max(MAX_DL);
+        let lum_lim = CAP_DL / (yg - self.bridge_y.unwrap_or(by_target)).abs().max(CAP_DL);
 
         match self.st {
             St::Idle => {}
@@ -875,6 +880,33 @@ mod tests {
         assert_eq!((s.update(DT, bright).scene, s.target()), (shown, shown));
     }
 
+    #[test]
+    fn the_per_frame_luminance_step_stays_within_the_bound_at_any_frame_rate() {
+        // bright (0.9) and white (1.0) scenes: the step in absolute luminance is dt-independent
+        for lum in [0.9f32, 1.0] {
+            for dt in [1.0 / 60.0, 1.0 / 30.0, 1.0 / 20.0, 1.0 / 10.0] {
+                for (from, to) in [(Spectrum, Fluid), (Fluid, Focus), (Orb, Aurora)] {
+                    let mut s = SceneSwitch::new(from);
+                    s.request(to);
+                    let mut prev = lum;
+                    for _ in 0..600 {
+                        let f = s.update(dt, |_| lum);
+                        let y = lum * (1.0 - f.veil[3]) + f.bridge_luma * f.veil[3];
+                        assert!(
+                            (y - prev).abs() <= MAX_DL + 1e-3,
+                            "step {} at dt {dt} lum {lum}",
+                            (y - prev).abs()
+                        );
+                        prev = y;
+                        if f.phase == Phase::Idle {
+                            break;
+                        }
+                    }
+                    assert_eq!(s.target(), to);
+                }
+            }
+        }
+    }
     #[test]
     fn re_selecting_the_active_scene_when_idle_does_nothing() {
         let mut s = SceneSwitch::new(Focus);
