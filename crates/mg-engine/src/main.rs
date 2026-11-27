@@ -15,6 +15,8 @@ mod presentation;
 mod scene_map;
 mod scene_run;
 mod scene_switch;
+#[allow(dead_code)] // wired by the scene panel (S5)
+mod scene_thumbs;
 mod selftest;
 mod sim;
 

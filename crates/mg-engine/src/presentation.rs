@@ -426,6 +426,9 @@ pub enum GpuOp {
     ClearPrevArt,
     SetText(usize, TextBitmap),
     ClearText(usize),
+    /// Scene-panel thumbnails (one sRGB RGBA8 picture per scene index, made once by `scene_thumbs`).
+    #[allow(dead_code)] // sent by the scene panel wiring (S5)
+    SetThumbs(Box<crate::scene_thumbs::Thumbs>),
 }
 
 impl GpuOp {
@@ -463,6 +466,13 @@ impl GpuOp {
                 ov.set_text(device, queue, i, (b.width, b.height), &b.coverage);
             }
             GpuOp::ClearText(i) => ov.clear_text(device, i),
+            GpuOp::SetThumbs(t) => {
+                for (i, img) in t.iter().enumerate() {
+                    if let Some(img) = img {
+                        ov.set_panel_thumb(device, queue, i, img);
+                    }
+                }
+            }
         }
     }
 }

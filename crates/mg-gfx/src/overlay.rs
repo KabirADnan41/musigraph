@@ -16,6 +16,16 @@ pub const META_SLOT: usize = 7;
 /// Largest texture side accepted (defence in depth; callers already bound their content).
 const MAX_TEXTURE_SIDE: u32 = 4096;
 
+/// Scene-panel atlas layout (binding 13, one Rgba8UnormSrgb texture): thumbnail cells (3 columns, 2 rows of
+/// `THUMB_SIZE`, cell = `SceneKind::index()`) above label cells (3 columns, 3 rows of `LABEL_SIZE`, white with
+/// the glyph coverage in alpha).
+pub const THUMB_SIZE: (u32, u32) = (256, 144);
+pub const THUMB_CELLS: usize = 5;
+pub const LABEL_SIZE: (u32, u32) = (256, 48);
+pub const LABEL_CELLS: usize = 8;
+pub const LABEL_ORIGIN_Y: u32 = 2 * THUMB_SIZE.1;
+pub const ATLAS_SIZE: (u32, u32) = (3 * THUMB_SIZE.0, LABEL_ORIGIN_Y + 3 * LABEL_SIZE.1);
+
 /// Artwork placement in surface pixels. `(cx, cy)` is the centre; `hw`/`hh` the half extents (the caller
 /// preserves the image aspect ratio when computing them). The plate (rounded corners, 1 px inner stroke, contact
 /// and ambient shadow) is drawn by the shader; nothing about it reacts to the music.
@@ -373,6 +383,10 @@ pub struct Overlay {
     art: Option<wgpu::TextureView>,
     art_prev: Option<wgpu::TextureView>,
     texts: [Option<wgpu::TextureView>; TEXT_SLOTS],
+    /// Scene-panel atlas (thumbnails above, label coverage in alpha below), created on first upload and kept.
+    atlas: Option<wgpu::Texture>,
+    atlas_view: Option<wgpu::TextureView>,
+    atlas_creations: u32,
     /// 1x1 stand-ins so the bind group is always complete.
     blank_rgba: wgpu::TextureView,
     blank_r8: wgpu::TextureView,
@@ -505,6 +519,7 @@ impl Overlay {
                 tex_entry(9),
                 tex_entry(11),
                 tex_entry(12),
+                tex_entry(13),
                 wgpu::BindGroupLayoutEntry {
                     binding: 10,
                     visibility: wgpu::ShaderStages::FRAGMENT,
@@ -618,6 +633,7 @@ impl Overlay {
                 [&uniform, &controls_uniform],
                 [&blank_rgba, &blank_rgba],
                 [&blank_r8; TEXT_SLOTS],
+                &blank_rgba,
                 &sampler,
             ),
             pipeline,
@@ -629,6 +645,9 @@ impl Overlay {
             art: None,
             art_prev: None,
             texts: Default::default(),
+            atlas: None,
+            atlas_view: None,
+            atlas_creations: 0,
             blank_rgba,
             blank_r8,
         };
@@ -642,12 +661,17 @@ impl Overlay {
         uniforms: [&wgpu::Buffer; 2],
         art: [&wgpu::TextureView; 2],
         texts: [&wgpu::TextureView; TEXT_SLOTS],
+        atlas: &wgpu::TextureView,
         sampler: &wgpu::Sampler,
     ) -> wgpu::BindGroup {
         device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("overlay"),
             layout: bgl,
             entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 13,
+                    resource: wgpu::BindingResource::TextureView(atlas),
+                },
                 wgpu::BindGroupEntry {
                     binding: 11,
                     resource: wgpu::BindingResource::TextureView(texts[META_SLOT]),
@@ -714,6 +738,7 @@ impl Overlay {
                 self.art_prev.as_ref().unwrap_or(&self.blank_rgba),
             ],
             std::array::from_fn(|i| self.texts[i].as_ref().unwrap_or(&self.blank_r8)),
+            self.atlas_view.as_ref().unwrap_or(&self.blank_rgba),
             &self.sampler,
         );
     }
@@ -771,6 +796,126 @@ impl Overlay {
     pub fn clear_art(&mut self, device: &wgpu::Device) {
         self.art = None;
         self.rebuild(device);
+    }
+
+    /// Creates the panel atlas on first use (one `ATLAS_SIZE` texture for the life of the overlay; later uploads
+    /// write sub-rectangles).
+    fn ensure_atlas(&mut self, device: &wgpu::Device) -> &wgpu::Texture {
+        if self.atlas.is_none() {
+            let tex = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("panel atlas"),
+                size: wgpu::Extent3d {
+                    width: ATLAS_SIZE.0,
+                    height: ATLAS_SIZE.1,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8UnormSrgb,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+            self.atlas_view = Some(tex.create_view(&wgpu::TextureViewDescriptor::default()));
+            self.atlas = Some(tex);
+            self.atlas_creations += 1;
+            self.rebuild(device);
+        }
+        self.atlas.as_ref().expect("created above")
+    }
+
+    /// Times the panel atlas texture was created (1 after the first upload, never more; tests).
+    pub fn atlas_creations(&self) -> u32 {
+        self.atlas_creations
+    }
+
+    fn write_atlas(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        origin: (u32, u32),
+        size: (u32, u32),
+        rgba: &[u8],
+    ) {
+        let tex = self.ensure_atlas(device);
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: tex,
+                mip_level: 0,
+                origin: wgpu::Origin3d {
+                    x: origin.0,
+                    y: origin.1,
+                    z: 0,
+                },
+                aspect: wgpu::TextureAspect::All,
+            },
+            rgba,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(size.0 * 4),
+                rows_per_image: Some(size.1),
+            },
+            wgpu::Extent3d {
+                width: size.0,
+                height: size.1,
+                depth_or_array_layers: 1,
+            },
+        );
+    }
+
+    /// Writes the thumbnail of scene `index` (`SceneKind::index()`; straight sRGB RGBA8, `THUMB_SIZE`) into its
+    /// atlas cell. False (nothing written) for a wrong index or length.
+    pub fn set_panel_thumb(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        index: usize,
+        rgba: &[u8],
+    ) -> bool {
+        if index >= THUMB_CELLS || rgba.len() != (THUMB_SIZE.0 * THUMB_SIZE.1 * 4) as usize {
+            return false;
+        }
+        let o = (
+            (index as u32 % 3) * THUMB_SIZE.0,
+            (index as u32 / 3) * THUMB_SIZE.1,
+        );
+        self.write_atlas(device, queue, o, THUMB_SIZE, rgba);
+        true
+    }
+
+    /// Writes label `cell` (< `LABEL_CELLS`) from a coverage bitmap (`w x h`, at most `LABEL_SIZE`) into the
+    /// atlas: white with the coverage in alpha (alpha is not sRGB-decoded). The rest of the cell is cleared.
+    pub fn set_panel_label(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        cell: usize,
+        size: (u32, u32),
+        coverage: &[u8],
+    ) -> bool {
+        if cell >= LABEL_CELLS
+            || size.0 == 0
+            || size.1 == 0
+            || size.0 > LABEL_SIZE.0
+            || size.1 > LABEL_SIZE.1
+            || coverage.len() != (size.0 * size.1) as usize
+        {
+            return false;
+        }
+        let mut px = vec![0u8; (LABEL_SIZE.0 * LABEL_SIZE.1 * 4) as usize];
+        for y in 0..size.1 {
+            for x in 0..size.0 {
+                let o = ((y * LABEL_SIZE.0 + x) * 4) as usize;
+                px[o..o + 3].fill(255);
+                px[o + 3] = coverage[(y * size.0 + x) as usize];
+            }
+        }
+        let o = (
+            (cell as u32 % 3) * LABEL_SIZE.0,
+            LABEL_ORIGIN_Y + (cell as u32 / 3) * LABEL_SIZE.1,
+        );
+        self.write_atlas(device, queue, o, LABEL_SIZE, &px);
+        true
     }
 
     /// Replaces text slot `which` (see `TEXT_SLOTS`) with a coverage bitmap (8-bit, `w x h`).
@@ -963,6 +1108,41 @@ mod tests {
         }
         let (x, y, w, h) = c.scissor(res); // NaN/inf geometry still yields a legal rectangle
         assert!(w >= 1 && h >= 1 && x + w <= res.0 && y + h <= res.1);
+    }
+
+    #[test]
+    fn panel_atlas_is_created_once_and_refuses_malformed_uploads_headless() {
+        let Ok(h) = init_headless() else {
+            eprintln!("SKIPPED (no hardware GPU)");
+            return;
+        };
+        let mut ov = Overlay::new_headless(&h.device, &h.queue);
+        assert_eq!(
+            ov.atlas_creations(),
+            0,
+            "nothing allocated until the first upload"
+        );
+        let thumb = vec![200u8; (THUMB_SIZE.0 * THUMB_SIZE.1 * 4) as usize];
+        assert!(!ov.set_panel_thumb(&h.device, &h.queue, THUMB_CELLS, &thumb));
+        assert!(!ov.set_panel_thumb(&h.device, &h.queue, 0, &thumb[..8]));
+        assert_eq!(ov.atlas_creations(), 0, "refused uploads allocate nothing");
+        let cov = vec![255u8; 40 * 20];
+        assert!(!ov.set_panel_label(&h.device, &h.queue, LABEL_CELLS, (40, 20), &cov));
+        assert!(!ov.set_panel_label(&h.device, &h.queue, 0, (LABEL_SIZE.0 + 1, 1), &cov));
+        assert!(!ov.set_panel_label(&h.device, &h.queue, 0, (40, 20), &cov[..5]));
+        for _ in 0..50 {
+            for i in 0..THUMB_CELLS {
+                assert!(ov.set_panel_thumb(&h.device, &h.queue, i, &thumb));
+            }
+            for c in 0..LABEL_CELLS {
+                assert!(ov.set_panel_label(&h.device, &h.queue, c, (40, 20), &cov));
+            }
+        }
+        assert_eq!(
+            ov.atlas_creations(),
+            1,
+            "one atlas for the life of the overlay"
+        );
     }
 
     /// The scissor covers the focused progress backing (track half thickness at hover + pad 7s + 3rw, rw = max(1, s))
