@@ -19,6 +19,7 @@ use crate::media_feed::MediaFeed;
 use crate::music_summary::MusicSummary;
 use crate::presentation::{GpuOp, Layout, Presentation, Ready, Worker, apply_album};
 use crate::scene_map::{Input, MapTuning, SceneMapper};
+use crate::scene_panel::{PanelEvent, PanelKey, ScenePanel};
 use crate::scene_switch::SceneSwitch;
 use mg_audio::capture::Loopback;
 use mg_dsp::features::{MusicFeatures, MusicTracker};
@@ -51,6 +52,8 @@ enum KeyAction {
     NextScene,
     /// Zero-based position in `SceneKind::selector()`.
     SceneAt(usize),
+    /// Open or close the scene panel (the Scene button).
+    TogglePanel,
     ToggleLyrics,
     CycleArtwork,
     ToggleFullscreen,
@@ -102,12 +105,31 @@ fn button_action(b: ButtonId) -> KeyAction {
         ButtonId::Previous => KeyAction::Media(MediaCommand::Previous),
         ButtonId::PlayPause => KeyAction::Media(MediaCommand::TogglePlayPause),
         ButtonId::Next => KeyAction::Media(MediaCommand::Next),
-        ButtonId::Scene => KeyAction::NextScene,
+        ButtonId::Scene => KeyAction::TogglePanel,
         ButtonId::Lyrics => KeyAction::ToggleLyrics,
         ButtonId::Artwork => KeyAction::CycleArtwork,
         ButtonId::Fullscreen => KeyAction::ToggleFullscreen,
         ButtonId::Exit => KeyAction::Exit,
     }
+}
+
+/// The keys the open scene panel takes before the global key map (so Esc closes the panel, not the app, and the
+/// arrows move the panel focus instead of changing track). Enter ignores key repeat; Space, `[` `]`, the digits,
+/// L, A and F stay global.
+fn panel_key(code: KeyCode, shift: bool, repeat: bool) -> Option<PanelKey> {
+    Some(match code {
+        KeyCode::Escape => PanelKey::Escape,
+        KeyCode::Tab if shift => PanelKey::BackTab,
+        KeyCode::Tab => PanelKey::Tab,
+        KeyCode::ArrowUp => PanelKey::Up,
+        KeyCode::ArrowDown => PanelKey::Down,
+        KeyCode::ArrowLeft => PanelKey::Left,
+        KeyCode::ArrowRight => PanelKey::Right,
+        KeyCode::Home => PanelKey::Home,
+        KeyCode::End => PanelKey::End,
+        KeyCode::Enter | KeyCode::NumpadEnter if !repeat => PanelKey::Enter,
+        _ => return None,
+    })
 }
 
 /// Seek delta (seconds) for a key while the progress line has keyboard focus: Left/Right step 5 s back/forward
@@ -363,6 +385,14 @@ struct App {
     last_seq: u64,
     last_change: Instant,
     ctl: ControlsUi,
+    panel: ScenePanel,
+    /// Pointer position in surface pixels (None while outside the window).
+    pointer: Option<(f32, f32)>,
+    /// The last input was the keyboard (the panel shows its focus ring only then).
+    keyboard_input: bool,
+    /// Runtime scene thumbnails: started once shortly after launch on a worker thread, delivered here.
+    thumbs_rx: Option<std::sync::mpsc::Receiver<crate::scene_thumbs::Thumbs>>,
+    thumbs_started: bool,
     cursor_hidden: bool,
     mods: ModifiersState,
     last_unsupported_note: Option<Instant>,
@@ -492,10 +522,18 @@ impl ApplicationHandler for App {
             } => self.on_key(el, code, repeat),
             WindowEvent::CursorMoved { position, .. } => {
                 self.sync_view();
+                self.pointer = Some((position.x as f32, position.y as f32));
+                self.keyboard_input = false;
+                self.panel
+                    .pointer_moved((position.x as f32, position.y as f32));
                 self.ctl
                     .pointer_moved((position.x as f32, position.y as f32));
             }
-            WindowEvent::CursorLeft { .. } => self.ctl.pointer_left(),
+            WindowEvent::CursorLeft { .. } => {
+                self.pointer = None;
+                self.panel.pointer_left();
+                self.ctl.pointer_left()
+            }
             WindowEvent::MouseInput {
                 state,
                 button: MouseButton::Left,
@@ -557,6 +595,10 @@ impl App {
                     .map_or((0, 0), |g| (g.config.width, g.config.height));
                 self.pres.set_layout(self.pres.layout().next(), surface);
             }
+            KeyAction::TogglePanel => {
+                let keyboard = self.keyboard_input;
+                self.panel.toggle(self.switch.target(), keyboard);
+            }
             KeyAction::PrevScene | KeyAction::NextScene | KeyAction::SceneAt(_) => {
                 let from = self.switch.target();
                 let to = match action {
@@ -567,6 +609,7 @@ impl App {
                 };
                 if let Some(to) = to {
                     self.switch.request(to);
+                    self.panel.follow(self.switch.target()); // no-op while the panel is closed
                     self.last_auto_switch = Instant::now(); // a manual choice restarts the tour timer
                 }
             }
@@ -599,6 +642,7 @@ impl App {
             .map_or(1.0, |w| w.scale_factor() as f32);
         let s = self.surface();
         self.ctl.set_view(s, dpi);
+        self.panel.set_view(s, dpi);
     }
 
     fn availability(&self) -> Availability {
@@ -611,6 +655,15 @@ impl App {
     fn on_key(&mut self, el: &ActiveEventLoop, code: KeyCode, repeat: bool) {
         self.sync_view();
         self.ctl.key_activity();
+        self.keyboard_input = true;
+        // an open scene panel takes its keys first (Esc closes only the panel)
+        if self.panel.is_open()
+            && toggle_allowed(self.mods)
+            && let Some(k) = panel_key(code, self.mods.shift_key(), repeat)
+        {
+            let ev = self.panel.key(k);
+            return self.on_panel_event(ev);
+        }
         // the focused progress line takes Left/Right/Home/End (key repeat allowed: holding an arrow keeps seeking)
         if toggle_allowed(self.mods)
             && self.ctl.progress_focused(&self.availability())
@@ -646,6 +699,15 @@ impl App {
         }
     }
 
+    /// What the panel decided: a selection is a scene request (the crossfade and its latest-wins rule live in
+    /// `SceneSwitch`); a manual choice restarts the tour timer like the keys do.
+    fn on_panel_event(&mut self, ev: PanelEvent) {
+        if let PanelEvent::Select(k) = ev {
+            self.switch.request(k);
+            self.last_auto_switch = Instant::now();
+        }
+    }
+
     /// A bar button (click or keyboard activation): the same action as its key, but its own exit reason.
     fn run_button(&mut self, el: &ActiveEventLoop, b: ButtonId) {
         self.run_action(el, button_action(b));
@@ -656,6 +718,17 @@ impl App {
 
     fn on_left_button(&mut self, el: &ActiveEventLoop, down: bool) {
         self.sync_view();
+        self.keyboard_input = false;
+        // a click outside the control bar belongs to the open panel (a tile selects, empty space closes)
+        if down
+            && self.panel.is_open()
+            && let Some(p) = self.pointer
+            && !self.ctl.geometry().area.contains(p)
+        {
+            self.ctl.key_activity();
+            let ev = self.panel.click(p);
+            return self.on_panel_event(ev);
+        }
         let av = self.availability();
         match self.ctl.mouse_left(down, &av) {
             Some(Click::Button(b)) => self.run_button(el, b),
@@ -745,6 +818,7 @@ impl App {
                 self.motion_reduced = r;
                 self.mapper.set_reduced_motion(r);
                 self.pres.set_reduced_motion(r);
+                self.panel.set_reduced(r);
             }
         }
         let t_poll = Instant::now();
@@ -762,6 +836,7 @@ impl App {
         while let Some(r) = self.worker.try_recv() {
             match r {
                 Ready::Clock { .. } => self.ctl.on_ready(r),
+                Ready::PanelLabels { .. } => self.panel.on_ready(r),
                 r => self.pres.on_ready(r),
             }
         }
@@ -778,6 +853,10 @@ impl App {
         };
         // While the bar is visible the lyrics ride above it. The bar advances first so the lift follows this
         // frame's bar alpha (applied after the lyric easing: no lag, no overlap with a visible bar).
+        // the scene panel: its "current" follows the switch's destination; while open it holds the one idle timer
+        self.panel.set_current(self.switch.target());
+        self.panel.advance(dt as f32);
+        self.ctl.vis.set_hold(self.panel.is_open());
         self.ctl.advance(dt as f32);
         self.pres.set_lyric_anchor(anchor);
         self.pres.set_lyric_lift(self.ctl.lyric_lift(anchor));
@@ -813,7 +892,11 @@ impl App {
             fg: overlay_params.colors.title,
             tint: overlay_params.accent,
         });
+        overlay_params.panel = self.panel.frame(overlay_params.accent);
         for job in self.ctl.take_jobs() {
+            self.worker.submit(job);
+        }
+        for job in self.panel.take_jobs() {
             self.worker.submit(job);
         }
         // Album Focus room light: the presentation owns the light rectangle (one source of truth with the cover
@@ -852,6 +935,24 @@ impl App {
             self.result = Err(format!("wgpu error: {e}"));
             return el.exit();
         }
+        // Scene thumbnails: made once, half a second after launch, off the render thread with a throwaway scene set
+        if !self.thumbs_started && self.start.elapsed() >= Duration::from_millis(500) {
+            self.thumbs_started = true;
+            let (device, queue) = (g.device.clone(), g.queue.clone());
+            let (tx, rx) = std::sync::mpsc::channel();
+            let spawned = std::thread::Builder::new()
+                .name("mg-thumbs".into())
+                .spawn(move || {
+                    let _ = tx.send(crate::scene_thumbs::generate(&device, &queue));
+                });
+            if spawned.is_ok() {
+                self.thumbs_rx = Some(rx);
+            }
+        }
+        if let Some(t) = self.thumbs_rx.as_ref().and_then(|rx| rx.try_recv().ok()) {
+            self.panel.on_thumbs(t);
+            self.thumbs_rx = None;
+        }
         let t_ops = Instant::now();
         if let Some(ov) = self.overlay.as_mut() {
             let ops: Vec<GpuOp> = self
@@ -859,6 +960,7 @@ impl App {
                 .take_ops()
                 .into_iter()
                 .chain(self.ctl.take_ops())
+                .chain(self.panel.take_ops())
                 .collect();
             for op in ops {
                 op.apply(ov, scene, &g.device, &g.queue);
@@ -1039,6 +1141,11 @@ pub fn run(opts: SceneOpts) -> i32 {
         last_seq: 0,
         last_change: Instant::now(),
         ctl: ControlsUi::new(controls_always),
+        panel: ScenePanel::new(),
+        pointer: None,
+        keyboard_input: false,
+        thumbs_rx: None,
+        thumbs_started: false,
         cursor_hidden: false,
         mods: ModifiersState::empty(),
         last_unsupported_note: None,
@@ -1163,7 +1270,8 @@ mod tests {
         assert_eq!(button_action(ButtonId::PlayPause), key(KeyCode::Space));
         assert_eq!(button_action(ButtonId::Previous), key(KeyCode::ArrowLeft));
         assert_eq!(button_action(ButtonId::Next), key(KeyCode::ArrowRight));
-        assert_eq!(button_action(ButtonId::Scene), key(KeyCode::BracketRight));
+        assert_eq!(button_action(ButtonId::Scene), KeyAction::TogglePanel);
+        assert_eq!(ButtonId::Scene.name(), "Scenes");
         assert_eq!(button_action(ButtonId::Lyrics), key(KeyCode::KeyL));
         assert_eq!(button_action(ButtonId::Artwork), key(KeyCode::KeyA));
         assert_eq!(button_action(ButtonId::Fullscreen), key(KeyCode::KeyF));
@@ -1213,6 +1321,43 @@ mod tests {
         assert_eq!(k(KeyCode::Escape), Some(Exit));
         assert_eq!(k(KeyCode::KeyQ), None);
         assert_eq!(k(KeyCode::ArrowUp), None);
+    }
+
+    #[test]
+    fn the_open_panel_takes_esc_arrows_tab_and_enter_before_the_global_map() {
+        let k = |c, shift, repeat| panel_key(c, shift, repeat);
+        assert_eq!(k(KeyCode::Escape, false, false), Some(PanelKey::Escape));
+        assert_eq!(k(KeyCode::Tab, false, false), Some(PanelKey::Tab));
+        assert_eq!(k(KeyCode::Tab, true, false), Some(PanelKey::BackTab));
+        assert_eq!(
+            k(KeyCode::ArrowLeft, false, true),
+            Some(PanelKey::Left),
+            "arrows repeat"
+        );
+        assert_eq!(k(KeyCode::ArrowDown, false, false), Some(PanelKey::Down));
+        assert_eq!(k(KeyCode::Enter, false, false), Some(PanelKey::Enter));
+        assert_eq!(k(KeyCode::NumpadEnter, false, false), Some(PanelKey::Enter));
+        assert_eq!(
+            k(KeyCode::Enter, false, true),
+            None,
+            "Enter does not repeat"
+        );
+        // everything else stays global while the panel is open: play/pause, [ ], digits, L, A, F
+        for c in [
+            KeyCode::Space,
+            KeyCode::BracketLeft,
+            KeyCode::BracketRight,
+            KeyCode::Digit1,
+            KeyCode::KeyL,
+            KeyCode::KeyA,
+            KeyCode::KeyF,
+        ] {
+            assert_eq!(k(c, false, false), None, "{c:?}");
+            assert!(
+                key_action(c, ModifiersState::empty(), false).is_some(),
+                "{c:?}"
+            );
+        }
     }
 
     #[test]

@@ -21,7 +21,7 @@ const MAX_TEXTURE_SIDE: u32 = 4096;
 /// the glyph coverage in alpha).
 pub const THUMB_SIZE: (u32, u32) = (256, 144);
 pub const THUMB_CELLS: usize = 5;
-pub const LABEL_SIZE: (u32, u32) = (256, 48);
+pub const LABEL_SIZE: (u32, u32) = (256, 64);
 pub const LABEL_CELLS: usize = 8;
 pub const LABEL_ORIGIN_Y: u32 = 2 * THUMB_SIZE.1;
 pub const ATLAS_SIZE: (u32, u32) = (3 * THUMB_SIZE.0, LABEL_ORIGIN_Y + 3 * LABEL_SIZE.1);
@@ -1307,7 +1307,7 @@ mod tests {
             THUMB_SIZE.0, THUMB_SIZE.1
         )));
         assert!(src.contains(&format!("const LABEL_ORIGIN_Y = {LABEL_ORIGIN_Y}.0;")));
-        assert_eq!((LABEL_SIZE.0, LABEL_SIZE.1), (256, 48), "shader cell size");
+        assert_eq!((LABEL_SIZE.0, LABEL_SIZE.1), (256, 64), "shader cell size");
         assert_eq!(PANEL_BYTES, (5 + 30) * 16);
         assert_eq!(d.scissor((640, 360)), (0, 0, 640, 360));
         assert_eq!(d.scissor((0, 0)), (0, 0, 1, 1));

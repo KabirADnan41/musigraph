@@ -7,14 +7,20 @@
 //! Invariant: nothing here allocates per frame (layout is rebuilt only when the surface changes).
 
 use crate::controls::{self, Rect};
+use crate::presentation::{GpuOp, Job, Ready};
+use crate::scene_thumbs::Thumbs;
+use mg_gfx::overlay::{
+    LABEL_CELLS, LABEL_CURRENT, LABEL_EXPERIMENTAL_HEADING, LABEL_EXPERIMENTAL_PILL, LABEL_SIZE,
+    PANEL_TILES, PanelDraw, PanelTileDraw,
+};
 use mg_gfx::scene::SceneKind;
+use mg_text::{Align, Cut, LineStyle, TextBitmap};
 
 /// Tiles the panel can hold (every scene).
 pub const MAX_TILES: usize = SceneKind::ALL.len();
 
 // Design pixels at 1080p; multiplied by `controls::ui_scale`.
 pub const TILE_W: f32 = 240.0;
-pub const TILE_H: f32 = TILE_W * 9.0 / 16.0;
 pub const GAP: f32 = 20.0;
 pub const LABEL_GAP: f32 = 12.0;
 pub const LABEL_H: f32 = 20.0;
@@ -22,7 +28,6 @@ pub const HEADING_H: f32 = 14.0;
 pub const HEADING_GAP: f32 = 12.0;
 pub const GROUP_GAP: f32 = 36.0;
 pub const MARGIN: f32 = 24.0;
-pub const RADIUS: f32 = 10.0;
 /// Tile shrink factors tried (largest first) when the content does not fit the surface.
 const FACTORS: [f32; 5] = [1.0, 0.85, 0.7, 0.55, 0.45];
 
@@ -342,6 +347,14 @@ pub struct ScenePanel {
     hover_tile: Option<usize>,
     hover: [f32; MAX_TILES],
     current: SceneKind,
+    jobs: Vec<Job>,
+    ops: Vec<GpuOp>,
+    /// Label scale bucket in the atlas, and the one already requested from the worker.
+    labels_have: Option<u32>,
+    labels_asked: Option<u32>,
+    /// (width, height, pad) of each rendered label bitmap, 0 = not there.
+    label_dims: [(f32, f32, f32); LABEL_CELLS],
+    has_thumb: [bool; MAX_TILES],
 }
 
 impl ScenePanel {
@@ -362,6 +375,12 @@ impl ScenePanel {
             hover_tile: None,
             hover: [0.0; MAX_TILES],
             current: SceneKind::Spectrum,
+            jobs: Vec::new(),
+            ops: Vec::new(),
+            labels_have: None,
+            labels_asked: None,
+            label_dims: [(0.0, 0.0, 0.0); LABEL_CELLS],
+            has_thumb: [false; MAX_TILES],
         }
     }
 
@@ -371,9 +390,13 @@ impl ScenePanel {
             self.surface = surface;
             self.dpi = dpi;
             self.lay = layout(surface, dpi);
+            if self.open || self.visible() {
+                self.want_labels();
+            }
         }
     }
 
+    #[cfg(test)]
     pub fn layout(&self) -> &PanelLayout {
         &self.lay
     }
@@ -388,6 +411,7 @@ impl ScenePanel {
         self.current = kind;
     }
 
+    #[cfg(test)]
     pub fn current(&self) -> SceneKind {
         self.current
     }
@@ -442,6 +466,7 @@ impl ScenePanel {
         if !self.open {
             self.since_open = 0.0;
         }
+        self.want_labels();
         self.retarget(true);
     }
 
@@ -647,6 +672,7 @@ impl ScenePanel {
     }
 
     /// Hover amount 0..1 of tile `i` (0.14 s ease; snaps in reduced motion).
+    #[cfg(test)]
     pub fn tile_hover(&self, i: usize) -> f32 {
         self.hover[i.min(MAX_TILES - 1)]
     }
@@ -656,11 +682,189 @@ impl ScenePanel {
         (self.open && self.keyboard).then_some(self.focus)
     }
 
+    #[cfg(test)]
     pub fn focus(&self) -> usize {
         self.focus
     }
 }
 
+// ---- runtime: labels, thumbnails and the draw ----------------------------------------------------------------------
+
+/// Largest UI scale labels are rasterised for (the label cells hold 256 x 48 px; above it labels stay at this size).
+const LABEL_SCALE_MAX: f32 = 2.2;
+
+fn label_key(scale: f32) -> u32 {
+    (scale.clamp(0.1, LABEL_SCALE_MAX) * 20.0).round() as u32
+}
+
+/// Rasterises the panel texts at UI scale `scale` (worker thread): one bitmap per atlas label cell. The scene
+/// labels are 15 px medium, "Current" 10 px, the pill 9 px and the heading 11 px caps with 0.08 em tracking.
+/// A text that does not fit its cell, or no text renderer, leaves the cell empty (that label is simply absent).
+pub fn render_labels(
+    text: Option<&mg_text::TextRenderer>,
+    scale: f32,
+) -> [Option<TextBitmap>; LABEL_CELLS] {
+    let mut out: [Option<TextBitmap>; LABEL_CELLS] = Default::default();
+    let Some(r) = text else { return out };
+    let s = label_key(scale) as f32 / 20.0;
+    let line = |t: &str, px: f32, weight: u16, tracking_em: f32| {
+        let px = px * s;
+        let pad = (px * 0.3).ceil() as u32;
+        r.render_line(
+            t,
+            &LineStyle {
+                px,
+                weight,
+                max_width: LABEL_SIZE.0.saturating_sub(2 * pad).max(8),
+                tracking_em,
+                cut: Cut::Text,
+                align: Align::Start,
+                ..Default::default()
+            },
+        )
+        .filter(|b| b.width <= LABEL_SIZE.0 && b.height <= LABEL_SIZE.1)
+    };
+    for k in SceneKind::ALL {
+        out[k.index()] = line(k.label(), 15.0, 500, 0.0);
+    }
+    out[LABEL_CURRENT] = line("Current", 10.0, 600, 0.02);
+    out[LABEL_EXPERIMENTAL_PILL] = line("EXPERIMENTAL", 9.0, 600, 0.08);
+    out[LABEL_EXPERIMENTAL_HEADING] = line("EXPERIMENTAL", 11.0, 600, 0.08);
+    out
+}
+
+impl ScenePanel {
+    /// Asks the worker for the labels at the current UI scale (once per scale bucket; the atlas cells are
+    /// rewritten in place, nothing is created).
+    fn want_labels(&mut self) {
+        let key = label_key(self.lay.scale);
+        if self.labels_have != Some(key) && self.labels_asked != Some(key) {
+            self.labels_asked = Some(key);
+            self.jobs.push(Job::PanelLabels {
+                scale: self.lay.scale,
+            });
+        }
+    }
+
+    pub fn take_jobs(&mut self) -> Vec<Job> {
+        std::mem::take(&mut self.jobs)
+    }
+
+    pub fn take_ops(&mut self) -> Vec<GpuOp> {
+        std::mem::take(&mut self.ops)
+    }
+
+    /// A worker result for the panel (labels); other results are not ours.
+    pub fn on_ready(&mut self, r: Ready) {
+        let Ready::PanelLabels { scale, cells } = r else {
+            return;
+        };
+        self.labels_have = Some(label_key(scale));
+        for (d, c) in self.label_dims.iter_mut().zip(cells.iter()) {
+            *d = c.as_ref().map_or((0.0, 0.0, 0.0), |b| {
+                (b.width as f32, b.height as f32, b.pad as f32)
+            });
+        }
+        self.ops.push(GpuOp::SetPanelLabels(cells));
+    }
+
+    /// The runtime thumbnails arrived (once, shortly after start): upload them and show them.
+    pub fn on_thumbs(&mut self, t: Thumbs) {
+        self.has_thumb = std::array::from_fn(|i| t[i].is_some());
+        self.ops.push(GpuOp::SetThumbs(Box::new(t)));
+    }
+
+    /// The draw for this frame, or None while nothing of the panel is on screen (zero cost).
+    pub fn frame(&self, accent: [f32; 3]) -> Option<PanelDraw> {
+        let alpha = self.scrim_alpha();
+        if !self.visible() || alpha <= 0.002 {
+            return None;
+        }
+        let s = self.lay.scale;
+        let dims = |cell: usize| self.label_dims[cell];
+        let (cur, exp) = (dims(LABEL_CURRENT), dims(LABEL_EXPERIMENTAL_PILL));
+        // a pill hugs the ink of its text: half size = half ink + padding (6 / 2.5 design px)
+        let pill_half = |d: (f32, f32, f32)| {
+            (
+                0.5 * (d.0 - 2.0 * d.2).max(0.0) + 6.0 * s,
+                0.5 * (d.1 - 2.0 * d.2).max(0.0) + 2.5 * s,
+            )
+        };
+        let mut tiles = [PanelTileDraw::default(); PANEL_TILES];
+        for (i, out) in tiles.iter_mut().enumerate().take(self.lay.count) {
+            let t = &self.lay.tiles[i];
+            let (hover, rise) = (self.hover[i], self.tile_rise_px(i));
+            let k = 1.0 + 0.03 * hover;
+            let (cx, cy) = (t.rect.x + 0.5 * t.rect.w, t.rect.y + 0.5 * t.rect.h + rise);
+            let (hw, hh) = (0.5 * t.rect.w * k, 0.5 * t.rect.h * k);
+            let selected = t.kind == self.current;
+            let (lw, lh, _) = dims(t.kind.index());
+            let label = if lw > 0.0 {
+                [
+                    (t.label.x + 0.5 * (t.label.w - lw)).round(),
+                    (t.label.y + 0.5 * (t.label.h - lh) + rise).round(),
+                    lw,
+                    lh,
+                ]
+            } else {
+                [0.0; 4]
+            };
+            let (left, right, top) = (cx - hw, cx + hw, cy - hh);
+            let mut cur_pill = [0.0; 4];
+            let mut exp_pill = [0.0; 4];
+            if selected && cur.0 > 0.0 {
+                let (pw, ph) = pill_half(cur);
+                cur_pill = [left + 8.0 * s + pw, top + 8.0 * s + ph, pw, ph];
+            }
+            if t.experimental && exp.0 > 0.0 {
+                let (pw, ph) = pill_half(exp);
+                let p = [right - 8.0 * s - pw, top + 8.0 * s + ph, pw, ph];
+                // a narrow tile shows only one pill: the selection ("Current") wins
+                if cur_pill[2] == 0.0 || cur_pill[0] + cur_pill[2] + 4.0 * s <= p[0] - p[2] {
+                    exp_pill = p;
+                }
+            }
+            *out = PanelTileDraw {
+                rect: [cx, cy, hw, hh],
+                alpha: self.tile_alpha(i),
+                hover,
+                selected,
+                focus: self.ring() == Some(i),
+                experimental: t.experimental,
+                has_thumb: self.has_thumb[t.kind.index()],
+                cell: t.kind.index(),
+                label,
+                cur_pill,
+                exp_pill,
+            };
+        }
+        let first_exp = self.lay.tiles[..self.lay.count]
+            .iter()
+            .position(|t| t.experimental)
+            .unwrap_or(0);
+        let hd = dims(LABEL_EXPERIMENTAL_HEADING);
+        let heading = match self.lay.heading {
+            Some(h) if hd.0 > 0.0 => [
+                (h.x - hd.2).round(),
+                (h.y + 0.5 * (h.h - hd.1)).round(),
+                hd.0,
+                hd.1,
+            ],
+            _ => [0.0; 4],
+        };
+        Some(PanelDraw {
+            alpha,
+            scale: s,
+            accent,
+            count: self.lay.count,
+            tiles,
+            heading,
+            heading_alpha: self.tile_alpha(first_exp),
+            cur_text: [cur.0, cur.1],
+            exp_text: [exp.0, exp.1],
+        })
+    }
+}
 impl Default for ScenePanel {
     fn default() -> Self {
         Self::new()
@@ -672,6 +876,7 @@ mod tests {
     use super::*;
     use crate::scene_switch::SceneSwitch;
     use SceneKind::*;
+    use mg_text::TextBitmap;
 
     const UW: (u32, u32) = (2560, 1080); // 21:9
     const HD: (u32, u32) = (1920, 1080); // 16:9
@@ -1085,5 +1290,158 @@ mod tests {
             let best = ratio(1.0, backdrop).max(ratio(0.0, backdrop));
             assert!(best >= 3.0, "backdrop {backdrop}: {best:.2}");
         }
+    }
+
+    // ---- runtime: labels, thumbnails, the draw and resource growth -------------------------------------------------
+
+    fn fake_labels() -> Ready {
+        let cells: [Option<TextBitmap>; LABEL_CELLS] = std::array::from_fn(|i| {
+            Some(TextBitmap {
+                width: 60 + i as u32,
+                height: 24,
+                pad: 4,
+                coverage: vec![255; (60 + i) * 24],
+            })
+        });
+        Ready::PanelLabels {
+            scale: 1.0,
+            cells: Box::new(cells),
+        }
+    }
+
+    fn all_thumbs() -> Thumbs {
+        std::array::from_fn(|_| Some(vec![1; 4]))
+    }
+
+    #[test]
+    fn labels_are_requested_once_per_scale_and_uploaded_without_creating_anything_new() {
+        let mut p = ScenePanel::new();
+        p.set_view(HD, 1.0);
+        assert!(
+            p.take_jobs().is_empty(),
+            "nothing is rendered until the panel is first opened"
+        );
+        p.open(Spectrum, false);
+        let jobs = p.take_jobs();
+        assert!(matches!(jobs[..], [Job::PanelLabels { .. }]));
+        p.close();
+        p.open(Spectrum, false);
+        assert!(p.take_jobs().is_empty(), "already asked for this scale");
+        p.on_ready(fake_labels());
+        assert!(matches!(p.take_ops()[..], [GpuOp::SetPanelLabels(_)]));
+        // a resize to another scale re-rasterises once (the same atlas cells are rewritten)
+        p.set_view(UHD, 1.0);
+        assert!(matches!(p.take_jobs()[..], [Job::PanelLabels { .. }]));
+        p.set_view(UHD, 1.0);
+        assert!(p.take_jobs().is_empty());
+    }
+
+    #[test]
+    fn opening_and_closing_many_times_creates_no_work_after_the_first_open() {
+        let mut p = ScenePanel::new();
+        p.set_view(HD, 1.0);
+        p.on_thumbs(all_thumbs());
+        p.open(Spectrum, false);
+        p.on_ready(fake_labels());
+        let first = p.take_ops().len() + p.take_jobs().len();
+        assert_eq!(first, 3, "thumbnails, labels, the one label job");
+        for i in 0..1000 {
+            p.toggle(Spectrum, i % 2 == 0);
+            for _ in 0..30 {
+                p.advance(1.0 / 60.0);
+                let _ = p.frame([0.5; 3]);
+            }
+            assert!(
+                p.take_jobs().is_empty() && p.take_ops().is_empty(),
+                "cycle {i}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_draw_marks_the_current_scene_and_the_experimental_tiles_and_stays_inside_the_surface() {
+        let mut p = ScenePanel::new();
+        p.set_view(HD, 1.0);
+        p.on_thumbs(all_thumbs());
+        p.open(Focus, true);
+        p.on_ready(fake_labels());
+        assert!(p.frame([0.5; 3]).is_some_and(|d| d.alpha == 0.0) || p.frame([0.5; 3]).is_none());
+        for _ in 0..40 {
+            p.advance(1.0 / 60.0);
+        }
+        let d = p.frame([0.5; 3]).expect("open");
+        assert_eq!((d.count, d.alpha), (5, 1.0));
+        let l = *p.layout();
+        for (i, t) in d.tiles[..5].iter().enumerate() {
+            assert_eq!(t.cell, l.tiles[i].kind.index());
+            assert_eq!(
+                t.selected,
+                l.tiles[i].kind == Focus,
+                "only the current scene is marked"
+            );
+            assert_eq!(t.experimental, matches!(l.tiles[i].kind, Aurora | Fluid));
+            assert!(t.has_thumb && t.alpha == 1.0);
+            assert_eq!(t.focus, i == p.focus(), "keyboard focus draws one ring");
+            let [cx, cy, hw, hh] = t.rect;
+            assert!(cx - hw >= 0.0 && cx + hw <= 1920.0 && cy - hh >= 0.0 && cy + hh <= 1080.0);
+            assert!(t.label[2] > 0.0, "labels present once rendered");
+            assert_eq!(
+                t.cur_pill[2] > 0.0,
+                t.selected,
+                "the Current pill is not colour alone"
+            );
+            assert_eq!(t.exp_pill[2] > 0.0, t.experimental);
+        }
+        assert!(d.heading[2] > 0.0 && d.heading_alpha == 1.0);
+    }
+
+    #[test]
+    fn a_missing_preview_and_missing_labels_degrade_cleanly() {
+        let mut p = ScenePanel::new();
+        p.set_view(HD, 1.0);
+        let mut t = all_thumbs();
+        t[Orb.index()] = None;
+        p.on_thumbs(t);
+        p.open(Spectrum, false);
+        for _ in 0..40 {
+            p.advance(1.0 / 60.0);
+        }
+        let d = p
+            .frame([0.5; 3])
+            .expect("drawn even before the labels exist");
+        let orb = d.tiles[..5].iter().find(|t| t.cell == Orb.index()).unwrap();
+        assert!(!orb.has_thumb && orb.label[2] == 0.0 && orb.alpha == 1.0);
+        assert!(d.tiles[..5].iter().filter(|t| t.has_thumb).count() == 4);
+        assert!(p.frame([0.5; 3]).is_some_and(|d| d.heading[2] == 0.0));
+    }
+
+    #[test]
+    fn hover_scales_the_tile_and_the_rise_shifts_it_and_a_closed_panel_draws_nothing() {
+        let mut p = ScenePanel::new();
+        p.set_view(HD, 1.0);
+        assert!(p.frame([0.5; 3]).is_none(), "closed: zero cost");
+        p.open(Spectrum, false);
+        p.advance(0.05);
+        let d = p.frame([0.5; 3]).unwrap();
+        let base = p.layout().tiles[0].rect;
+        assert!(d.tiles[0].rect[1] > base.y + 0.5 * base.h, "still rising");
+        for _ in 0..40 {
+            p.advance(1.0 / 60.0);
+        }
+        let t = p.layout().tiles[0];
+        p.pointer_moved((t.rect.x + 3.0, t.rect.y + 3.0));
+        for _ in 0..20 {
+            p.advance(1.0 / 60.0);
+        }
+        let d = p.frame([0.5; 3]).unwrap();
+        assert!(
+            (d.tiles[0].rect[2] / (0.5 * t.rect.w) - 1.03).abs() < 1e-3,
+            "hover scale 1.03"
+        );
+        p.close();
+        for _ in 0..20 {
+            p.advance(1.0 / 60.0);
+        }
+        assert!(p.frame([0.5; 3]).is_none());
     }
 }

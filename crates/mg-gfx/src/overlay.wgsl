@@ -215,10 +215,8 @@ fn icon_cov(id: u32, u: vec2<f32>, fw: f32) -> f32 {
         d = sd_tri(u - vec2<f32>(0.08, 0.0), vec2<f32>(-0.5, -0.66), vec2<f32>(-0.5, 0.66), vec2<f32>(0.62, 0.0)) - 0.08;
     } else if (id == 2u) {          // pause
         d = sd_box(vec2<f32>(abs(u.x) - 0.34, u.y), vec2<f32>(0.17, 0.6)) - 0.07;
-    } else if (id == 4u) {          // next scene: stacked layers
-        let back = abs(sd_box(u - vec2<f32>(-0.2, -0.2), vec2<f32>(0.5, 0.5)) - 0.08) - 0.06;
-        let front = sd_box(u - vec2<f32>(0.22, 0.22), vec2<f32>(0.5, 0.5)) - 0.08;
-        d = min(max(back, -(front - 0.16)), front);
+    } else if (id == 4u) {          // scenes: a 2 x 2 grid of rounded squares
+        d = sd_box(abs(u) - vec2<f32>(0.36), vec2<f32>(0.26)) - 0.08;
     } else if (id == 5u) {          // lyrics: text lines
         let l0 = sd_seg(u, vec2<f32>(-0.7, -0.5), vec2<f32>(0.7, -0.5));
         let l1 = sd_seg(u, vec2<f32>(-0.7, 0.0), vec2<f32>(0.2, 0.0));
@@ -350,7 +348,7 @@ fn fs_controls(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 // ---- scene panel (third draw of the same pass, `fs_panel`, whole surface) --------------------------------------
 // The panel dims the picture a little (black 0.45, 0.65 towards the bottom, no blur: the visualisation keeps
 // running underneath) and floats scene tiles on it. Thumbnails and labels come from ONE atlas (binding 13): the
-// thumbnails above (3 x 2 cells of 256 x 144, cell = scene index), the label cells below (3 x 3 cells of 256 x 48,
+// thumbnails above (3 x 2 cells of 256 x 144, cell = scene index), the label cells below (3 x 3 cells of 256 x 64,
 // white with the glyph coverage in alpha, drawn 1:1). Layout constants mirror overlay.rs (THUMB_SIZE, LABEL_SIZE,
 // LABEL_ORIGIN_Y, ATLAS_SIZE; a test checks them). All geometry is final surface pixels computed on the CPU.
 struct P {
@@ -366,7 +364,7 @@ struct P {
 @group(0) @binding(13) var atlas_tex: texture_2d<f32>;
 @group(0) @binding(14) var<uniform> pn: P;
 
-const ATLAS_SIZE = vec2<f32>(768.0, 432.0);
+const ATLAS_SIZE = vec2<f32>(768.0, 480.0);
 const THUMB_SIZE = vec2<f32>(256.0, 144.0);
 const LABEL_ORIGIN_Y = 288.0;
 
@@ -375,7 +373,7 @@ fn label_cov(cell: u32, rect: vec4<f32>, p: vec2<f32>) -> f32 {
     if (rect.z <= 0.0) { return 0.0; }
     let q = floor(p - rect.xy);
     if (q.x < 0.0 || q.y < 0.0 || q.x >= rect.z || q.y >= rect.w) { return 0.0; }
-    let org = vec2<f32>(f32(cell % 3u) * 256.0, LABEL_ORIGIN_Y + f32(cell / 3u) * 48.0);
+    let org = vec2<f32>(f32(cell % 3u) * 256.0, LABEL_ORIGIN_Y + f32(cell / 3u) * 64.0);
     return textureLoad(atlas_tex, vec2<i32>(org + q), 0).a;
 }
 
@@ -397,6 +395,10 @@ fn panel_tile(dst: vec4<f32>, p: vec2<f32>, i: u32) -> vec4<f32> {
     let s = pn.res.w;
     let rad = 10.0 * s;
     let q = p - r.xy;
+    // cheap reject: only the tile plus its shadow and focus ring (40 design px), or its label, can change this pixel
+    let near_tile = all(abs(q) <= r.zw + vec2<f32>(40.0 * s));
+    let near_label = lab.z > 0.0 && p.x >= lab.x - 2.0 && p.x < lab.x + lab.z + 2.0 && p.y >= lab.y - 2.0 && p.y < lab.y + lab.w + 2.0;
+    if (!near_tile && !near_label) { return dst; }
     let d = sd_round_box(q, r.zw, rad);
     let inside = cov(d, 0.75);
     var o2 = dst;

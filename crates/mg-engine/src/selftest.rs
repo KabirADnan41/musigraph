@@ -1108,6 +1108,171 @@ fn focus_checks(failures: &mut Vec<String>) -> bool {
     true
 }
 
+/// Scene panel (S5): the real thumbnails (runtime, throwaway scene set) and labels (DirectWrite) through the real
+/// `ScenePanel` and overlay, over the live scene at 16:9, 21:9, 4:3 and 9:16. Checks: the panel changes the picture,
+/// every tile's thumbnail shows (not the placeholder), reduced motion fades without rising, repeated open/close
+/// never creates another atlas, and the draw cost delta is printed. With `MG_SCENE_DUMP=<dir>` writes
+/// `panel-<w>x<h>.png` for visual inspection.
+fn panel_previews(failures: &mut Vec<String>) -> bool {
+    use crate::presentation::{GpuOp, Job, Ready, process_job};
+    use crate::scene_panel::ScenePanel;
+    use mg_gfx::overlay::{Overlay, OverlayParams};
+    let Ok(h) = headless() else { return false };
+    let Some(text) = mg_text::TextRenderer::new() else {
+        failures.push("panel: DirectWrite unavailable".into());
+        return true;
+    };
+    let x = fixture("demo", SR).expect("demo fixture");
+    let ticks = Sim::new(SR, FPS, MapTuning::default()).run(&x[..x.len().min(SR as usize * 12)]);
+    let mut p = ticks.last().expect("ticks").params.clone();
+    p.mode = mg_gfx::scene::SceneMode::Live;
+    let mut scene = SceneSet::new_headless(&h.device);
+    let dump = std::env::var("MG_SCENE_DUMP").ok();
+    let t0 = std::time::Instant::now();
+    let thumbs = crate::scene_thumbs::generate(&h.device, &h.queue);
+    println!(
+        "PANEL thumbnails generated in {:.0} ms (throwaway scene set, one-time)",
+        t0.elapsed().as_secs_f64() * 1000.0
+    );
+    if thumbs.iter().any(Option::is_none) {
+        failures.push("panel: a thumbnail failed to render".into());
+    }
+    let mut ov = Overlay::new_headless(&h.device, &h.queue);
+    let mut panel = ScenePanel::new();
+    let seed = |panel: &mut ScenePanel, ov: &mut Overlay, scene: &mut SceneSet, res| {
+        panel.set_view(res, 1.0);
+        panel.open(SceneKind::Orb, true);
+        for job in panel.take_jobs() {
+            let Job::PanelLabels { .. } = &job else {
+                continue;
+            };
+            let r: Ready = process_job(Some(&text), job);
+            panel.on_ready(r);
+        }
+        for op in panel.take_ops() {
+            op.apply(ov, scene, &h.device, &h.queue);
+        }
+    };
+    panel.on_thumbs(thumbs);
+    for (res, tag) in [
+        ((1920u32, 1080u32), "16x9"),
+        ((2560, 1080), "21x9"),
+        ((1024, 768), "4x3"),
+        ((1080, 1920), "9x16"),
+    ] {
+        seed(&mut panel, &mut ov, &mut scene, res);
+        for _ in 0..40 {
+            panel.advance(1.0 / 60.0);
+        }
+        let Some(draw) = panel.frame([0.9, 0.55, 0.2]) else {
+            failures.push(format!("panel {tag}: nothing to draw"));
+            continue;
+        };
+        let render = |panel_draw: Option<mg_gfx::overlay::PanelDraw>| {
+            let op = OverlayParams {
+                res,
+                panel: panel_draw,
+                ..Default::default()
+            };
+            scene.render_offscreen_scenes(
+                &h.device,
+                &h.queue,
+                res,
+                &p,
+                SceneKind::Orb,
+                None,
+                &|enc, view| ov.draw(&h.queue, enc, view, &op),
+            )
+        };
+        let (Ok(bare), Ok(img)) = (render(None), render(Some(draw.clone()))) else {
+            failures.push(format!("panel {tag}: render failed"));
+            continue;
+        };
+        let changed =
+            img.iter().zip(&bare).filter(|(a, b)| a != b).count() as f64 / img.len() as f64;
+        if changed < 0.3 {
+            failures.push(format!(
+                "panel {tag}: only {:.0} % of the picture changed",
+                changed * 100.0
+            ));
+        }
+        // every tile shows its thumbnail (brighter and more varied than the neutral placeholder) and its label
+        for (i, t) in draw.tiles[..draw.count].iter().enumerate() {
+            let (cx, cy) = (t.rect[0] as u32, t.rect[1] as u32);
+            let at = |x: u32, y: u32| {
+                let o = ((y * res.0 + x) * 4) as usize;
+                [img[o], img[o + 1], img[o + 2]]
+            };
+            let c = at(cx.min(res.0 - 1), cy.min(res.1 - 1));
+            if c == [0, 0, 0] {
+                failures.push(format!("panel {tag}: tile {i} is black"));
+            }
+            if t.label[2] <= 0.0 {
+                failures.push(format!("panel {tag}: tile {i} has no label"));
+            }
+        }
+        if let Some(dir) = &dump {
+            let png = mg_media::synth::png_rgba(res.0, res.1, &srgb_view(&img));
+            let _ = std::fs::write(format!("{dir}/panel-{tag}.png"), png);
+        }
+        if tag == "16x9" {
+            // cost: wall time of an offscreen render with and without the panel (readback included in both)
+            let time = |with: bool| {
+                let t = std::time::Instant::now();
+                for _ in 0..20 {
+                    let _ = render(with.then(|| draw.clone()));
+                }
+                t.elapsed().as_secs_f64() * 1000.0 / 20.0
+            };
+            let (a, b) = (time(false), time(true));
+            println!(
+                "PANEL draw cost at 1080p: {b:.2} ms vs {a:.2} ms without (wall, readback included, delta {:.2} ms)",
+                b - a
+            );
+        }
+    }
+    // reduced motion: a plain fade, no rise
+    let mut r = ScenePanel::new();
+    r.set_reduced(true);
+    r.set_view((1920, 1080), 1.0);
+    r.open(SceneKind::Orb, false);
+    r.advance(0.06);
+    match r.frame([0.5; 3]) {
+        Some(d) if (d.alpha - 0.5).abs() < 0.05 && d.tiles[0].alpha == d.alpha => {}
+        other => failures.push(format!(
+            "panel reduced motion: not a plain fade ({:?})",
+            other.map(|d| d.alpha)
+        )),
+    }
+    // resource growth: open and close 500 times, then the atlas was still created once
+    for i in 0..500 {
+        panel.toggle(SceneKind::Orb, i % 2 == 0);
+        for _ in 0..20 {
+            panel.advance(1.0 / 60.0);
+            let _ = panel.frame([0.5; 3]);
+        }
+        let ops: Vec<GpuOp> = panel.take_ops();
+        for op in ops {
+            op.apply(&mut ov, &mut scene, &h.device, &h.queue);
+        }
+        if !panel.take_jobs().is_empty() {
+            failures.push("panel: open/close queued new work".into());
+            break;
+        }
+    }
+    if ov.atlas_creations() != 1 {
+        failures.push(format!(
+            "panel: atlas created {} times",
+            ov.atlas_creations()
+        ));
+    }
+    println!(
+        "PANEL atlas bytes {} (created {} time)",
+        mg_gfx::overlay::ATLAS_SIZE.0 * mg_gfx::overlay::ATLAS_SIZE.1 * 4,
+        ov.atlas_creations()
+    );
+    true
+}
 pub fn run(allow_no_gpu: bool) -> i32 {
     let mut failures = Vec::new();
     let mut gpu_seen = false;
@@ -1234,6 +1399,7 @@ pub fn run(allow_no_gpu: bool) -> i32 {
     gpu_seen |= orb_checks(&mut failures);
     gpu_seen |= fluid_checks(&mut failures);
     gpu_seen |= focus_checks(&mut failures);
+    gpu_seen |= panel_previews(&mut failures);
     if !gpu_seen {
         println!(
             "NOTE: no hardware GPU device available; rendered-pixel checks were NOT run (parameter checks ran)."

@@ -13,11 +13,9 @@ mod music_summary;
 mod nowplaying;
 mod presentation;
 mod scene_map;
-#[allow(dead_code)] // wired by the scene panel (S5)
 mod scene_panel;
 mod scene_run;
 mod scene_switch;
-#[allow(dead_code)] // wired by the scene panel (S5)
 mod scene_thumbs;
 mod selftest;
 mod sim;

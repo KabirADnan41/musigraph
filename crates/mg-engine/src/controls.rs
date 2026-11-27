@@ -105,7 +105,7 @@ impl ButtonId {
             ButtonId::Previous => "Previous track",
             ButtonId::PlayPause => "Play or pause",
             ButtonId::Next => "Next track",
-            ButtonId::Scene => "Next scene",
+            ButtonId::Scene => "Scenes",
             ButtonId::Lyrics => "Show or hide lyrics",
             ButtonId::Artwork => "Change artwork layout",
             ButtonId::Fullscreen => "Toggle fullscreen",
@@ -382,6 +382,8 @@ pub struct Visibility {
     idle: f32,
     hovering: bool,
     pressed: bool,
+    /// The scene panel is open: the bar and the cursor stay (the same one idle timer, held).
+    hold: bool,
     always: bool,
     lift: f32,
 }
@@ -399,6 +401,7 @@ impl Visibility {
             idle: IDLE_S,
             hovering: false,
             pressed: false,
+            hold: false,
             always,
             lift: 0.0,
         }
@@ -420,18 +423,23 @@ impl Visibility {
         self.pressed = on;
     }
 
+    /// Holds the idle timer while the scene panel is open; releasing it restarts the 2.5 s countdown.
+    pub fn set_hold(&mut self, on: bool) {
+        self.hold = on;
+    }
+
     pub fn tick(&mut self, dt: f32) {
         let dt = if dt.is_finite() {
             dt.clamp(0.0, 0.25)
         } else {
             0.0
         };
-        if self.always {
+        if self.always || self.hold {
             self.wants = true;
         }
         // The spec's "4 s while the pointer is over the bar" is subsumed by "never hide while hovering":
         // the 2.5 s countdown starts when the pointer leaves or the button is released.
-        if self.hovering || self.pressed || self.always {
+        if self.hovering || self.pressed || self.always || self.hold {
             self.idle = 0.0;
         } else {
             self.idle += dt;
@@ -1001,6 +1009,31 @@ mod tests {
     }
 
     // ---- visibility state machine --------------------------------------------------------------------------
+
+    #[test]
+    fn an_open_scene_panel_holds_the_one_idle_timer_and_releasing_it_restarts_the_countdown() {
+        let mut v = Visibility::new(false);
+        v.activity();
+        v.set_hold(true);
+        run(&mut v, 10.0, 60.0);
+        assert!(
+            v.wants_visible() && v.alpha() == 1.0,
+            "held: the bar (and so the cursor) stays"
+        );
+        // even a hidden bar is brought back while the panel is open
+        let mut h = Visibility::new(false);
+        h.set_hold(true);
+        run(&mut h, 0.5, 60.0);
+        assert!(h.wants_visible() && h.alpha() > 0.9);
+        v.set_hold(false);
+        run(&mut v, 2.0, 60.0);
+        assert!(
+            v.wants_visible(),
+            "the 2.5 s countdown starts only when the hold ends"
+        );
+        run(&mut v, 1.0, 60.0);
+        assert!(!v.wants_visible());
+    }
 
     #[test]
     fn starts_hidden_shows_on_activity_in_180ms_and_hides_after_idle() {
