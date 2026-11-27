@@ -82,8 +82,9 @@ const HOLD_RELEASE_S: f32 = 0.4;
 /// The flash guard and the per-frame luminance cap are a PALETTE-LEVEL PROXY, not measured screen luminance: the
 /// palette estimate was 2-4x too low for bright palettes (Spectrum 0.25 vs 0.49 measured, Fluid 0.13 vs 0.59), so both
 /// assume the worst case, a white scene (Y = 1). The cap is then dt-independent in absolute terms: a veil step of at
-/// most `MAX_DL / (1 - bridge)` per frame keeps every frame-to-frame luminance step <= `MAX_DL` at ANY frame rate
-/// (a lower fps just stretches the phase). Dim scenes only cost an unnecessary calm hold under hammering.
+/// most `MAX_DL / (1 - bridge)` per frame keeps every frame-to-frame luminance step <= `MAX_DL` at any frame rate
+/// while the bridge is steady (its low-pass can add a small step after the cap is computed); a lower fps just
+/// stretches the phase. Dim scenes only cost an unnecessary calm hold under hammering.
 /// Area- or region-level flashing validation is NOT claimed (tracked for Interactive Session 3).
 const GUARD_Y: f32 = 1.0;
 
@@ -882,31 +883,52 @@ mod tests {
 
     #[test]
     fn the_per_frame_luminance_step_stays_within_the_bound_at_any_frame_rate() {
-        // bright (0.9) and white (1.0) scenes: the step in absolute luminance is dt-independent
-        for lum in [0.9f32, 1.0] {
+        // The machine only knows a DIM proxy (0.1); the TRUE scene luminance is 0.9 or 1.0. Mid-flight a retarget, a
+        // reversal and a re-request must keep every measured frame-to-frame step <= MAX_DL and still end on the
+        // last scene asked for (no stall). Steady bridge: the bridge low-pass could add a small step after the cap.
+        for truth in [0.9f32, 1.0] {
             for dt in [1.0 / 60.0, 1.0 / 30.0, 1.0 / 20.0, 1.0 / 10.0] {
-                for (from, to) in [(Spectrum, Fluid), (Fluid, Focus), (Orb, Aurora)] {
+                for (from, to, alt) in [
+                    (Spectrum, Fluid, Orb),
+                    (Fluid, Focus, Aurora),
+                    (Orb, Aurora, Spectrum),
+                ] {
                     let mut s = SceneSwitch::new(from);
+                    let mut prev = truth;
+                    let (mut worst, mut last) = (0.0f32, to);
                     s.request(to);
-                    let mut prev = lum;
-                    for _ in 0..600 {
-                        let f = s.update(dt, |_| lum);
-                        let y = lum * (1.0 - f.veil[3]) + f.bridge_luma * f.veil[3];
-                        assert!(
-                            (y - prev).abs() <= MAX_DL + 1e-3,
-                            "step {} at dt {dt} lum {lum}",
-                            (y - prev).abs()
-                        );
+                    let mut f = s.update(dt, |_| 0.1);
+                    for i in 1..3000 {
+                        let t = i as f32 * dt;
+                        // retarget at 0.2 s, reversal (asking for the scene being left) at 0.35 s, final at 0.7 s
+                        for (at, k) in [(0.2, alt), (0.35, from), (0.7, to)] {
+                            if t >= at && t - dt < at {
+                                s.request(k);
+                                last = k;
+                            }
+                        }
+                        f = s.update(dt, |_| 0.1);
+                        let y = truth * (1.0 - f.veil[3]) + f.bridge_luma * f.veil[3];
+                        worst = worst.max((y - prev).abs());
                         prev = y;
-                        if f.phase == Phase::Idle {
+                        if f.phase == Phase::Idle && t > 0.8 {
                             break;
                         }
                     }
-                    assert_eq!(s.target(), to);
+                    assert!(
+                        worst <= MAX_DL,
+                        "step {worst} at dt {dt} truth {truth} {from:?}->{to:?}"
+                    );
+                    assert_eq!(
+                        (f.phase, f.scene, s.target()),
+                        (Phase::Idle, last, last),
+                        "stalled or wrong end"
+                    );
                 }
             }
         }
     }
+
     #[test]
     fn re_selecting_the_active_scene_when_idle_does_nothing() {
         let mut s = SceneSwitch::new(Focus);
